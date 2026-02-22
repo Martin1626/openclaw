@@ -186,6 +186,11 @@ export async function modelsAuthAddCommand(_opts: Record<string, never>, runtime
       ...(providerId === "anthropic"
         ? [
             {
+              value: "anthropic-oauth",
+              label: "OAuth (claude.ai)",
+              hint: "Sign in with your Claude account (auto-refresh)",
+            },
+            {
               value: "setup-token",
               label: "setup-token (claude)",
               hint: "Paste a setup-token from `claude setup-token`",
@@ -194,7 +199,26 @@ export async function modelsAuthAddCommand(_opts: Record<string, never>, runtime
         : []),
       { value: "paste", label: "paste token" },
     ],
-  })) as "setup-token" | "paste";
+  })) as "anthropic-oauth" | "setup-token" | "paste";
+
+  if (method === "anthropic-oauth") {
+    const { applyAuthChoiceAnthropic } = await import("../auth-choice.apply.anthropic.js");
+    const prompter = createClackPrompter();
+    const config = runtime.config();
+    const agentDir = resolveAgentDir(config, undefined);
+    const result = await applyAuthChoiceAnthropic({
+      authChoice: "anthropic-oauth",
+      config,
+      prompter,
+      agentDir,
+      setDefaultModel: false,
+    });
+    if (result) {
+      runtime.saveConfig(result.config);
+      logConfigUpdated(runtime);
+    }
+    return;
+  }
 
   if (method === "setup-token") {
     await modelsAuthSetupTokenCommand({ provider: providerId }, runtime);
