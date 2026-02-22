@@ -1,5 +1,11 @@
 import { upsertAuthProfile } from "../agents/auth-profiles.js";
 import {
+  buildAnthropicAuthorizeUrl,
+  exchangeAnthropicCode,
+  generateAnthropicPkce,
+  parseAnthropicOAuthCallback,
+} from "../providers/anthropic-oauth.js";
+import {
   formatApiKeyPreview,
   normalizeApiKeyInput,
   validateApiKeyInput,
@@ -14,6 +20,70 @@ const DEFAULT_ANTHROPIC_MODEL = "anthropic/claude-sonnet-4-6";
 export async function applyAuthChoiceAnthropic(
   params: ApplyAuthChoiceParams,
 ): Promise<ApplyAuthChoiceResult | null> {
+  if (params.authChoice === "anthropic-oauth") {
+    let nextConfig = params.config;
+    const pkce = generateAnthropicPkce();
+    const authorizeUrl = buildAnthropicAuthorizeUrl(pkce);
+
+    await params.prompter.note(
+      [
+        "Open this URL in your browser to sign in with your Claude account:",
+        "",
+        authorizeUrl,
+        "",
+        "After signing in, you will be redirected to a page with an authorization code.",
+        "Copy the full redirect URL and paste it below.",
+      ].join("\n"),
+      "Anthropic OAuth",
+    );
+
+    const callbackInput = await params.prompter.text({
+      message: "Paste the redirect URL",
+      validate: (value) => {
+        const parsed = parseAnthropicOAuthCallback(String(value ?? ""), pkce.verifier);
+        if ("error" in parsed) {
+          return parsed.error;
+        }
+        return undefined;
+      },
+    });
+
+    const parsed = parseAnthropicOAuthCallback(String(callbackInput ?? ""), pkce.verifier);
+    if ("error" in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const credentials = await exchangeAnthropicCode({
+      code: parsed.code,
+      codeVerifier: pkce.verifier,
+    });
+
+    const provider = "anthropic";
+    const profileId = `${provider}:oauth`;
+
+    upsertAuthProfile({
+      profileId,
+      agentDir: params.agentDir,
+      credential: {
+        type: "oauth",
+        provider,
+        access: credentials.access,
+        refresh: credentials.refresh,
+        expires: credentials.expires,
+      },
+    });
+
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId,
+      provider,
+      mode: "oauth",
+    });
+    if (params.setDefaultModel) {
+      nextConfig = applyAgentDefaultModelPrimary(nextConfig, DEFAULT_ANTHROPIC_MODEL);
+    }
+    return { config: nextConfig };
+  }
+
   if (
     params.authChoice === "setup-token" ||
     params.authChoice === "oauth" ||
