@@ -11,10 +11,10 @@ OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, w
 ### Celková architektura
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    OpenClaw Gateway                      │
-│                  (Node.js 22, TypeScript)                │
-│                                                          │
+┌────────────────────────────────────────────────────────┐
+│                    OpenClaw Gateway                    │
+│                  (Node.js 22, TypeScript)              │
+│                                                        │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
 │  │ Web UI   │  │ Channels │  │  Agents  │  │ Skills │  │
 │  │ :18789   │  │          │  │          │  │        │  │
@@ -26,19 +26,19 @@ OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, w
 │  │ Cron     │  │ iMessage │  │ Browser  │  │        │  │
 │  │ Debug    │  │ Teams    │  │ (Playw.) │  │        │  │
 │  └──────────┘  │ Matrix   │  └──────────┘  └────────┘  │
-│                │ ...      │                              │
-│                └──────────┘                              │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              Providers (LLM API)                  │   │
-│  │  Anthropic | OpenAI | Google | OpenRouter | ...   │   │
-│  └──────────────────────────────────────────────────┘   │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              Plugins & Extensions                 │   │
-│  │  MCP (mcporter) | Custom plugins | ClawHub        │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+│                │ ...      │                            │
+│                └──────────┘                            │
+│                                                        │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │              Providers (LLM API)                 │  │
+│  │  Anthropic | OpenAI | Google | OpenRouter | ...  │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                        │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │              Plugins & Extensions                │  │
+│  │  MCP (mcporter) | Custom plugins | ClawHub       │  │
+│  └──────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────┘
 ```
 
 ### Detailní schéma: Gateway, Agent, gateway-client a pairing
@@ -281,6 +281,134 @@ Přes web UI → Channels → přidat Telegram/Discord/...
 
 ---
 
+## PII Anonymizace (Regex Proxy — BEZ Presidia)
+
+### Architektura
+
+Veškerá PII detekce je **lokální regex + česká znalostní báze** (jména, příjmení, adresy).
+Presidio kontejnery (Analyzer + Anonymizer) byly odstraněny — úspora ~830 MB RAM a ~1.9 GB disku.
+
+```
+┌─────────────── VPS (Docker) ───────────────────────────────┐
+│                                                            │
+│  ┌───────────────────┐       ┌───────────────────────┐     │
+│  │  OpenClaw Gateway │──────>│  presidio-proxy       │     │
+│  │  (Node.js)        │       │  (Python FastAPI)     │     │
+│  │                   │       │  port 3001            │     │
+│  │  baseUrl:         │       │                       │     │
+│  │  presidio-proxy   │       │  1. Regex PII detekce │     │
+│  └───────────────────┘       │  2. Anonymizace       │     │
+│                              │  3. Forward do        │     │
+│                              │     Anthropic API     │     │
+│                              │  4. De-anonymizace    │     │
+│                              │     odpovědi          │     │
+│                              └──────────┬────────────┘     │
+│                                         │                  │
+│                                         ▼                  │
+│                                ┌────────────────┐          │
+│                                │ Anthropic API  │          │
+│                                │ (cloud)        │          │
+│                                │ vidí jen       │          │
+│                                │ <PERSON_1>     │          │
+│                                │ <PHONE_1>      │          │
+│                                │ <EMAIL_1>      │          │
+│                                └────────────────┘          │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Jak to funguje
+
+1. OpenClaw pošle LLM request na `http://presidio-proxy:3001/v1/messages`
+2. Proxy zkontroluje `/noanon` marker — pokud přítomen, přeskočí anonymizaci
+3. Proxy extrahuje text z `messages[]` (systémový prompt se přeskakuje)
+4. Regex detekce PII entit (jména, telefony, emaily, adresy, rodná čísla, IBAN)
+5. Proxy nahradí PII číslovanými placeholdery: `Jan Novák` → `<PERSON_1>`
+6. Anonymizovaný request jde do Anthropic API
+7. Odpověď LLM projde de-anonymizací: `<PERSON_1>` → `Jan Novák`
+8. Uživatel vidí odpověď s reálnými údaji
+
+### Detekce jmen — česká znalostní báze
+
+Proxy obsahuje rozsáhlou znalostní bázi pro detekci českých jmen:
+
+- **100+ křestních jmen** (české, slovenské, německé, polské varianty)
+- **160+ explicitních příjmení** (známé kontakty, kolegové)
+- **Suffix-based detekce**: `-ová`, `-ský`, `-ský`, `-ek`, `-ík` atd.
+- **Stem matching pro 7 pádů**: Novák/Nováka/Novákovi/Novákem...
+- **Samohláská alternace**: Peterka → Peterky (genitiv)
+- **Standalone detekce**: jedno velké slovo, pokud je ve znalostní bázi
+- **False-positive ochrana**: deny-list běžných českých slov (smetana, svoboda, černý, holub...)
+
+### Detekované entity
+
+| Typ | Metoda | Příklad |
+|---|---|---|
+| PERSON | Znalostní báze + suffix + stem matching | Jan Novák, Nováka, Steinberger |
+| PHONE_NUMBER | Regex (CZ/SK/mezinárodní) | +420 731 131 426 |
+| EMAIL_ADDRESS | Regex | jan.novak@firma.cz |
+| CZECH_ADDRESS | Regex (ulice + č.p. + PSČ) | Zkušebny 123/45, 110 00 Praha 1 |
+| IBAN_CODE | Regex (CZ/SK prefix) | CZ65 0800 0000 1920 0014 5399 |
+| BIRTH_NUMBER | Regex (rodné číslo) | 850101/1234 |
+
+### Bypass anonymizace (`/noanon`)
+
+Uživatel může jednorázově přeskočit anonymizaci přidáním `/noanon` na začátek zprávy:
+
+```
+/noanon Jaká je adresa Jana Nováka?
+```
+
+- Proxy detekuje `/noanon` marker, odstraní ho, a přeskočí PII anonymizaci
+- Platí **jen pro daný request** — další zprávy jsou anonymizovány normálně
+- Claudie o této možnosti ví přes skill `noanon` (SKILL.md v systémovém promptu)
+- Skill má `user-invocable: false` — gateway ho nezachytí jako command, marker projde na proxy
+
+### Kde jsou jaká data
+
+| Data | Umístění | Anonymizované? | Opouští VPS? |
+|---|---|---|---|
+| Session JSONL | VPS `/sessions/` | NE (originál) | NE |
+| Vault/Memory | VPS `/workspace/` | NE (originál) | NE |
+| Embeddings | VPS sqlite-vec | N/A (vektory) | NE (lokální model) |
+| **LLM prompt** | **Anthropic API** | **ANO** | **ANO → cloud** |
+| **LLM odpověď** | **Anthropic API** | **ANO** | **ANO → cloud** |
+
+### Docker služby
+
+| Služba | Image | RAM | Účel |
+|---|---|---|---|
+| `presidio-proxy` | custom (Python 3.12-slim) | ~50 MB | Regex PII detekce + API proxy |
+
+Presidio Analyzer a Anonymizer byly odstraněny (úspora ~830 MB RAM).
+
+### Konfigurace
+
+V `openclaw.json`:
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": {
+        "baseUrl": "http://presidio-proxy:3001",
+        "api": "anthropic-messages",
+        "models": []
+      }
+    }
+  }
+}
+```
+
+V `docker-compose.yml`: pouze služba `presidio-proxy`.
+
+### Omezení
+
+- Regex detekce — závisí na znalostní bázi, nová jména je třeba přidat ručně
+- Český jazyk: stem matching pokrývá 7 pádů, ale neformální text může uniknout
+- Systémový prompt se neanonymizuje (optimalizace výkonu)
+- Latence: minimální (~10-50ms, vše lokální regex)
+
+---
+
 ## Klíčové soubory pro studium
 
 | Co chcete pochopit | Soubory |
@@ -293,3 +421,5 @@ Přes web UI → Channels → přidat Telegram/Discord/...
 | Konfigurace | `src/config/`, `.env.example` |
 | Web UI | `ui/` |
 | Sandbox | `src/agents/sandbox/`, `Dockerfile.sandbox*` |
+| PII Anonymizace | `presidio-proxy/proxy.py` |
+| Per-channel model routing | `src/channels/model-overrides.ts` |
