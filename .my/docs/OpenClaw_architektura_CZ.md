@@ -41,6 +41,105 @@ OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, w
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Detailní schéma: Gateway, Agent, gateway-client a pairing
+
+```
+┌─────────────────────── Hetzner VPS (Docker) ─────────────────────────┐
+│                                                                      │
+│  ┌─────────────── kontejner: openclaw-gateway-1 ────────────────┐    │
+│  │                                                              │    │
+│  │  ┌────────────────── GATEWAY (Node.js) ───────────────────┐  │    │
+│  │  │  Hlavní server proces — řídí vše                       │  │    │
+│  │  │  Naslouchá na ws://0.0.0.0:18789                       │  │    │
+│  │  │                                                        │  │    │
+│  │  │  ┌───────────────┐     ┌───────────────────────────┐   │  │    │
+│  │  │  │   WhatsApp    │     │         AGENT             │   │  │    │
+│  │  │  │   (Baileys)   │     │   (AI — Claude Haiku)     │   │  │    │
+│  │  │  │               │     │                           │   │  │    │
+│  │  │  │ Připojuje se  │────>│ Přijímá zprávy,           │   │  │    │
+│  │  │  │ k WhatsApp    │     │ generuje odpovědi,        │   │  │    │
+│  │  │  │ serverům      │     │ volá skills/tools         │   │  │    │
+│  │  │  └───────────────┘     │                           │   │  │    │
+│  │  │                        │    Když potřebuje         │   │  │    │
+│  │  │                        │    tool (cron, message,   │   │  │    │
+│  │  │                        │    restart...) vytvoří:   │   │  │    │
+│  │  │                        │         │                 │   │  │    │
+│  │  │                        └─────────┼─────────────────┘   │  │    │
+│  │  │                                  │                     │  │    │
+│  │  │                                  v                     │  │    │
+│  │  │                   ┌──────────────────────────┐         │  │    │
+│  │  │                   │    GATEWAY-CLIENT        │         │  │    │
+│  │  │                   │    (interní WS klient)   │         │  │    │
+│  │  │                   │                          │         │  │    │
+│  │  │                   │  ws://127.0.0.1:18789    │         │  │    │
+│  │  │                   │  deviceId: 336623ef...   │         │  │    │
+│  │  │                   │  Připojuje se zpět       │         │  │    │
+│  │  │                   │  k vlastnímu gateway!    │         │  │    │
+│  │  │                   └────────────┬─────────────┘         │  │    │
+│  │  │                                │                       │  │    │
+│  │  │                     loopback   │  WebSocket            │  │    │
+│  │  │                                v                       │  │    │
+│  │  │  ┌─────────────────────────────────────────────────┐   │  │    │
+│  │  │  │          GATEWAY API (WebSocket server)         │   │  │    │
+│  │  │  │                                                 │   │  │    │
+│  │  │  │  Ověřuje device token + scopes                  │   │  │    │
+│  │  │  │  Zpracovává: chat, cron, tools, config...       │   │  │    │
+│  │  │  │                                                 │   │  │    │
+│  │  │  │  Připojení přijímá od:                          │   │  │    │
+│  │  │  │    • gateway-client (agent, zevnitř)            │   │  │    │
+│  │  │  │    • control-ui (WebUI, zvenčí přes tunel)      │   │  │    │
+│  │  │  └─────────────────────────────────────────────────┘   │  │    │
+│  │  └────────────────────────────────────────────────────────┘  │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                              │                                       │
+│                     port 18789 (pouze 127.0.0.1)                     │
+│                              │                                       │
+└──────────────────────────────┼───────────────────────────────────────┘
+                               │
+                          SSH tunel                    WhatsApp servery
+                          port 2222                    (web.whatsapp.com)
+                               │                             ▲
+                               │                             │
+                    ┌──────────┴──────────┐          Baileys WebSocket
+                    │   Tvůj počítač      │          (z kontejneru ven)
+                    │                     │
+                    │  localhost:18789 ───┤
+                    │       │             │
+                    │       v             │
+                    │  ┌──────────┐       │
+                    │  │  WEB UI  │       │
+                    │  │ (prohlí- │       │
+                    │  │  žeč)    │       │
+                    │  │          │       │
+                    │  │ deviceId:│       │
+                    │  │ e993ae.. │       │
+                    │  └──────────┘       │
+                    └─────────────────────┘
+```
+
+#### Device pairing a scopes
+
+Agent (gateway-client) i Web UI jsou z pohledu gateway **samostatná zařízení**,
+každé s vlastním `deviceId`, tokenem a sadou scope. Při připojení gateway
+ověřuje, zda požadované scopes odpovídají schváleným — jakákoli neshoda
+(i downgrade) vyžaduje re-pairing.
+
+| Scope | Popis | Hierarchie |
+|---|---|---|
+| `operator.read` | Čtení dat | Splněn i přes write nebo admin |
+| `operator.write` | Zápis (posílání zpráv, tools) | Pouze přesná shoda |
+| `operator.admin` | Administrace (cron, config) | Pouze přesná shoda |
+| `operator.approvals` | Schvalování požadavků | Pouze přesná shoda |
+| `operator.pairing` | Správa device pairingu | Pouze přesná shoda |
+
+**Důležité:** `operator.admin` **nezahrnuje** `operator.write` — jsou nezávislé.
+Agent potřebuje všech 5 scope, aby mohl používat všechny tools bez chyb.
+
+Soubory na serveru:
+- `~/.openclaw-gw/devices/paired.json` — schválená zařízení a jejich scopes
+- `~/.openclaw-gw/devices/pending.json` — čekající požadavky na schválení
+- `~/.openclaw-gw/identity/device-auth.json` — klientská identita agenta
+
 ### Klíčové komponenty
 
 **1. Gateway** — centrální server (Node.js proces)
