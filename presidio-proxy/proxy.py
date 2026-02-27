@@ -16,6 +16,7 @@ import logging
 import os
 import re
 from collections import defaultdict
+from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
@@ -66,8 +67,9 @@ _CZECH_FIRST_NAMES = frozenset([
     "william", "george", "charles", "henry", "hans", "franz", "heinrich",
 ])
 
-# Explicit Czech surnames (lowercase nominative) — known contacts & colleagues
-_CZECH_SURNAMES = frozenset([
+# Explicit Czech surnames (lowercase nominative) — known contacts & colleagues.
+# Built-in list can be extended via surnames.txt (one per line, # comments).
+_CZECH_SURNAMES_BUILTIN = frozenset([
     "aghová", "babisz", "baier", "baierová", "barčiová", "bezděk", "bezecný",
     "bialas", "bilas", "bílek", "brzezinová", "bzonek", "cavalcante", "czopnik",
     "čech", "černý", "dadok", "daňa", "dobruská", "dohňanský", "domanský",
@@ -94,6 +96,23 @@ _CZECH_SURNAMES = frozenset([
     "tomis", "ulčáková", "vaněček", "vaněk", "veličková", "vidlář", "vzorek",
     "walach", "wilczek", "wrona", "zetocha", "židková", "bočková", "hamplová",
 ])
+
+
+def _load_surnames() -> frozenset:
+    """Load surnames from built-in list + optional surnames.txt file."""
+    extra: set = set()
+    surnames_file = Path(__file__).parent / "surnames.txt"
+    if surnames_file.is_file():
+        for line in surnames_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                extra.add(line.lower())
+        if extra:
+            log.info("Loaded %d extra surnames from %s", len(extra), surnames_file)
+    return _CZECH_SURNAMES_BUILTIN | frozenset(extra)
+
+
+_CZECH_SURNAMES = _load_surnames()
 
 # Common Czech surname suffixes (helps identify name-like words)
 _CZECH_SURNAME_SUFFIXES = (
