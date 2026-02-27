@@ -1,0 +1,78 @@
+{
+  // ==========================================================================
+  // OpenClaw — Šablona konfigurace / Configuration Template
+  //
+  // Zkopírujte do ~/.openclaw/openclaw.json a vyplňte hodnoty.
+  // Copy to ~/.openclaw/openclaw.json and fill in the values.
+  //
+  // Formát: JSON5 (komentáře a trailing commas povoleny)
+  // ==========================================================================
+
+  // --- Identita agenta ---
+  identity: {
+    name: "Claudie",           // Jméno vašeho AI asistenta
+    emoji: "🤖",
+  },
+
+  // --- Model provider ---
+  // Anthropic API prochází přes PII anonymizační proxy (presidio-proxy:3001)
+  models: {
+    providers: {
+      anthropic: {
+        baseUrl: "http://presidio-proxy:3001",
+        apiKey: "${ANTHROPIC_API_KEY}",
+      },
+    },
+    defaults: {
+      model: "claude-sonnet-4-20250514",
+    },
+  },
+
+  // --- Agent nastavení ---
+  agents: {
+    defaults: {
+      memorySearch: {
+        enabled: true,
+        provider: "local",         // Lokální embeddings (data neopustí server)
+        sync: {
+          onSessionStart: true,
+          onSearch: true,
+          watch: true,
+        },
+        query: {
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0.7,
+            textWeight: 0.3,
+          },
+        },
+      },
+    },
+  },
+
+  // --- Kanály ---
+  // Odkomentujte a vyplňte kanály, které chcete používat.
+  // channels: {
+  //   whatsapp: {
+  //     allowFrom: ["+420XXXXXXXXX"],    // Vaše telefonní číslo
+  //     dmPolicy: "allowlist",
+  //   },
+  // },
+
+  // --- Skills ---
+  skills: {
+    allowBundled: ["noanon"],    // /noanon bypass pro PII proxy
+  },
+
+  // --- Gateway ---
+  gateway: {
+    port: 18789,
+    bind: "lan",
+    controlUi: { enabled: true },
+    auth: {
+      mode: "token",
+      // Token se generuje automaticky při setup — viz .env
+    },
+    reload: { mode: "hybrid" },
+  },
+}

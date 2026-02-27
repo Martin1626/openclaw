@@ -1,0 +1,13 @@
+# Vlastní příjmení pro PII detekci
+# Custom surnames for PII detection
+#
+# Jeden záznam na řádek (lowercase, nominativ).
+# One entry per line (lowercase, nominative case).
+# Řádky začínající # jsou komentáře.
+# Lines starting with # are comments.
+#
+# Příklady / Examples:
+# novák
+# nováková
+# dvořák
+# dvořáková
