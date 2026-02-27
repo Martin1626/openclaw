@@ -37,6 +37,7 @@ SSH konfigurace: `~/.ssh/config`
 |---|---|---|---|
 | `myclaw` | myclaw-myclaw | 8080 | myClaw instance |
 | `openclaw-openclaw-gateway-1` | openclaw:local | 18789, 18790 | OpenClaw Gateway |
+| `openclaw-presidio-proxy-1` | openclaw-presidio-proxy | 3001 (jen Docker síť) | PII anonymizační proxy |
 
 ## OpenClaw - cesty na serveru
 
@@ -48,6 +49,8 @@ SSH konfigurace: `~/.ssh/config`
 | **Gateway konfigurace** | `/home/deploy/.openclaw-gw/openclaw.json` |
 | **Data (SQLite, logy)** | `/home/deploy/.openclaw-gw/` |
 | **Workspace** | `/home/deploy/.openclaw-gw/workspace/` |
+| **PII proxy kód** | `/home/deploy/openclaw/presidio-proxy/proxy.py` |
+| **PII příjmení (volitelné)** | `/home/deploy/openclaw/presidio-proxy/surnames.txt` |
 
 ## OpenClaw - přístupové údaje
 
@@ -64,9 +67,10 @@ SSH konfigurace: `~/.ssh/config`
 |---|---|
 | **Fork URL** | https://github.com/Martin1626/openclaw |
 | **Uživatel** | Martin1626 |
-| **Upstream** | Oficiální OpenClaw repozitář |
+| **Upstream** | `https://github.com/openclaw/openclaw.git` (remote `upstream` na lokálním PC) |
 
-Fork je plně pod vaší kontrolou - žádné změny z upstreamu se nepropagují automaticky.
+Fork je plně pod vaší kontrolou — změny z upstreamu se nepropagují automaticky.
+Na serveru je nastaven pouze remote `origin` (fork). Upstream remote je na lokálním PC.
 
 ## Správa OpenClaw (příkazy na serveru)
 
@@ -92,6 +96,17 @@ docker stats --no-stream
 
 ## Aktualizace OpenClaw
 
+### Rychlá aktualizace (z forku)
+
+```bash
+cd ~/openclaw
+bash update-client.sh
+```
+
+Skript provede: git pull → docker build → docker compose restart → health check.
+
+### Ruční aktualizace / merge z upstreamu
+
 ```bash
 cd ~/openclaw
 
@@ -105,10 +120,16 @@ git diff main upstream/main          # prohlédnout změny PŘED mergem
 git merge upstream/main              # pouze pokud chcete
 
 # 3. Rebuild a restart
-docker compose down
 docker build -t openclaw:local -f Dockerfile .
-docker compose up -d openclaw-gateway
+docker compose build presidio-proxy
+docker compose down && docker compose up -d
+
+# 4. Health check
+curl -f http://localhost:18789/      # gateway
 ```
+
+**Poznámka:** Na serveru je `docker-compose.yml` upraven o produkční specifika
+(gog mounty, extra env vars). Po `git pull` je třeba tyto úpravy znovu aplikovat.
 
 ## Záloha před aktualizací
 
@@ -136,9 +157,13 @@ Váš počítač                          Hetzner VPS
 
 - Všechny porty bindované pouze na `127.0.0.1` (ne veřejně)
 - Kontejnery na oddělených Docker sítích (nevidí se navzájem)
+- Presidio-proxy port 3001 dostupný jen uvnitř Docker sítě (ne z hostu)
 - Přístup pouze přes SSH tunel s klíčem
 - Gateway chráněný tokenem
 
-## Datum instalace
+## Verze a historie
 
-2026-02-21
+| Datum | Verze | Poznámka |
+|---|---|---|
+| 2026-02-21 | v2026.2.21 | Počáteční instalace |
+| 2026-02-27 | v2026.2.26 | Update z upstreamu, nové: `controlUi.dangerouslyAllowHostHeaderOriginFallback` |

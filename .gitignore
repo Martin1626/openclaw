@@ -77,9 +77,6 @@ apps/ios/*.dSYM.zip
 # provisioning profiles (local)
 apps/ios/*.mobileprovision
 
-# Personal agent data
-.my/
-
 # Local untracked files
 .local/
 docs/.local/
