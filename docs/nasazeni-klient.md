@@ -116,7 +116,7 @@ OpenClaw automaticky anonymizuje osobní údaje před odesláním do AI (Anthrop
 
 ### Přidání vlastních příjmení
 
-Upravte soubor `presidio-proxy/surnames.txt` (jeden záznam na řádek, malými písmeny):
+Upravte soubor `pii-proxy/surnames.txt` (jeden záznam na řádek, malými písmeny):
 
 ```
 novák
@@ -124,7 +124,7 @@ nováková
 dvořák
 ```
 
-Po úpravě restartujte: `docker compose restart presidio-proxy`
+Po úpravě restartujte: `docker compose restart pii-proxy`
 
 ### Dočasné vypnutí anonymizace
 
@@ -150,7 +150,7 @@ docker compose logs        # chybové hlášky
 ### PII proxy neodpovídá
 
 ```bash
-docker compose logs presidio-proxy
+docker compose logs pii-proxy
 curl http://localhost:3001/health
 ```
 

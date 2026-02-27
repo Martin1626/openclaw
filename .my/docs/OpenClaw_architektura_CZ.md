@@ -281,22 +281,21 @@ Přes web UI → Channels → přidat Telegram/Discord/...
 
 ---
 
-## PII Anonymizace (Regex Proxy — BEZ Presidia)
+## PII Anonymizace (Regex Proxy)
 
 ### Architektura
 
 Veškerá PII detekce je **lokální regex + česká znalostní báze** (jména, příjmení, adresy).
-Presidio kontejnery (Analyzer + Anonymizer) byly odstraněny — úspora ~830 MB RAM a ~1.9 GB disku.
 
 ```
 ┌─────────────── VPS (Docker) ───────────────────────────────┐
 │                                                            │
 │  ┌───────────────────┐       ┌───────────────────────┐     │
-│  │  OpenClaw Gateway │──────>│  presidio-proxy       │     │
+│  │  OpenClaw Gateway │──────>│  pii-proxy       │     │
 │  │  (Node.js)        │       │  (Python FastAPI)     │     │
 │  │                   │       │  port 3001            │     │
 │  │  baseUrl:         │       │                       │     │
-│  │  presidio-proxy   │       │  1. Regex PII detekce │     │
+│  │  pii-proxy   │       │  1. Regex PII detekce │     │
 │  └───────────────────┘       │  2. Anonymizace       │     │
 │                              │  3. Forward do        │     │
 │                              │     Anthropic API     │     │
@@ -318,7 +317,7 @@ Presidio kontejnery (Analyzer + Anonymizer) byly odstraněny — úspora ~830 MB
 
 ### Jak to funguje
 
-1. OpenClaw pošle LLM request na `http://presidio-proxy:3001/v1/messages`
+1. OpenClaw pošle LLM request na `http://pii-proxy:3001/v1/messages`
 2. Proxy zkontroluje `/noanon` marker — pokud přítomen, přeskočí anonymizaci
 3. Proxy extrahuje text z `messages[]` (systémový prompt se přeskakuje)
 4. Regex detekce PII entit (jména, telefony, emaily, adresy, rodná čísla, IBAN)
@@ -377,9 +376,8 @@ Uživatel může jednorázově přeskočit anonymizaci přidáním `/noanon` na 
 
 | Služba | Image | RAM | Účel |
 |---|---|---|---|
-| `presidio-proxy` | custom (Python 3.12-slim) | ~50 MB | Regex PII detekce + API proxy |
+| `pii-proxy` | custom (Python 3.12-slim) | ~50 MB | Regex PII detekce + API proxy |
 
-Presidio Analyzer a Anonymizer byly odstraněny (úspora ~830 MB RAM).
 
 ### Konfigurace
 
@@ -389,7 +387,7 @@ V `openclaw.json`:
   "models": {
     "providers": {
       "anthropic": {
-        "baseUrl": "http://presidio-proxy:3001",
+        "baseUrl": "http://pii-proxy:3001",
         "api": "anthropic-messages",
         "models": []
       }
@@ -398,7 +396,7 @@ V `openclaw.json`:
 }
 ```
 
-V `docker-compose.yml`: pouze služba `presidio-proxy`.
+V `docker-compose.yml`: pouze služba `pii-proxy`.
 
 ### Omezení
 
@@ -421,5 +419,5 @@ V `docker-compose.yml`: pouze služba `presidio-proxy`.
 | Konfigurace | `src/config/`, `.env.example` |
 | Web UI | `ui/` |
 | Sandbox | `src/agents/sandbox/`, `Dockerfile.sandbox*` |
-| PII Anonymizace | `presidio-proxy/proxy.py` |
+| PII Anonymizace | `pii-proxy/proxy.py` |
 | Per-channel model routing | `src/channels/model-overrides.ts` |

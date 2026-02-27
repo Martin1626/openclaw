@@ -237,7 +237,7 @@ _CZECH_ADDRESS = re.compile(
     re.UNICODE,
 )
 
-# Universal patterns (previously handled by Presidio)
+# Universal patterns
 _EMAIL = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
 _IBAN = re.compile(r"\b[A-Z]{2}\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}(?:\s?\d{4})?(?:\s?\d{2})?\b")
 _CREDIT_CARD = re.compile(r"\b(?:\d{4}[\s-]?){3}\d{4}\b")

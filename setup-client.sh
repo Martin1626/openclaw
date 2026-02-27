@@ -145,7 +145,7 @@ echo "(Příjmení v 1. pádu, malými písmeny, jedno na řádek)"
 echo ""
 read -rp "Chcete přidat vlastní příjmení? [a/N]: " ADD_SURNAMES
 if [[ "$ADD_SURNAMES" =~ ^[aAyY] ]]; then
-  SURNAMES_FILE="$ROOT_DIR/presidio-proxy/surnames.txt"
+  SURNAMES_FILE="$ROOT_DIR/pii-proxy/surnames.txt"
   echo ""
   echo "Zadávejte příjmení (jedno na řádek). Prázdný řádek = konec:"
   echo "# Vlastní příjmení pro PII detekci" > "$SURNAMES_FILE"
@@ -157,7 +157,7 @@ if [[ "$ADD_SURNAMES" =~ ^[aAyY] ]]; then
     echo "${SURNAME,,}" >> "$SURNAMES_FILE"
   done
   SURNAME_COUNT=$(grep -cv '^#\|^$' "$SURNAMES_FILE" 2>/dev/null || echo "0")
-  info "Uloženo $SURNAME_COUNT příjmení do presidio-proxy/surnames.txt"
+  info "Uloženo $SURNAME_COUNT příjmení do pii-proxy/surnames.txt"
 fi
 
 # ---------------------------------------------------------------------------
@@ -246,8 +246,8 @@ docker build \
   -f "$ROOT_DIR/Dockerfile" \
   "$ROOT_DIR"
 
-info "Stavím presidio-proxy image..."
-docker compose -f "$COMPOSE_FILE" build presidio-proxy
+info "Stavím pii-proxy image..."
+docker compose -f "$COMPOSE_FILE" build pii-proxy
 
 # ---------------------------------------------------------------------------
 # 6. Onboarding

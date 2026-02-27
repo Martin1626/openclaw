@@ -1,6 +1,6 @@
 services:
-  presidio-proxy:
-    build: ./presidio-proxy
+  pii-proxy:
+    build: ./pii-proxy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
@@ -12,7 +12,7 @@ services:
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
     depends_on:
-      presidio-proxy:
+      pii-proxy:
         condition: service_healthy
     environment:
       HOME: /home/node

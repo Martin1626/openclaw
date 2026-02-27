@@ -15,11 +15,11 @@
   },
 
   // --- Model provider ---
-  // Anthropic API prochází přes PII anonymizační proxy (presidio-proxy:3001)
+  // Anthropic API prochází přes PII anonymizační proxy (pii-proxy:3001)
   models: {
     providers: {
       anthropic: {
-        baseUrl: "http://presidio-proxy:3001",
+        baseUrl: "http://pii-proxy:3001",
         apiKey: "${ANTHROPIC_API_KEY}",
       },
     },

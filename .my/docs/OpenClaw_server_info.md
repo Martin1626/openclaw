@@ -37,7 +37,7 @@ SSH konfigurace: `~/.ssh/config`
 |---|---|---|---|
 | `myclaw` | myclaw-myclaw | 8080 | myClaw instance |
 | `openclaw-openclaw-gateway-1` | openclaw:local | 18789, 18790 | OpenClaw Gateway |
-| `openclaw-presidio-proxy-1` | openclaw-presidio-proxy | 3001 (jen Docker síť) | PII anonymizační proxy |
+| `openclaw-pii-proxy-1` | openclaw-pii-proxy | 3001 (jen Docker síť) | PII anonymizační proxy |
 
 ## OpenClaw - cesty na serveru
 
@@ -49,8 +49,8 @@ SSH konfigurace: `~/.ssh/config`
 | **Gateway konfigurace** | `/home/deploy/.openclaw-gw/openclaw.json` |
 | **Data (SQLite, logy)** | `/home/deploy/.openclaw-gw/` |
 | **Workspace** | `/home/deploy/.openclaw-gw/workspace/` |
-| **PII proxy kód** | `/home/deploy/openclaw/presidio-proxy/proxy.py` |
-| **PII příjmení (volitelné)** | `/home/deploy/openclaw/presidio-proxy/surnames.txt` |
+| **PII proxy kód** | `/home/deploy/openclaw/pii-proxy/proxy.py` |
+| **PII příjmení (volitelné)** | `/home/deploy/openclaw/pii-proxy/surnames.txt` |
 
 ## OpenClaw - přístupové údaje
 
@@ -121,7 +121,7 @@ git merge upstream/main              # pouze pokud chcete
 
 # 3. Rebuild a restart
 docker build -t openclaw:local -f Dockerfile .
-docker compose build presidio-proxy
+docker compose build pii-proxy
 docker compose down && docker compose up -d
 
 # 4. Health check
@@ -157,7 +157,7 @@ Váš počítač                          Hetzner VPS
 
 - Všechny porty bindované pouze na `127.0.0.1` (ne veřejně)
 - Kontejnery na oddělených Docker sítích (nevidí se navzájem)
-- Presidio-proxy port 3001 dostupný jen uvnitř Docker sítě (ne z hostu)
+- PII proxy port 3001 dostupný jen uvnitř Docker sítě (ne z hostu)
 - Přístup pouze přes SSH tunel s klíčem
 - Gateway chráněný tokenem
 

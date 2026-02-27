@@ -27,8 +27,8 @@ git pull || fail "git pull selhal. Zkontrolujte připojení k internetu."
 info "Stavím Docker image..."
 docker build -t "$IMAGE_NAME" -f "$ROOT_DIR/Dockerfile" "$ROOT_DIR"
 
-info "Stavím presidio-proxy image..."
-docker compose -f "$COMPOSE_FILE" build presidio-proxy
+info "Stavím pii-proxy image..."
+docker compose -f "$COMPOSE_FILE" build pii-proxy
 
 # ---------------------------------------------------------------------------
 # 3. Restart kontejnerů / Restart containers
@@ -43,7 +43,7 @@ docker compose -f "$COMPOSE_FILE" up -d
 info "Čekám na spuštění..."
 sleep 5
 
-# Kontrola presidio-proxy
+# Kontrola pii-proxy
 if curl -sf http://localhost:3001/health >/dev/null 2>&1; then
   info "PII proxy: OK"
 else
