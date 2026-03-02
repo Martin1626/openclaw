@@ -1,19 +1,6 @@
 services:
-  pii-proxy:
-    build: ./pii-proxy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
-    depends_on:
-      pii-proxy:
-        condition: service_healthy
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -21,7 +8,6 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
-      GROQ_API_KEY: ${GROQ_API_KEY}
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
@@ -51,7 +37,6 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
-      GROQ_API_KEY: ${GROQ_API_KEY}
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace

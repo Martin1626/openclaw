@@ -1,0 +1,25 @@
+# Custom OpenClaw overrides (PII proxy, GROQ)
+# This file is auto-merged by Docker Compose with docker-compose.yml.
+# Keep upstream-specific config in docker-compose.yml untouched.
+
+services:
+  pii-proxy:
+    build: ./pii-proxy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  openclaw-gateway:
+    depends_on:
+      pii-proxy:
+        condition: service_healthy
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+
+  openclaw-cli:
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
