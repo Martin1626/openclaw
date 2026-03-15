@@ -2,7 +2,7 @@
 
 ## Kontext
 
-OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, web UI je dostupné přes SSH tunel na `http://localhost:18789`.
+OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, web UI je dostupné přes SSH tunel na `http://localhost:18789`. Webové aplikace vytvořené Claudií jsou dostupné přes SSH tunel nebo Tailscale VPN z mobilu.
 
 ---
 
@@ -235,6 +235,60 @@ Uživatel (browser/Telegram/...)
 
 ---
 
+## Webové aplikace (Claudie) a mobilní přístup
+
+### Architektura přístupu
+
+Claudie (AI agent) může vytvářet webové aplikace uvnitř gateway kontejneru. Ty jsou dostupné
+přes pre-alokované porty 3800–3810.
+
+```
+┌──────────────┐                    ┌──────────── Hetzner VPS ─────────────┐
+│  Počítač     │    SSH tunel       │                                      │
+│  localhost:  │ =================> │  127.0.0.1:3800-3810                 │
+│  38XX        │   (port 2222)      │       │                              │
+└──────────────┘                    │       ▼                              │
+                                    │  ┌────────────────────────────────┐  │
+┌──────────────┐    Tailscale VPN   │  │  openclaw-gateway kontejner    │  │
+│  Mobil       │ =================> │  │  (Node 22)                     │  │
+│  (Pixel 8a)  │                    │  │                                │  │
+│  http://100. │   100.115.228.96   │  │  ~/workspace/moje-appka/       │  │
+│  115.228.96: │   :3800-3810       │  │    └── node server.js :38XX    │  │
+│  38XX        │                    │  │                                │  │
+└──────────────┘                    │  └────────────────────────────────┘  │
+                                    └──────────────────────────────────────┘
+```
+
+### Pravidla pro Claudii (skill `webapp`)
+
+- Povolené porty: **3800–3810** (pre-alokovány v `docker-compose.override.yml`)
+- Porty vystaveny na `127.0.0.1` (SSH tunel) i `100.115.228.96` (Tailscale)
+- Jiné porty nebudou dostupné — Docker je nevystaví
+- Aplikace žijí v `~/workspace/` (sdílený volume s hostem)
+- Aplikace nepřežijí restart kontejneru (netrvalé)
+- Playwright + headless Chromium k dispozici pro testování (build arg `OPENCLAW_INSTALL_BROWSER=1`)
+- Server: 4 GB RAM + 2 GB swap (swappiness=10) — po Chromium testu vždy `browser.close()`
+
+### Tailscale VPN
+
+| Zařízení | Tailscale IP | Účet |
+|---|---|---|
+| Server (ubuntu-4gb-nbg1-1) | `100.115.228.96` | tomis1626@ |
+| Mobil (Pixel 8a) | `100.69.103.68` | tomis1626@ |
+
+- Tailscale nainstalován přímo na hostu (ne v kontejneru)
+- Žádné porty se neotvírají na veřejnou IP — vše přes WireGuard mesh VPN
+- Přístup z mobilu: `http://100.115.228.96:38XX`
+
+### Aktuální aplikace
+
+| Port | Aplikace | Popis |
+|---|---|---|
+| 3800 | Velké kameny (nocni-projekt) | Personal command center — C.S. Lewis citáty, denní kameny, kalendář, počasí |
+| 3801–3810 | Volné | |
+
+---
+
 ## První kroky — doporučený postup
 
 ### Krok 1: Otevřít web UI a spárovat zařízení
@@ -291,11 +345,11 @@ Veškerá PII detekce je **lokální regex + česká znalostní báze** (jména,
 ┌─────────────── VPS (Docker) ───────────────────────────────┐
 │                                                            │
 │  ┌───────────────────┐       ┌───────────────────────┐     │
-│  │  OpenClaw Gateway │──────>│  pii-proxy       │     │
+│  │  OpenClaw Gateway │──────>│  pii-proxy            │     │
 │  │  (Node.js)        │       │  (Python FastAPI)     │     │
 │  │                   │       │  port 3001            │     │
 │  │  baseUrl:         │       │                       │     │
-│  │  pii-proxy   │       │  1. Regex PII detekce │     │
+│  │  pii-proxy        │       │  1. Regex PII detekce │     │
 │  └───────────────────┘       │  2. Anonymizace       │     │
 │                              │  3. Forward do        │     │
 │                              │     Anthropic API     │     │

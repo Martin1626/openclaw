@@ -30,6 +30,13 @@ ANTHROPIC_API_URL = os.getenv("ANTHROPIC_API_URL", "https://api.anthropic.com")
 PII_DEBUG = os.getenv("PII_DEBUG", "false").lower() in ("true", "1", "yes")
 ANONYMIZE_SYSTEM = os.getenv("PII_ANONYMIZE_SYSTEM", "false").lower() in ("true", "1", "yes")
 
+# Emails that should never be anonymized (functional accounts used by skills like gog).
+# Comma-separated list, e.g. "alice@example.com,bob@example.com"
+_EMAIL_WHITELIST_RAW = os.getenv("PII_EMAIL_WHITELIST", "")
+EMAIL_WHITELIST: frozenset[str] = frozenset(
+    e.strip().lower() for e in _EMAIL_WHITELIST_RAW.split(",") if e.strip()
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -298,6 +305,8 @@ def detect_pii(text: str) -> list[dict]:
 
     # --- Universal ---
     for m in _EMAIL.finditer(text):
+        if m.group().lower() in EMAIL_WHITELIST:
+            continue
         entities.append({"entity_type": "EMAIL_ADDRESS", "start": m.start(), "end": m.end(), "score": 1.0})
     for m in _IBAN.finditer(text):
         entities.append({"entity_type": "IBAN_CODE", "start": m.start(), "end": m.end(), "score": 0.95})
@@ -380,19 +389,28 @@ def _remove_overlaps(entities: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def build_anonymization(
-    text: str, entities: list[dict]
+    text: str,
+    entities: list[dict],
+    counters: dict[str, int] | None = None,
+    value_to_ph: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """
     Replace detected PII with numbered placeholders.
     Returns (anonymized_text, {placeholder: original}).
+
+    When *counters* and *value_to_ph* are supplied they are updated in-place,
+    ensuring consistent placeholder numbering across multiple calls within the
+    same API request.
     """
     if not entities:
         return text, {}
 
     sorted_ents = sorted(entities, key=lambda e: e["start"], reverse=True)
     mapping: dict[str, str] = {}
-    value_to_ph: dict[str, str] = {}
-    counters: dict[str, int] = defaultdict(int)
+    if counters is None:
+        counters = defaultdict(int)
+    if value_to_ph is None:
+        value_to_ph = {}
 
     for ent in sorted_ents:
         original = text[ent["start"] : ent["end"]]
@@ -419,27 +437,101 @@ def deanonymize_text(text: str, mapping: dict[str, str]) -> str:
 
 
 def anonymize_text(text: str) -> tuple[str, dict[str, str]]:
-    """Full pipeline: detect PII then anonymize."""
+    """Full pipeline: detect PII then anonymize (standalone, fresh counters)."""
     entities = detect_pii(text)
     return build_anonymization(text, entities)
+
+
+def _anonymize_text_shared(
+    text: str,
+    counters: dict[str, int],
+    value_to_ph: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Anonymize text using shared state (consistent placeholders across blocks)."""
+    entities = detect_pii(text)
+    return build_anonymization(text, entities, counters, value_to_ph)
+
+
+def _anonymize_dict_strings(obj, combined, counters, value_to_ph):
+    """Recursively anonymize all string values in a dict/list structure.
+
+    Used for tool_use.input and similar nested JSON objects.
+    """
+    if isinstance(obj, str):
+        anon, m = _anonymize_text_shared(obj, counters, value_to_ph)
+        combined.update(m)
+        return anon
+    if isinstance(obj, dict):
+        return {k: _anonymize_dict_strings(v, combined, counters, value_to_ph)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_anonymize_dict_strings(i, combined, counters, value_to_ph)
+                for i in obj]
+    return obj
+
+
+def _deanonymize_dict_strings(obj, mapping: dict[str, str]):
+    """Recursively de-anonymize all string values in a dict/list structure."""
+    if isinstance(obj, str):
+        return deanonymize_text(obj, mapping)
+    if isinstance(obj, dict):
+        return {k: _deanonymize_dict_strings(v, mapping) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deanonymize_dict_strings(i, mapping) for i in obj]
+    return obj
+
+
+def _anonymize_content_block(item, combined, counters, value_to_ph):
+    """Anonymize a single content block by type.
+
+    Handles: "text", "tool_use" (input dict).
+    Passes through "tool_result" and anything else (image, etc.) unchanged.
+    Tool results are system-generated (e.g. gog CLI output) and must not be
+    anonymized — the LLM needs to see real data to compose follow-up commands.
+    """
+    block_type = item.get("type")
+
+    if block_type == "text" and "text" in item:
+        anon, m = _anonymize_text_shared(item["text"], counters, value_to_ph)
+        combined.update(m)
+        return {**item, "text": anon}
+
+    if block_type == "tool_result":
+        # Pass through — tool results are system-generated, not user PII.
+        return item
+
+    if block_type == "tool_use" and "input" in item:
+        new_item = dict(item)
+        new_item["input"] = _anonymize_dict_strings(
+            item["input"], combined, counters, value_to_ph)
+        return new_item
+
+    return item
 
 
 # ---------------------------------------------------------------------------
 # Anthropic message processing
 # ---------------------------------------------------------------------------
 
-def anonymize_system(system):
-    """Anonymize the system prompt (string or block array)."""
+def anonymize_system(system, counters=None, value_to_ph=None):
+    """Anonymize the system prompt (string or block array).
+
+    Accepts shared *counters*/*value_to_ph* for cross-field consistency.
+    """
     if system is None or not ANONYMIZE_SYSTEM:
         return system, {}
+    if counters is None:
+        counters = defaultdict(int)
+    if value_to_ph is None:
+        value_to_ph = {}
     if isinstance(system, str):
-        return anonymize_text(system)
+        return _anonymize_text_shared(system, counters, value_to_ph)
     if isinstance(system, list):
         combined: dict[str, str] = {}
         result = []
         for item in system:
             if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                anon, m = anonymize_text(item["text"])
+                anon, m = _anonymize_text_shared(item["text"], counters, value_to_ph)
                 combined.update(m)
                 result.append({**item, "text": anon})
             else:
@@ -448,9 +540,18 @@ def anonymize_system(system):
     return system, {}
 
 
-def anonymize_messages(messages: list[dict]):
-    """Anonymize all text content in the messages array."""
+def anonymize_messages(messages: list[dict], counters=None, value_to_ph=None):
+    """Anonymize all content in the messages array.
+
+    Processes text, tool_result, and tool_use content blocks.
+    Uses shared *counters*/*value_to_ph* for consistent placeholder numbering
+    across all messages and content blocks within a single API request.
+    """
     combined: dict[str, str] = {}
+    if counters is None:
+        counters = defaultdict(int)
+    if value_to_ph is None:
+        value_to_ph = {}
     out = []
 
     for msg in messages:
@@ -461,19 +562,15 @@ def anonymize_messages(messages: list[dict]):
             continue
 
         if isinstance(content, str):
-            anon, m = anonymize_text(content)
+            anon, m = _anonymize_text_shared(content, counters, value_to_ph)
             combined.update(m)
             mc["content"] = anon
         elif isinstance(content, list):
-            new_content = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                    anon, m = anonymize_text(item["text"])
-                    combined.update(m)
-                    new_content.append({**item, "text": anon})
-                else:
-                    new_content.append(item)
-            mc["content"] = new_content
+            mc["content"] = [
+                _anonymize_content_block(item, combined, counters, value_to_ph)
+                if isinstance(item, dict) else item
+                for item in content
+            ]
 
         out.append(mc)
 
@@ -520,8 +617,15 @@ async def _stream_proxy(
     mapping: dict[str, str],
     client: httpx.AsyncClient,
 ) -> AsyncGenerator[bytes, None]:
-    """Read Anthropic SSE stream, de-anonymize text deltas, re-emit."""
+    """Read Anthropic SSE stream, de-anonymize text/tool-input deltas, re-emit."""
     deanon = StreamDeanonymizer(mapping) if mapping else None
+    # JSON-escaped mapping for tool_use input de-anonymization (safe inside JSON strings)
+    json_mapping = (
+        {ph: json.dumps(orig, ensure_ascii=False)[1:-1] for ph, orig in mapping.items()}
+        if mapping else None
+    )
+    json_deanon = StreamDeanonymizer(json_mapping) if json_mapping else None
+    current_block_type: str | None = None  # "text" or "tool_use"
     pending_event: str | None = None
 
     try:
@@ -562,6 +666,10 @@ async def _stream_proxy(
 
             evt_type = data.get("type")
 
+            if evt_type == "content_block_start":
+                block = data.get("content_block", {})
+                current_block_type = block.get("type")
+
             if evt_type == "content_block_delta":
                 delta = data.get("delta", {})
                 if delta.get("type") == "text_delta":
@@ -569,6 +677,19 @@ async def _stream_proxy(
                     processed = deanon.process(text)
                     if processed:
                         out = {**data, "delta": {**delta, "text": processed}}
+                        if pending_event:
+                            yield (pending_event + "\n").encode()
+                            pending_event = None
+                        yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n".encode()
+                    else:
+                        pending_event = None
+                    continue
+
+                if delta.get("type") == "input_json_delta" and json_deanon:
+                    partial = delta.get("partial_json", "")
+                    processed = json_deanon.process(partial)
+                    if processed:
+                        out = {**data, "delta": {**delta, "partial_json": processed}}
                         if pending_event:
                             yield (pending_event + "\n").encode()
                             pending_event = None
@@ -587,6 +708,18 @@ async def _stream_proxy(
                         "delta": {"type": "text_delta", "text": remaining},
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(flush_evt, ensure_ascii=False)}\n\n".encode()
+
+                json_remaining = json_deanon.flush() if json_deanon else ""
+                if json_remaining:
+                    idx = data.get("index", 0)
+                    flush_evt = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "input_json_delta", "partial_json": json_remaining},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(flush_evt, ensure_ascii=False)}\n\n".encode()
+
+                current_block_type = None
 
             if pending_event:
                 yield (pending_event + "\n").encode()
@@ -671,8 +804,12 @@ async def proxy_messages(request: Request):
             mapping = {}
             anon_body = body
         else:
-            anon_sys, sys_map = anonymize_system(body.get("system"))
-            anon_msgs, msg_map = anonymize_messages(body.get("messages", []))
+            # Shared state ensures consistent placeholders across system + messages
+            shared_counters: dict[str, int] = defaultdict(int)
+            shared_v2ph: dict[str, str] = {}
+
+            anon_sys, sys_map = anonymize_system(body.get("system"), shared_counters, shared_v2ph)
+            anon_msgs, msg_map = anonymize_messages(body.get("messages", []), shared_counters, shared_v2ph)
             mapping = {**sys_map, **msg_map}
 
             if mapping:
@@ -732,6 +869,8 @@ async def proxy_messages(request: Request):
                     block["text"] = deanonymize_text(block["text"], mapping)
                     if PII_DEBUG:
                         log.info("  [DE-ANONYMIZED] %.300s", block["text"])
+                elif block.get("type") == "tool_use" and "input" in block:
+                    block["input"] = _deanonymize_dict_strings(block["input"], mapping)
 
         return JSONResponse(content=resp_data)
 

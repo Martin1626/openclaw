@@ -24,13 +24,18 @@
       },
     },
     defaults: {
-      model: "claude-sonnet-4-20250514",
+      model: "anthropic/claude-sonnet-4-6",
     },
   },
 
   // --- Agent nastavení ---
   agents: {
     defaults: {
+      // Alias mapping pro přepínání modelů (opus/sonnet → plné ID)
+      models: {
+        "anthropic/claude-opus-4-6": { alias: "opus" },
+        "anthropic/claude-sonnet-4-6": { alias: "sonnet" },
+      },
       memorySearch: {
         enabled: true,
         provider: "local",         // Lokální embeddings (data neopustí server)
