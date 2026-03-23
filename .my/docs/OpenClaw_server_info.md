@@ -92,21 +92,23 @@ Přístup z PC: `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:3
 ### Jak to funguje
 
 OpenClaw používá OAuth token z Claude Code CLI (`claude setup-token`).
-Token je **dlouhodobý (1 rok)** a nevyžaduje automatický refresh.
+Token je **dlouhodobý (1 rok)**, scope `user:inference`, bez refresh tokenu.
 
 ```
-Claude Code CLI ──[setup-token]──> ~/.claude/.credentials.json
-                                          │
-                            sync-claude-token.cjs (cron)
-                                          │
-                                          ▼
-                            auth-profiles.json (OpenClaw)
-                                          │
-                            OpenClaw Gateway (pi-ai)
-                                          │  Authorization: Bearer <token>
-                                          │  anthropic-beta: oauth-2025-04-20
-                                          ▼
-                            pii-proxy ──> api.anthropic.com
+claude setup-token ──> token na obrazovce (sk-ant-oat01-...)
+                              │
+                       ručně uložit do ~/.claude/.credentials.json
+                              │
+                       sync-claude-token.cjs (cron 1×/den)
+                              │
+                              ▼
+                       auth-profiles.json (OpenClaw)
+                              │
+                       OpenClaw Gateway (pi-ai)
+                              │  Authorization: Bearer <token>
+                              │  anthropic-beta: claude-code-20250219,oauth-2025-04-20
+                              ▼
+                       pii-proxy ──> api.anthropic.com
 ```
 
 ### Klíčové detaily
@@ -114,10 +116,11 @@ Claude Code CLI ──[setup-token]──> ~/.claude/.credentials.json
 - Token prefix: `sk-ant-oat01-...` (OAuth token)
 - OpenClaw automaticky detekuje OAuth token (`sk-ant-oat-*` prefix)
 - Posílá jako `Authorization: Bearer` (NE `x-api-key`!)
-- Přidává povinný header `anthropic-beta: oauth-2025-04-20`
+- Přidává povinné headery: `anthropic-beta: claude-code-20250219,oauth-2025-04-20`
+- **Bez `claude-code-20250219`** Anthropic token odmítne (third-party blokace)
 - Detekce + headery: `src/agents/pi-embedded-runner/extra-params.ts:422-456`
-- pii-proxy forwarduje oba headery (`authorization`, `anthropic-beta`)
-- Auth profil: `mode: "token"` v `openclaw.json`
+- pii-proxy forwarduje headery (`authorization`, `anthropic-beta`, `anthropic-version`)
+- Auth profil: `type: "token"` v `auth-profiles.json`
 
 ### Soubory
 
@@ -126,18 +129,22 @@ Claude Code CLI ──[setup-token]──> ~/.claude/.credentials.json
 | Claude Code credentials | `~/.claude/.credentials.json` |
 | OpenClaw auth profily | `~/.openclaw-gw/agents/main/agent/auth-profiles.json` |
 | Sync skript | `/home/deploy/openclaw/sync-claude-token.cjs` |
-| Claude Code CLI | `/usr/local/lib/node_modules/@anthropic-ai/claude-code/` |
+| Sync log | `/home/deploy/openclaw/sync-claude-token.log` |
 
 ### Cron
 
 ```
-# Kontrola tokenu 1× denně (jen sync + warning při < 30 dnech do expirace)
+# Sync tokenu 1× denně v 06:00 UTC (stačí pro 1-year token)
 0 6 * * * /usr/bin/node /home/deploy/openclaw/sync-claude-token.cjs >> /home/deploy/openclaw/sync-claude-token.log 2>&1
 ```
 
+Sync skript obsahuje logiku pro forced refresh (3.5h buffer, `claude -p ping`).
+Při přechodu na krátké tokeny (8h, přes `claude auth login`) stačí změnit cron
+na `0 */3 * * *`.
+
 ### Obnova tokenu (když vyprší nebo přestane fungovat)
 
-1. **Aktualizuj Claude Code CLI:**
+1. **Aktualizuj Claude Code CLI (volitelné):**
    ```bash
    # Přes nsenter (root potřeba):
    docker run --rm --privileged --pid=host alpine nsenter -t 1 -m -u -i -n -- \
@@ -147,22 +154,56 @@ Claude Code CLI ──[setup-token]──> ~/.claude/.credentials.json
 
 2. **Vytvoř nový token (interaktivně přes tmux):**
    ```bash
-   tmux new-session -s auth 'claude setup-token'
-   # Počkej na URL → otevři v prohlížeči → autorizuj jako tomis@kvados.cz
+   tmux new-session -d -s auth 'claude setup-token 2>&1; echo EXIT_CODE=$?; sleep 30'
+   # Počkej ~5s, pak přečti URL:
+   tmux capture-pane -t auth -p -S -40
+   # Otevři URL v prohlížeči → autorizuj jako tomis@kvados.cz
    # Kód z prohlížeče vlož přes tmux:
    tmux send-keys -t auth '<KÓD>' Enter
+   # Počkej ~10s, ověř výstup:
+   tmux capture-pane -t auth -p -S -50
+   # Mělo by se zobrazit: "Long-lived authentication token created successfully!"
+   # a token sk-ant-oat01-...
    ```
+   **POZOR:** `claude auth login` na headless serveru NEFUNGUJE (nepřijímá
+   ruční vložení kódu). Používej výhradně `claude setup-token`.
 
 3. **Zapiš token do credentials:**
    ```bash
    # Token se zobrazí na obrazovce (sk-ant-oat01-...)
-   # Zapiš ho do ~/.claude/.credentials.json (accessToken + expiresAt za 1 rok)
+   # setup-token ho NEULOŽÍ automaticky do credentials.json!
+   cat > ~/.claude/.credentials.json << 'EOF'
+   {
+     "claudeAiOauth": {
+       "accessToken": "sk-ant-oat01-TVŮJ-TOKEN-ZDE",
+       "expiresAt": EPOCH_MS_ZA_1_ROK,
+       "scopes": ["user:inference"],
+       "subscriptionType": "max",
+       "rateLimitTier": "default_claude_max_5x"
+     }
+   }
+   EOF
+   chmod 600 ~/.claude/.credentials.json
    ```
+   expiresAt: `python3 -c "import time; print(int((time.time() + 365*86400)*1000))"`
 
 4. **Spusť sync:**
    ```bash
    node /home/deploy/openclaw/sync-claude-token.cjs
-   # Ověř: Token synced, Gateway restarted
+   # Ověř: "Token synced" + "Gateway restarted"
+   ```
+
+5. **Ověř funkčnost:**
+   ```bash
+   # Claude CLI:
+   claude -p "odpověz jen: OK"
+   # Přímé API volání:
+   curl -s https://api.anthropic.com/v1/messages \
+     -H "Authorization: Bearer sk-ant-oat01-..." \
+     -H "anthropic-beta: claude-code-20250219,oauth-2025-04-20" \
+     -H "anthropic-version: 2023-06-01" \
+     -H "content-type: application/json" \
+     -d '{"model":"claude-haiku-4-5","max_tokens":10,"messages":[{"role":"user","content":"Say OK"}]}'
    ```
 
 ### Časté chyby
@@ -171,8 +212,10 @@ Claude Code CLI ──[setup-token]──> ~/.claude/.credentials.json
 |---|---|---|
 | `invalid x-api-key` | Token posílán jako x-api-key místo Bearer | Ověř, že OpenClaw detekuje `sk-ant-oat-*` prefix |
 | `OAuth authentication is currently not supported` | Chybí `anthropic-beta: oauth-2025-04-20` header | Ověř extra-params.ts a pii-proxy FORWARD_HEADERS |
-| `OAuth token has expired` | Token/refresh token vypršel | Nový `claude setup-token` (viz postup výše) |
+| `OAuth authentication is currently not allowed for this organization` | Chybí `claude-code-20250219` beta header, nebo změna předplatného | Nový `claude setup-token`; ověř, že OpenClaw posílá oba beta headery |
+| `OAuth token has expired` | Token vypršel (1 rok) | Nový `claude setup-token` (viz postup výše) |
 | `claude -p ping` selže s 401 | Credentials mají expirovaný token | Nový `claude setup-token` |
+| `not_found_error` pro model | OAuth tokeny fungují jen s novými názvy modelů | Používej `claude-haiku-4-5`, `claude-sonnet-4-5` (ne staré `*-20241022` formáty) |
 
 ## GitHub fork
 
