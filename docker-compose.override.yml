@@ -1,4 +1,4 @@
-# Custom OpenClaw overrides (PII proxy, GROQ)
+# Custom OpenClaw overrides (PII proxy, GROQ, custom skills)
 # This file is auto-merged by Docker Compose with docker-compose.yml.
 # Keep upstream-specific config in docker-compose.yml untouched.
 
@@ -6,6 +6,8 @@ services:
   pii-proxy:
     build: ./pii-proxy
     restart: unless-stopped
+    environment:
+      PII_EMAIL_WHITELIST: "tomis.martin@gmail.com,claudie.tomis@gmail.com"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
       interval: 30s
@@ -14,12 +16,25 @@ services:
       start_period: 10s
 
   openclaw-gateway:
+    ports:
+      - "127.0.0.1:3800-3810:3800-3810"
+      - "100.115.228.96:3800-3810:3800-3810"
     depends_on:
       pii-proxy:
         condition: service_healthy
     environment:
       GROQ_API_KEY: ${GROQ_API_KEY}
+    volumes:
+      - /home/deploy/.local/bin/gog:/usr/local/bin/gog:ro
+      - /home/deploy/.config/gogcli:/home/node/.config/gogcli
+      - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
+      - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
 
   openclaw-cli:
     environment:
       GROQ_API_KEY: ${GROQ_API_KEY}
+    volumes:
+      - /home/deploy/.local/bin/gog:/usr/local/bin/gog:ro
+      - /home/deploy/.config/gogcli:/home/node/.config/gogcli
+      - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
+      - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro

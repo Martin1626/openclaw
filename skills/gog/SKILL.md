@@ -24,6 +24,24 @@ metadata:
 
 # gog
 
+## ⚠️ CRITICAL: Account Configuration — READ FIRST!
+
+There are TWO separate Google accounts with DIFFERENT purposes and DIFFERENT OAuth clients. Using the wrong account WILL fail with auth errors.
+
+| Service    | Account                      | OAuth client flag | Example |
+|------------|------------------------------|-------------------|---------|
+| **Calendar** | `tomis.martin@gmail.com`   | *(none, default)* | `gog calendar events primary --account tomis.martin@gmail.com` |
+| **Gmail**    | `claudie.tomis@gmail.com`  | `--client claudie` | `gog gmail search "newer_than:7d" --account claudie.tomis@gmail.com --client claudie` |
+
+### Rules (MUST follow):
+1. **Gmail** commands → ALWAYS use `--account claudie.tomis@gmail.com --client claudie`
+2. **Calendar** commands → ALWAYS use `--account tomis.martin@gmail.com` (no --client flag)
+3. **NEVER** use `tomis.martin@gmail.com` for Gmail — that account has NO Gmail permissions
+4. **NEVER** use `claudie.tomis@gmail.com` for Calendar — that account has NO Calendar permissions
+5. **NEVER** omit `--client claudie` when using `claudie.tomis@gmail.com` — it will use the wrong OAuth app and fail
+
+---
+
 Use `gog` for Gmail/Calendar/Drive/Contacts/Sheets/Docs. Requires OAuth setup.
 
 Setup (once)
@@ -34,19 +52,19 @@ Setup (once)
 
 Common commands
 
-- Gmail search: `gog gmail search 'newer_than:7d' --max 10`
-- Gmail messages search (per email, ignores threading): `gog gmail messages search "in:inbox from:ryanair.com" --max 20 --account you@example.com`
-- Gmail send (plain): `gog gmail send --to a@b.com --subject "Hi" --body "Hello"`
-- Gmail send (multi-line): `gog gmail send --to a@b.com --subject "Hi" --body-file ./message.txt`
-- Gmail send (stdin): `gog gmail send --to a@b.com --subject "Hi" --body-file -`
-- Gmail send (HTML): `gog gmail send --to a@b.com --subject "Hi" --body-html "<p>Hello</p>"`
-- Gmail draft: `gog gmail drafts create --to a@b.com --subject "Hi" --body-file ./message.txt`
-- Gmail send draft: `gog gmail drafts send <draftId>`
-- Gmail reply: `gog gmail send --to a@b.com --subject "Re: Hi" --body "Reply" --reply-to-message-id <msgId>`
-- Calendar list events: `gog calendar events <calendarId> --from <iso> --to <iso>`
-- Calendar create event: `gog calendar create <calendarId> --summary "Title" --from <iso> --to <iso>`
-- Calendar create with color: `gog calendar create <calendarId> --summary "Title" --from <iso> --to <iso> --event-color 7`
-- Calendar update event: `gog calendar update <calendarId> <eventId> --summary "New Title" --event-color 4`
+- Gmail search: `gog gmail search 'newer_than:7d' --max 10 --account claudie.tomis@gmail.com --client claudie`
+- Gmail messages search (per email, ignores threading): `gog gmail messages search "in:inbox from:ryanair.com" --max 20 --account claudie.tomis@gmail.com --client claudie`
+- Gmail send (plain): `gog gmail send --to a@b.com --subject "Hi" --body "Hello" --account claudie.tomis@gmail.com --client claudie`
+- Gmail send (multi-line): `gog gmail send --to a@b.com --subject "Hi" --body-file ./message.txt --account claudie.tomis@gmail.com --client claudie`
+- Gmail send (stdin): `gog gmail send --to a@b.com --subject "Hi" --body-file - --account claudie.tomis@gmail.com --client claudie`
+- Gmail send (HTML): `gog gmail send --to a@b.com --subject "Hi" --body-html "<p>Hello</p>" --account claudie.tomis@gmail.com --client claudie`
+- Gmail draft: `gog gmail drafts create --to a@b.com --subject "Hi" --body-file ./message.txt --account claudie.tomis@gmail.com --client claudie`
+- Gmail send draft: `gog gmail drafts send <draftId> --account claudie.tomis@gmail.com --client claudie`
+- Gmail reply: `gog gmail send --to a@b.com --subject "Re: Hi" --body "Reply" --reply-to-message-id <msgId> --account claudie.tomis@gmail.com --client claudie`
+- Calendar list events: `gog calendar events <calendarId> --from <iso> --to <iso> --account tomis.martin@gmail.com`
+- Calendar create event: `gog calendar create <calendarId> --summary "Title" --from <iso> --to <iso> --account tomis.martin@gmail.com`
+- Calendar create with color: `gog calendar create <calendarId> --summary "Title" --from <iso> --to <iso> --event-color 7 --account tomis.martin@gmail.com`
+- Calendar update event: `gog calendar update <calendarId> <eventId> --summary "New Title" --event-color 4 --account tomis.martin@gmail.com`
 - Calendar show colors: `gog calendar colors`
 - Drive search: `gog drive search "query" --max 10`
 - Contacts: `gog contacts list --max 20`
@@ -87,6 +105,7 @@ Email Formatting
   ```bash
   gog gmail send --to recipient@example.com \
     --subject "Meeting Follow-up" \
+    --account claudie.tomis@gmail.com --client claudie \
     --body-file - <<'EOF'
   Hi Name,
 
@@ -103,12 +122,12 @@ Email Formatting
   ```bash
   gog gmail send --to recipient@example.com \
     --subject "Meeting Follow-up" \
+    --account claudie.tomis@gmail.com --client claudie \
     --body-html "<p>Hi Name,</p><p>Thanks for meeting today. Here are the next steps:</p><ul><li>Item one</li><li>Item two</li></ul><p>Best regards,<br>Your Name</p>"
   ```
 
 Notes
 
-- Set `GOG_ACCOUNT=you@gmail.com` to avoid repeating `--account`.
 - For scripting, prefer `--json` plus `--no-input`.
 - Sheets values can be passed via `--values-json` (recommended) or as inline rows.
 - Docs supports export/cat/copy. In-place edits require a Docs API client (not in gog).
