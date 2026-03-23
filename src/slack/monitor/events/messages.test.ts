@@ -5,23 +5,27 @@ import {
   type SlackSystemEventTestOverrides,
 } from "./system-event-test-harness.js";
 
-const enqueueSystemEventMock = vi.fn();
-const readAllowFromStoreMock = vi.fn();
+const messageQueueMock = vi.fn();
+const messageAllowMock = vi.fn();
 
 vi.mock("../../../infra/system-events.js", () => ({
-  enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
+  enqueueSystemEvent: (...args: unknown[]) => messageQueueMock(...args),
 }));
 
 vi.mock("../../../pairing/pairing-store.js", () => ({
-  readChannelAllowFromStore: (...args: unknown[]) => readAllowFromStoreMock(...args),
+  readChannelAllowFromStore: (...args: unknown[]) => messageAllowMock(...args),
 }));
 
-type SlackMessageHandler = (args: {
-  event: Record<string, unknown>;
-  body: unknown;
-}) => Promise<void>;
+type MessageHandler = (args: { event: Record<string, unknown>; body: unknown }) => Promise<void>;
+type RegisteredEventName = "message" | "app_mention";
 
-function createMessagesContext(overrides?: SlackSystemEventTestOverrides) {
+type MessageCase = {
+  overrides?: SlackSystemEventTestOverrides;
+  event?: Record<string, unknown>;
+  body?: unknown;
+};
+
+function createHandlers(eventName: RegisteredEventName, overrides?: SlackSystemEventTestOverrides) {
   const harness = createSlackSystemEventTestHarness(overrides);
   const handleSlackMessage = vi.fn(async () => {});
   registerSlackMessageEvents({
@@ -29,9 +33,14 @@ function createMessagesContext(overrides?: SlackSystemEventTestOverrides) {
     handleSlackMessage,
   });
   return {
-    getMessageHandler: () => harness.getHandler("message") as SlackMessageHandler | null,
+    handler: harness.getHandler(eventName) as MessageHandler | null,
     handleSlackMessage,
   };
+}
+
+function resetMessageMocks(): void {
+  messageQueueMock.mockClear();
+  messageAllowMock.mockReset().mockResolvedValue([]);
 }
 
 function makeChangedEvent(overrides?: { channel?: string; user?: string }) {
@@ -40,14 +49,8 @@ function makeChangedEvent(overrides?: { channel?: string; user?: string }) {
     type: "message",
     subtype: "message_changed",
     channel: overrides?.channel ?? "D1",
-    message: {
-      ts: "123.456",
-      user,
-    },
-    previous_message: {
-      ts: "123.450",
-      user,
-    },
+    message: { ts: "123.456", user },
+    previous_message: { ts: "123.450", user },
     event_ts: "123.456",
   };
 }
@@ -73,113 +76,106 @@ function makeThreadBroadcastEvent(overrides?: { channel?: string; user?: string 
     subtype: "thread_broadcast",
     channel: overrides?.channel ?? "D1",
     user,
-    message: {
-      ts: "123.456",
-      user,
-    },
+    message: { ts: "123.456", user },
     event_ts: "123.456",
   };
 }
 
+function makeAppMentionEvent(overrides?: {
+  channel?: string;
+  channelType?: "channel" | "group" | "im" | "mpim";
+  ts?: string;
+}) {
+  return {
+    type: "app_mention",
+    channel: overrides?.channel ?? "C123",
+    channel_type: overrides?.channelType ?? "channel",
+    user: "U1",
+    text: "<@U_BOT> hello",
+    ts: overrides?.ts ?? "123.456",
+  };
+}
+
+async function invokeRegisteredHandler(input: {
+  eventName: RegisteredEventName;
+  overrides?: SlackSystemEventTestOverrides;
+  event: Record<string, unknown>;
+  body?: unknown;
+}) {
+  resetMessageMocks();
+  const { handler, handleSlackMessage } = createHandlers(input.eventName, input.overrides);
+  expect(handler).toBeTruthy();
+  await handler!({
+    event: input.event,
+    body: input.body ?? {},
+  });
+  return { handleSlackMessage };
+}
+
+async function runMessageCase(input: MessageCase = {}): Promise<void> {
+  resetMessageMocks();
+  const { handler } = createHandlers("message", input.overrides);
+  expect(handler).toBeTruthy();
+  await handler!({
+    event: (input.event ?? makeChangedEvent()) as Record<string, unknown>,
+    body: input.body ?? {},
+  });
+}
+
 describe("registerSlackMessageEvents", () => {
-  it("enqueues message_changed system events when dmPolicy is open", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler } = createMessagesContext({ dmPolicy: "open" });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
-      event: makeChangedEvent(),
-      body: {},
-    });
-
-    expect(enqueueSystemEventMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("blocks message_changed system events when dmPolicy is disabled", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler } = createMessagesContext({ dmPolicy: "disabled" });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
-      event: makeChangedEvent(),
-      body: {},
-    });
-
-    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
-  });
-
-  it("blocks message_changed system events for unauthorized senders in allowlist mode", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler } = createMessagesContext({
-      dmPolicy: "allowlist",
-      allowFrom: ["U2"],
-    });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
-      event: makeChangedEvent({ user: "U1" }),
-      body: {},
-    });
-
-    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
-  });
-
-  it("blocks message_deleted system events for users outside channel users allowlist", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler } = createMessagesContext({
-      dmPolicy: "open",
-      channelType: "channel",
-      channelUsers: ["U_OWNER"],
-    });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
-      event: makeDeletedEvent({ channel: "C1", user: "U_ATTACKER" }),
-      body: {},
-    });
-
-    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
-  });
-
-  it("blocks thread_broadcast system events without an authenticated sender", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler } = createMessagesContext({ dmPolicy: "open" });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
-      event: {
-        ...makeThreadBroadcastEvent(),
-        user: undefined,
-        message: {
-          ts: "123.456",
+  const cases: Array<{ name: string; input: MessageCase; calls: number }> = [
+    {
+      name: "enqueues message_changed system events when dmPolicy is open",
+      input: { overrides: { dmPolicy: "open" }, event: makeChangedEvent() },
+      calls: 1,
+    },
+    {
+      name: "blocks message_changed system events when dmPolicy is disabled",
+      input: { overrides: { dmPolicy: "disabled" }, event: makeChangedEvent() },
+      calls: 0,
+    },
+    {
+      name: "blocks message_changed system events for unauthorized senders in allowlist mode",
+      input: {
+        overrides: { dmPolicy: "allowlist", allowFrom: ["U2"] },
+        event: makeChangedEvent({ user: "U1" }),
+      },
+      calls: 0,
+    },
+    {
+      name: "blocks message_deleted system events for users outside channel users allowlist",
+      input: {
+        overrides: {
+          dmPolicy: "open",
+          channelType: "channel",
+          channelUsers: ["U_OWNER"],
+        },
+        event: makeDeletedEvent({ channel: "C1", user: "U_ATTACKER" }),
+      },
+      calls: 0,
+    },
+    {
+      name: "blocks thread_broadcast system events without an authenticated sender",
+      input: {
+        overrides: { dmPolicy: "open" },
+        event: {
+          ...makeThreadBroadcastEvent(),
+          user: undefined,
+          message: { ts: "123.456" },
         },
       },
-      body: {},
-    });
-
-    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
+      calls: 0,
+    },
+  ];
+  it.each(cases)("$name", async ({ input, calls }) => {
+    await runMessageCase(input);
+    expect(messageQueueMock).toHaveBeenCalledTimes(calls);
   });
 
   it("passes regular message events to the message handler", async () => {
-    enqueueSystemEventMock.mockClear();
-    readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-    const { getMessageHandler, handleSlackMessage } = createMessagesContext({
-      dmPolicy: "open",
-    });
-    const messageHandler = getMessageHandler();
-    expect(messageHandler).toBeTruthy();
-
-    await messageHandler!({
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: { dmPolicy: "open" },
       event: {
         type: "message",
         channel: "D1",
@@ -187,10 +183,81 @@ describe("registerSlackMessageEvents", () => {
         text: "hello",
         ts: "123.456",
       },
-      body: {},
     });
 
     expect(handleSlackMessage).toHaveBeenCalledTimes(1);
-    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
+  it("handles channel and group messages via the unified message handler", async () => {
+    resetMessageMocks();
+    const { handler, handleSlackMessage } = createHandlers("message", {
+      dmPolicy: "open",
+      channelType: "channel",
+    });
+
+    expect(handler).toBeTruthy();
+
+    // channel_type distinguishes the source; all arrive as event type "message"
+    const channelMessage = {
+      type: "message",
+      channel: "C1",
+      channel_type: "channel",
+      user: "U1",
+      text: "hello channel",
+      ts: "123.100",
+    };
+    await handler!({ event: channelMessage, body: {} });
+    await handler!({
+      event: {
+        ...channelMessage,
+        channel_type: "group",
+        channel: "G1",
+        ts: "123.200",
+      },
+      body: {},
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(2);
+    expect(messageQueueMock).not.toHaveBeenCalled();
+  });
+
+  it("applies subtype system-event handling for channel messages", async () => {
+    // message_changed events from channels arrive via the generic "message"
+    // handler with channel_type:"channel" — not a separate event type.
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "message",
+      overrides: {
+        dmPolicy: "open",
+        channelType: "channel",
+      },
+      event: {
+        ...makeChangedEvent({ channel: "C1", user: "U1" }),
+        channel_type: "channel",
+      },
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+    expect(messageQueueMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips app_mention events for DM channel ids even with contradictory channel_type", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "app_mention",
+      overrides: { dmPolicy: "open" },
+      event: makeAppMentionEvent({ channel: "D123", channelType: "channel" }),
+    });
+
+    expect(handleSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it("routes app_mention events from channels to the message handler", async () => {
+    const { handleSlackMessage } = await invokeRegisteredHandler({
+      eventName: "app_mention",
+      overrides: { dmPolicy: "open" },
+      event: makeAppMentionEvent({ channel: "C123", channelType: "channel", ts: "123.789" }),
+    });
+
+    expect(handleSlackMessage).toHaveBeenCalledTimes(1);
   });
 });
