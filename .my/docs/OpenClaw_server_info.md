@@ -33,16 +33,21 @@ Po připojení přes `ssh openclaw` je webové rozhraní dostupné na:
 
 SSH konfigurace: `~/.ssh/config`
 
-## Tailscale VPN
+## WireGuard VPN (přístup z mobilu)
 
 | Parametr | Hodnota |
 |---|---|
-| **Tailscale IP serveru** | `100.115.228.96` |
-| **Tailscale IP telefon (Pixel 8a)** | `100.69.103.68` |
-| **Účet** | tomis1626@ |
+| **VPS WireGuard IP** | `10.10.0.1` |
+| **Mobil WireGuard IP** | `10.1.3.2` |
+| **Server config** | `/etc/wireguard/wg0.conf` |
+| **Port** | `51820/udp` |
+| **Subnet** | `10.10.0.0/24` |
 
-Tailscale umožňuje přístup k aplikacím z mobilu bez SSH tunelu.
-Porty 3800–3810 jsou dostupné přes Tailscale IP.
+WireGuard server na VPS umožňuje přístup k aplikacím z mobilu bez SSH tunelu.
+Mobil má WireGuard profil "HA" se dvěma peery — domácí router + VPS.
+Porty 3800–3810 jsou dostupné přes WireGuard IP (`10.10.0.1`).
+
+**Poznámka:** Tailscale byl odinstalován (2026-04-03), nahrazen WireGuard.
 
 ## Kontejnery na serveru
 
@@ -55,14 +60,14 @@ Porty 3800–3810 jsou dostupné přes Tailscale IP.
 ## Porty pro Claudiiny webové aplikace
 
 Rozsah **3800–3810** je pre-alokován v `docker-compose.override.yml`.
-Vystaveny na `127.0.0.1` (SSH tunel) i `100.115.228.96` (Tailscale).
+Vystaveny na `127.0.0.1` (SSH tunel) i `10.10.0.1` (WireGuard VPN).
 
 | Port | Aplikace |
 |---|---|
 | 3800 | Velké kameny (nocni-projekt) |
 | 3801–3810 | Volné |
 
-Přístup z mobilu: `http://100.115.228.96:38XX`
+Přístup z mobilu: `http://10.10.0.1:38XX`
 Přístup z PC: `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:38XX`
 
 ## OpenClaw - cesty na serveru
@@ -305,21 +310,21 @@ Váš počítač                          Hetzner VPS
 |  18790 -------+--tunnel---------+-> 127.0.0.1:18790 -> [OpenClaw]   |
 |  8080  -------+--tunnel---------+-> 127.0.0.1:8080  -> [myClaw]     |
 +---------------+                  |                                  |
-                                   | Tailscale VPN (100.115.228.96):  |
+                                   | WireGuard VPN (10.10.0.1):       |
 Mobil (Pixel 8a)                   |  3800-3810 -> [Claudie appky]    |
-+---------------+    Tailscale     |                                  |
-| 100.69.103.68 | ==============>  | Docker sítě (oddělené):          |
-| http://100.   |                  |   openclaw_default: [OpenClaw]   |
-|  115.228.96:  |                  |   myclaw_default:   [myClaw]     |
-|  38XX         |                  +----------------------------------+
-+---------------+
++---------------+    WireGuard     |                                  |
+| 10.1.3.2      | ==============>  | Docker sítě (oddělené):          |
+| http://10.    |  (port 51820)    |   openclaw_default: [OpenClaw]   |
+|  10.0.1:38XX  |                  |   myclaw_default:   [myClaw]     |
++---------------+                  +----------------------------------+
 ```
 
-- Všechny porty bindované na `127.0.0.1` + Tailscale IP (ne veřejně)
-- Porty 3800–3810 dostupné i přes Tailscale VPN (pro mobilní přístup)
+- Všechny porty bindované na `127.0.0.1` + WireGuard IP `10.10.0.1` (ne veřejně)
+- Porty 3800–3810 dostupné přes WireGuard VPN (pro mobilní přístup)
+- WireGuard port 51820/udp otevřen v UFW, porty 3800-3810 povoleny jen z `10.1.3.2`
 - Kontejnery na oddělených Docker sítích (nevidí se navzájem)
 - PII proxy port 3001 dostupný jen uvnitř Docker sítě (ne z hostu)
-- Přístup přes SSH tunel s klíčem nebo Tailscale VPN
+- Přístup přes SSH tunel s klíčem nebo WireGuard VPN
 - Gateway chráněný tokenem
 - Root SSH zakázán (`PermitRootLogin no`)
 
