@@ -16,6 +16,10 @@ services:
       start_period: 10s
 
   openclaw-gateway:
+    build:
+      context: .
+      args:
+        OPENCLAW_INSTALL_BROWSER: "1"
     ports:
       - "127.0.0.1:3800-3810:3800-3810"
       - "100.115.228.96:3800-3810:3800-3810"
