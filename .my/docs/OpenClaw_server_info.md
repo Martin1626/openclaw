@@ -62,13 +62,89 @@ Porty 3800–3810 jsou dostupné přes WireGuard IP (`10.10.0.1`).
 Rozsah **3800–3810** je pre-alokován v `docker-compose.override.yml`.
 Vystaveny na `127.0.0.1` (SSH tunel) i `10.10.0.1` (WireGuard VPN).
 
-| Port | Aplikace |
-|---|---|
-| 3800 | Velké kameny (nocni-projekt) |
-| 3801–3810 | Volné |
+| Port | Aplikace | Správa |
+|---|---|---|
+| 3800 | Velké kameny (nocni-projekt) | manuální |
+| 3801 | Brainbox (vault-viewer) | systemd (`openclaw-brainbox`) |
+| 3802–3810 | Volné | — |
 
 Přístup z mobilu: `http://10.10.0.1:38XX`
 Přístup z PC: `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:38XX`
+
+## Systemd služby pro webapps (od 2026-04-09)
+
+Host-level systemd platforma pro správu Node.js webapps běžících uvnitř OpenClaw kontejneru.
+Claudie může přidávat/odebírat služby přes JSON requesty v workspace — bez SSH přístupu.
+
+### Architektura
+
+```
+📱 Martin (Telegram): "Zapni službu X"
+   → Claudie zapíše JSON do workspace/services/requests/
+   → systemd .path watcher detekuje soubor
+   → processor validuje (port 3800-3810, cesta v workspace, bezpečný název)
+   → vytvoří systemd unit + start
+   → výsledek v workspace/services/results/
+```
+
+### Soubory na hostu
+
+| Soubor | Účel |
+|---|---|
+| `/home/deploy/services/openclaw-app-ctl.sh` | Runtime: start/stop/wait/cleanup (univerzální) |
+| `/home/deploy/services/openclaw-app-processor.sh` | Request processor (validace, generování units) |
+| `~/.config/systemd/user/openclaw-app-request.path` | Watcher na requesty |
+| `~/.config/systemd/user/openclaw-app-request.service` | Trigger pro processor |
+| `~/.config/systemd/user/openclaw-brainbox.service` | Brainbox unit |
+| `workspace/services/` | Sdílený prostor (requests, results, status.json) |
+
+### Správa
+
+```bash
+# Status
+systemctl --user status openclaw-brainbox
+
+# Restart
+systemctl --user restart openclaw-brainbox
+
+# Logy
+journalctl --user -u openclaw-brainbox -n 50 --no-pager
+
+# Stav všech služeb
+cat ~/.openclaw-gw/workspace/services/status.json
+```
+
+### Přidání nové služby (Claudie nebo manuálně)
+
+```bash
+# Manuálně přes JSON request:
+cat > ~/.openclaw-gw/workspace/services/requests/install-foo.json << 'EOF'
+{"action":"install","name":"foo","dir":"/home/node/.openclaw/workspace/projekty/foo","entry":"server.js","port":3802}
+EOF
+# Watcher automaticky zpracuje → výsledek v results/install-foo.json
+```
+
+### Bezpečnostní záruky
+
+- Porty jen 3800–3810
+- Cesta musí začínat `/home/node/.openclaw/workspace/`
+- Název: `[a-z0-9-]`, max 30 znaků
+- Entry soubor musí existovat v kontejneru
+- ExecStart je vždy šablona (`openclaw-app-ctl.sh`), žádný arbitrary exec
+
+### Technické detaily
+
+- **User-level systemd** (deploy, `Linger=yes`) — bez sudo
+- Node v24 v kontejneru přejmenuje proces na `MainThread` → `pgrep -f` (ne `-x`)
+- `ss` neexistuje v kontejneru → port check přes `node -e net.createServer().listen()`
+- Restart: `always`, `RestartSec=10`, `StartLimitBurst=10/300s`
+
+### Deaktivovaný cron watchdog
+
+Původní LLM cron watchdog pro Brainbox (ID `86cd92f5-901a-4b66-a479-d0faff1e9a4b`)
+byl deaktivován 2026-04-09. Script `ensure-brainbox.sh` stále existuje, ale nepoužívá se.
+
+Pro rollback: v `jobs.json` nastavit `enabled: true` pro daný ID.
 
 ## OpenClaw - cesty na serveru
 
@@ -88,13 +164,77 @@ Přístup z PC: `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:3
 | Údaj | Hodnota |
 |---|---|
 | **Gateway token** | `e09827b725998431a32baeac1a2b7e639951dfea0714b428877c5b5fa19c4729` |
-| **LLM provider** | Anthropic (Claude) |
-| **Auth metoda** | OAuth token (Bearer) přes Claude Code CLI |
+| **Primární LLM provider** | OpenAI Codex (GPT-5.4, ChatGPT Plus subscription) |
+| **Auth metoda (OpenAI)** | Codex OAuth (`openai-codex:default`, automatický refresh) |
+| **Záložní LLM provider** | Anthropic Claude (pozastaveno od 4.4.2026) |
+| **Auth metoda (Anthropic)** | OAuth token (Bearer) — blokováno pro third-party |
+| **OpenAI účet** | ChatGPT Plus, 499 Kč/měs |
 | **Anthropic konzole** | https://console.anthropic.com |
 
-## Anthropic OAuth — Token Broker (setup-token)
+## OpenAI Codex — primární LLM provider (od 2026-04-05)
 
 ### Jak to funguje
+
+OpenClaw používá OpenAI Codex OAuth (ChatGPT Plus subscription).
+OpenAI **explicitně povoluje** Codex OAuth v third-party nástrojích.
+
+```
+OpenClaw Gateway
+       │
+       │  openai-codex/gpt-5.4
+       │  OAuth (automatický refresh)
+       ▼
+ api.openai.com (Codex endpoint)
+```
+
+### Klíčové detaily
+
+- Model: `openai-codex/gpt-5.4`
+- Auth profil: `openai-codex:default` (mode: "oauth")
+- OAuth refresh: automatický (spravuje OpenClaw)
+- Rate limity: 160 msg/3h (Plus), 3000 msg/týden (GPT-5.4 Thinking)
+- PII proxy: NEPOUŽÍVÁ SE (jen pro Anthropic)
+
+### Nastavení / obnova OAuth
+
+```bash
+# V tmux (headless server):
+tmux new-session -d -s codex \
+  "cd /home/deploy/openclaw && docker compose exec openclaw-gateway \
+   npx openclaw models auth login --provider openai-codex --set-default 2>&1; \
+   echo EXIT_CODE=\$?; sleep 120"
+
+# Přečti URL:
+tmux capture-pane -t codex -p -S -50
+# Otevři URL v prohlížeči → přihlas se OpenAI účtem
+# Prohlížeč přesměruje na localhost:XXXX/auth/callback?code=...
+# Zkopíruj CELOU URL z adresního řádku a vlož:
+tmux send-keys -t codex '<CELÁ_REDIRECT_URL>' Enter
+# Ověř: "Auth profile: openai-codex:default"
+```
+
+### Přepnutí modelu
+
+V `/home/deploy/.openclaw-gw/openclaw.json`:
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai-codex/gpt-5.4"
+      }
+    }
+  }
+}
+```
+
+## Anthropic OAuth — Token Broker (záložní, pozastaveno od 2026-04-05)
+
+> **POZOR:** Od 4.4.2026 Anthropic blokuje subscription OAuth tokeny pro
+> third-party nástroje. Volání z OpenClaw se účtují z Extra Usage (pay-per-token),
+> ne z Max subscription. Primární provider je nyní OpenAI Codex (viz výše).
+
+### Jak to funguje (pokud se rozhodneš reaktivovat)
 
 OpenClaw používá OAuth token z Claude Code CLI (`claude setup-token`).
 Token je **dlouhodobý (1 rok)**, scope `user:inference`, bez refresh tokenu.

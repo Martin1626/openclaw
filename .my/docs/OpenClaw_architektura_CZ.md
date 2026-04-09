@@ -225,13 +225,18 @@ Uživatel (browser/Telegram/...)
   → Gateway přijme zprávu
     → Routing (který agent? který kanál?)
       → Session (kontext, paměť)
-        → LLM API (Anthropic Claude)
+        → LLM API (OpenAI Codex / Anthropic Claude)
           → Odpověď + volání nástrojů
             → Sandbox (pokud kód)
             → Skills (pokud aktivní)
           → Odpověď zpět do kanálu
         → Uživatel vidí odpověď
 ```
+
+**Aktuální LLM provider (od 2026-04-05):** OpenAI Codex (`openai-codex/gpt-5.4`)
+přes ChatGPT Plus subscription (499 Kč/měs). OpenAI explicitně povoluje Codex OAuth
+v third-party nástrojích. Anthropic Claude zůstává jako záložní profil (blokován
+pro third-party od 4.4.2026).
 
 ---
 
@@ -265,7 +270,7 @@ přes pre-alokované porty 3800–3810.
 - Porty vystaveny na `127.0.0.1` (SSH tunel) i `10.10.0.1` (WireGuard VPN)
 - Jiné porty nebudou dostupné — Docker je nevystaví
 - Aplikace žijí v `~/workspace/` (sdílený volume s hostem)
-- Aplikace nepřežijí restart kontejneru (netrvalé)
+- Aplikace nepřežijí restart kontejneru samy — pro trvalost použít systemd službu (viz níže)
 - Playwright + headless Chromium k dispozici pro testování (build arg `OPENCLAW_INSTALL_BROWSER=1`)
 - Server: 4 GB RAM + 2 GB swap (swappiness=10) — po Chromium testu vždy `browser.close()`
 
@@ -284,10 +289,33 @@ přes pre-alokované porty 3800–3810.
 
 ### Aktuální aplikace
 
-| Port | Aplikace | Popis |
-|---|---|---|
-| 3800 | Velké kameny (nocni-projekt) | Personal command center — C.S. Lewis citáty, denní kameny, kalendář, počasí |
-| 3801–3810 | Volné | |
+| Port | Aplikace | Popis | Správa |
+|---|---|---|---|
+| 3800 | Velké kameny (nocni-projekt) | Personal command center — C.S. Lewis citáty, denní kameny, kalendář, počasí | manuální |
+| 3801 | Brainbox (vault-viewer) | Obsidian-like vault viewer pro mobil, info-log | systemd |
+| 3802–3810 | Volné | | — |
+
+### Systemd služby pro trvalé webapps
+
+Webapps, které mají přežít restart kontejneru, jsou spravovány host-level systemd platformou.
+Claudie může přidávat/odebírat služby přes JSON requesty v workspace — bez SSH přístupu.
+
+```
+Claudie (kontejner)  →  workspace/services/requests/<uuid>.json
+                              ↓  (bind mount)
+Host systemd .path   →  detekuje nový soubor
+                              ↓
+Processor script     →  validuje → vytvoří unit → start
+                              ↓
+                         workspace/services/results/<uuid>.json  →  Claudie čte výsledek
+```
+
+**Bezpečnost:** Processor validuje vstupy — porty 3800-3810, cesta v workspace, bezpečný název.
+ExecStart je vždy šablona (`openclaw-app-ctl.sh`), žádný arbitrary exec.
+
+**Správa:** `systemctl --user {status|restart|stop} openclaw-<name>`
+**Logy:** `journalctl --user -u openclaw-<name>`
+**Detaily:** viz `OpenClaw_server_info.md` sekce "Systemd služby pro webapps"
 
 ---
 
@@ -353,34 +381,39 @@ Veškerá PII detekce je **lokální regex + česká znalostní báze** (jména,
 │  │  baseUrl:         │       │                       │     │
 │  │  pii-proxy        │       │  1. Regex PII detekce │     │
 │  └───────────────────┘       │  2. Anonymizace       │     │
-│                              │  3. Forward do        │     │
-│                              │     Anthropic API     │     │
-│                              │  4. De-anonymizace    │     │
-│                              │     odpovědi          │     │
-│                              └──────────┬────────────┘     │
-│                                         │                  │
-│                                         ▼                  │
-│                                ┌────────────────┐          │
-│                                │ Anthropic API  │          │
-│                                │ (cloud)        │          │
-│                                │ vidí jen       │          │
-│                                │ <PERSON_1>     │          │
-│                                │ <PHONE_1>      │          │
-│                                │ <EMAIL_1>      │          │
-│                                └────────────────┘          │
-└────────────────────────────────────────────────────────────┘
+│         │                    │  3. Forward do LLM API│     │
+│         │                    │  4. De-anonymizace    │     │
+│         │                    └───────┬───────┬───────┘     │
+│         │                            │       │             │
+│         │                            ▼       ▼             │
+│         │           ┌────────────┐  ┌────────────────┐     │
+│         │           │ OpenAI API │  │ Anthropic API  │     │
+│         │           │ (Codex)    │  │ (záloha)       │     │
+│         │           │ chatgpt.   │  │ api.anthropic  │     │
+│         │           │ com        │  │ .com           │     │
+│         │           │            │  │                │     │
+│         │           │ vidí jen   │  │ vidí jen       │     │
+│         │           │ <PERSON_1> │  │ <PERSON_1>     │     │
+│         │           └────────────┘  └────────────────┘     │
+└─────────┼──────────────────────────────────────────────────┘
 ```
 
 ### Jak to funguje
 
-1. OpenClaw pošle LLM request na `http://pii-proxy:3001/v1/messages`
+**OpenAI Codex (primární, od 2026-04-05):**
+1. OpenClaw pošle LLM request na `http://pii-proxy:3001/openai/codex/responses`
 2. Proxy zkontroluje `/noanon` marker — pokud přítomen, přeskočí anonymizaci
-3. Proxy extrahuje text z `messages[]` (systémový prompt se přeskakuje)
+3. Proxy extrahuje text z `input[]`/`messages[]` (OpenAI formát)
 4. Regex detekce PII entit (jména, telefony, emaily, adresy, rodná čísla, IBAN)
 5. Proxy nahradí PII číslovanými placeholdery: `Jan Novák` → `<PERSON_1>`
-6. Anonymizovaný request jde do Anthropic API
-7. Odpověď LLM projde de-anonymizací: `<PERSON_1>` → `Jan Novák`
+6. Anonymizovaný request jde do `chatgpt.com/backend-api/codex/responses`
+7. Odpověď (streaming SSE) projde de-anonymizací: `<PERSON_1>` → `Jan Novák`
 8. Uživatel vidí odpověď s reálnými údaji
+
+**Anthropic Claude (záložní):**
+1. OpenClaw pošle LLM request na `http://pii-proxy:3001/v1/messages`
+2. Stejný PII pipeline jako výše
+3. Forward do `api.anthropic.com/v1/messages`
 
 ### Detekce jmen — česká znalostní báze
 
@@ -425,8 +458,13 @@ Uživatel může jednorázově přeskočit anonymizaci přidáním `/noanon` na 
 | Session JSONL | VPS `/sessions/` | NE (originál) | NE |
 | Vault/Memory | VPS `/workspace/` | NE (originál) | NE |
 | Embeddings | VPS sqlite-vec | N/A (vektory) | NE (lokální model) |
-| **LLM prompt** | **Anthropic API** | **ANO** | **ANO → cloud** |
-| **LLM odpověď** | **Anthropic API** | **ANO** | **ANO → cloud** |
+| **LLM prompt (OpenAI)** | **OpenAI API** | **NE** (pii-proxy nepoužito) | **ANO → cloud** |
+| **LLM prompt (Anthropic)** | **Anthropic API** | **ANO** (přes pii-proxy) | **ANO → cloud** |
+| **LLM odpověď** | **OpenAI/Anthropic** | **viz výše** | **ANO → cloud** |
+
+> **Pozn.:** PII proxy anonymizuje pouze Anthropic provoz (`baseUrl: pii-proxy:3001`).
+> OpenAI Codex provoz jde přímo bez anonymizace. Pokud potřebuješ PII ochranu
+> i pro OpenAI, je třeba nastavit OpenAI provider přes pii-proxy.
 
 ### Docker služby
 
@@ -442,6 +480,11 @@ V `openclaw.json`:
 {
   "models": {
     "providers": {
+      "openai-codex": {
+        "baseUrl": "http://pii-proxy:3001/openai",
+        "api": "openai-codex-responses",
+        "models": []
+      },
       "anthropic": {
         "baseUrl": "http://pii-proxy:3001",
         "api": "anthropic-messages",
@@ -452,7 +495,7 @@ V `openclaw.json`:
 }
 ```
 
-V `docker-compose.yml`: pouze služba `pii-proxy`.
+V `docker-compose.override.yml`: služba `pii-proxy` (build z `./pii-proxy/`).
 
 ### Omezení
 
