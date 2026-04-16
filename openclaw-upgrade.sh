@@ -221,6 +221,7 @@ do_upgrade() {
     info "Fetch upstream tags..."
     if ! git fetch upstream --tags 2>&1 | tee -a "$LOG_FILE"; then
         fail "git fetch upstream selhal (síť?)"
+        restore_stash
         write_result "error" "$version_before" "git fetch upstream selhal" ""
         return 1
     fi
@@ -231,6 +232,7 @@ do_upgrade() {
         target_tag=$(get_latest_stable_tag)
         if [ -z "$target_tag" ]; then
             fail "Nepodařilo se najít latest stable tag"
+            restore_stash
             write_result "error" "$version_before" "Žádný stable tag nenalezen" ""
             return 1
         fi
@@ -243,6 +245,7 @@ do_upgrade() {
     if ! git rev-parse "$target_tag" >/dev/null 2>&1; then
         fail "Tag $target_tag neexistuje. Dostupné:"
         git tag -l 'v20*' | grep -v -E '(beta|alpha|rc|dev)' | sort -V | tail -5 | tee -a "$LOG_FILE"
+        restore_stash
         write_result "error" "$version_before" "Tag $target_tag neexistuje" ""
         return 1
     fi
@@ -250,6 +253,7 @@ do_upgrade() {
     # Zkontroluj, jestli není už na požadované verzi
     if git merge-base --is-ancestor "$target_tag" HEAD 2>/dev/null; then
         info "Tag $target_tag je již zahrnut v aktuální verzi."
+        restore_stash
         write_result "already_current" "$version_before" "Už na verzi $target_tag nebo novější" ""
         cleanup_trigger
         return 0
