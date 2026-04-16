@@ -200,6 +200,24 @@ print(f'{resp[\"count\"]} entities (codex format)')
 "
 }
 
+test_pii_noanon_codex() {
+    # Ověří, že /noanon bypass funguje v Codex input formátu
+    $COMPOSE exec -T pii-proxy python -c "
+import urllib.request, json
+req = urllib.request.Request('http://localhost:3001/test',
+    data=json.dumps({
+        'format': 'codex-input',
+        'input': [{'role': 'user', 'content': [
+            {'type': 'input_text', 'text': '/noanon Zavolej Janu Novakovi na +420731131426'}
+        ]}]
+    }).encode(),
+    headers={'Content-Type': 'application/json'}, method='POST')
+resp = json.loads(urllib.request.urlopen(req).read())
+assert resp['count'] == 0, f'Expected 0 entities with /noanon, got {resp[\"count\"]}'
+print('ok (noanon bypass works)')
+"
+}
+
 test_pii_openai_route() {
     # Ověří, že /openai/ route existuje (vrací non-404 pro POST)
     $COMPOSE exec -T pii-proxy python -c "
@@ -314,6 +332,7 @@ main() {
     run_test "pii_anonymization"    "functional" test_pii_anonymization
     run_test "pii_roundtrip"        "functional" test_pii_roundtrip
     run_test "pii_codex_format"     "functional" test_pii_codex_format
+    run_test "pii_noanon_codex"     "functional" test_pii_noanon_codex
     run_test "pii_openai_route"     "functional" test_pii_openai_route
     run_test "memory_status"        "functional" test_memory_status
     run_test "vault_indexed"        "functional" test_vault_indexed
