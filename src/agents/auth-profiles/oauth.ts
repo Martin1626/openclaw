@@ -7,7 +7,6 @@ import {
 import { loadConfig, type OpenClawConfig } from "../../config/config.js";
 import { coerceSecretRef } from "../../config/types.secrets.js";
 import { withFileLock } from "../../infra/file-lock.js";
-import { refreshAnthropicTokens } from "../../providers/anthropic-oauth.js";
 import { refreshQwenPortalCredentials } from "../../providers/qwen-portal-oauth.js";
 import { resolveSecretRefString, type SecretRefResolveCache } from "../../secrets/resolve.js";
 import { refreshChutesTokens } from "../chutes-oauth.js";
@@ -194,14 +193,7 @@ async function refreshOAuthTokenWithLock(params: {
               const newCredentials = await refreshQwenPortalCredentials(cred);
               return { apiKey: newCredentials.access, newCredentials };
             })()
-          : String(cred.provider) === "anthropic"
-            ? await (async () => {
-                const newCredentials = await refreshAnthropicTokens({
-                  credential: cred,
-                });
-                return { apiKey: newCredentials.access, newCredentials };
-              })()
-            : await (async () => {
+          : await (async () => {
               const oauthProvider = resolveOAuthProvider(cred.provider);
               if (!oauthProvider) {
                 return null;

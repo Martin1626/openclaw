@@ -211,11 +211,6 @@ export async function modelsAuthAddCommand(_opts: Record<string, never>, runtime
       ...(providerId === "anthropic"
         ? [
             {
-              value: "anthropic-oauth",
-              label: "OAuth (claude.ai)",
-              hint: "Sign in with your Claude account (auto-refresh)",
-            },
-            {
               value: "setup-token",
               label: "setup-token (claude)",
               hint: "Paste a setup-token from `claude setup-token`",
@@ -224,68 +219,7 @@ export async function modelsAuthAddCommand(_opts: Record<string, never>, runtime
         : []),
       { value: "paste", label: "paste token" },
     ],
-  })) as "anthropic-oauth" | "setup-token" | "paste";
-
-  if (method === "anthropic-oauth") {
-    const {
-      buildAnthropicAuthorizeUrl,
-      exchangeAnthropicCode,
-      generateAnthropicPkce,
-      parseAnthropicOAuthCallback,
-    } = await import("../../providers/anthropic-oauth.js");
-
-    const pkce = generateAnthropicPkce();
-    const authorizeUrl = buildAnthropicAuthorizeUrl(pkce);
-
-    runtime.log("\nOpen this URL in your browser to sign in with your Claude account:\n");
-    runtime.log(authorizeUrl);
-    runtime.log("\nAfter signing in, copy the full redirect URL and paste it below.\n");
-
-    const callbackInput = await text({
-      message: "Paste the redirect URL",
-      validate: (value) => {
-        const parsed = parseAnthropicOAuthCallback(String(value ?? ""), pkce.verifier);
-        if ("error" in parsed) {
-          return parsed.error;
-        }
-        return undefined;
-      },
-    });
-
-    const parsed = parseAnthropicOAuthCallback(String(callbackInput ?? ""), pkce.verifier);
-    if ("error" in parsed) {
-      throw new Error(parsed.error);
-    }
-
-    const credentials = await exchangeAnthropicCode({
-      code: parsed.code,
-      codeVerifier: pkce.verifier,
-    });
-
-    const profileId = "anthropic:oauth";
-    upsertAuthProfile({
-      profileId,
-      credential: {
-        type: "oauth",
-        provider: "anthropic",
-        access: credentials.access,
-        refresh: credentials.refresh,
-        expires: credentials.expires,
-      },
-    });
-
-    await updateConfig((cfg) =>
-      applyAuthProfileConfig(cfg, {
-        profileId,
-        provider: "anthropic",
-        mode: "oauth",
-      }),
-    );
-
-    logConfigUpdated(runtime);
-    runtime.log(`Auth profile: ${profileId} (anthropic/oauth)`);
-    return;
-  }
+  })) as "setup-token" | "paste";
 
   if (method === "setup-token") {
     await modelsAuthSetupTokenCommand({ provider: providerId }, runtime);
