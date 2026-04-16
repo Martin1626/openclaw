@@ -116,8 +116,8 @@ RUN printf 'packages:\n  - .\n  - ui\n' > /tmp/pnpm-workspace.runtime.yaml && \
     done && \
     cp /tmp/pnpm-workspace.runtime.yaml pnpm-workspace.yaml && \
     mkdir -p /tmp/_llama-backup && \
-    cp -a node_modules/node-llama-cpp /tmp/_llama-backup/ 2>/dev/null || true && \
-    cp -a node_modules/@node-llama-cpp /tmp/_llama-backup/ 2>/dev/null || true && \
+    cp -aL node_modules/node-llama-cpp /tmp/_llama-backup/ 2>/dev/null || true && \
+    cp -aL node_modules/@node-llama-cpp /tmp/_llama-backup/ 2>/dev/null || true && \
     CI=true NPM_CONFIG_FROZEN_LOCKFILE=false pnpm prune --prod && \
     if [ -d /tmp/_llama-backup/node-llama-cpp ]; then \
       cp -a /tmp/_llama-backup/node-llama-cpp node_modules/ && \
