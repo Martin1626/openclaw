@@ -79,9 +79,10 @@ restore_stash() {
 }
 
 sync_skill_templates() {
-    # Kopíruj repo skill šablony do workspace (jen pokud ve workspace ještě neexistují).
+    # Kopíruj custom skill šablony z .my/skills/ do workspace (jen pokud ve workspace ještě neexistují).
     # Workspace skills mají vyšší prioritu — nepřepisujeme Claudiiny úpravy.
-    local repo_skills="$ROOT_DIR/skills"
+    # Pozn: repo skills/ obsahuje upstream bundled skills — ty se NESYNCUJÍ.
+    local repo_skills="$ROOT_DIR/.my/skills"
     local ws_skills="$WORKSPACE/skills"
     if [ -d "$repo_skills" ]; then
         for skill_dir in "$repo_skills"/*/; do
