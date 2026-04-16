@@ -115,8 +115,9 @@ RUN printf 'packages:\n  - .\n  - ui\n' > /tmp/pnpm-workspace.runtime.yaml && \
       printf '  - %s/%s\n' "$OPENCLAW_BUNDLED_PLUGIN_DIR" "$ext" >> /tmp/pnpm-workspace.runtime.yaml; \
     done && \
     cp /tmp/pnpm-workspace.runtime.yaml pnpm-workspace.yaml && \
+    cp -a node_modules/node-llama-cpp /tmp/_node-llama-cpp 2>/dev/null || true && \
     CI=true NPM_CONFIG_FROZEN_LOCKFILE=false pnpm prune --prod && \
-    pnpm add node-llama-cpp@3.18.1 --save-optional 2>/dev/null || true && \
+    if [ -d /tmp/_node-llama-cpp ]; then cp -a /tmp/_node-llama-cpp node_modules/node-llama-cpp && rm -rf /tmp/_node-llama-cpp; fi && \
     node scripts/postinstall-bundled-plugins.mjs && \
     find dist -type f \( -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' -o -name '*.map' \) -delete
 
