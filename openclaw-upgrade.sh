@@ -18,6 +18,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${OPENCLAW_IMAGE:-openclaw:local}"
+IMAGE_REPO="${IMAGE_NAME%%:*}"  # "openclaw" (bez tagu, pro docker images query)
 UPSTREAM_URL="https://github.com/openclaw/openclaw.git"
 
 WORKSPACE="${OPENCLAW_WORKSPACE_DIR:-/home/deploy/.openclaw-gw/workspace}"
@@ -60,11 +61,11 @@ cleanup_trigger() {
 
 cleanup_old_backups() {
     local kept=0
-    for tag in $(docker images "$IMAGE_NAME" --format '{{.Tag}}' 2>/dev/null | grep '^backup-' | sort -r); do
+    for tag in $(docker images "$IMAGE_REPO" --format '{{.Tag}}' 2>/dev/null | grep '^backup-' | sort -r); do
         kept=$((kept + 1))
         if [ "$kept" -gt "$MAX_BACKUP_IMAGES" ]; then
             info "Mažu starý backup image: $IMAGE_NAME:$tag"
-            docker rmi "$IMAGE_NAME:$tag" 2>/dev/null || true
+            docker rmi "$IMAGE_REPO:$tag" 2>/dev/null || true
         fi
     done
 }
@@ -142,7 +143,7 @@ do_rollback() {
 
     # Najdi poslední backup image
     local backup_tag
-    backup_tag=$(docker images "$IMAGE_NAME" --format '{{.Tag}}' 2>/dev/null | grep '^backup-' | sort -r | head -1)
+    backup_tag=$(docker images "$IMAGE_REPO" --format '{{.Tag}}' 2>/dev/null | grep '^backup-' | sort -r | head -1)
     if [ -z "$backup_tag" ]; then
         fail "Žádný backup image nenalezen! Rollback není možný."
         write_result "rollback_failed" "" "Žádný backup image" ""
@@ -150,7 +151,7 @@ do_rollback() {
     fi
 
     info "Obnovuji image: $IMAGE_NAME:$backup_tag → $IMAGE_NAME"
-    docker tag "$IMAGE_NAME:$backup_tag" "$IMAGE_NAME"
+    docker tag "$IMAGE_REPO:$backup_tag" "$IMAGE_NAME"
 
     # Najdi poslední pre-upgrade git tag
     local git_backup_tag
@@ -270,7 +271,7 @@ do_upgrade() {
 
     # --- Záloha Docker image ---
     info "Záloha Docker image: $IMAGE_NAME → $IMAGE_NAME:backup-$timestamp"
-    docker tag "$IMAGE_NAME" "$IMAGE_NAME:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal (první instalace?)"
+    docker tag "$IMAGE_NAME" "$IMAGE_REPO:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal (první instalace?)"
 
     # --- Záloha git ---
     local git_backup_tag="local/pre-$target_tag"
@@ -296,7 +297,7 @@ do_upgrade() {
         fail "MERGE KONFLIKT! Automatický upgrade přerušen."
         git merge --abort 2>/dev/null || true
         git tag -d "$git_backup_tag" 2>/dev/null || true
-        docker rmi "$IMAGE_NAME:backup-$timestamp" 2>/dev/null || true
+        docker rmi "$IMAGE_REPO:backup-$timestamp" 2>/dev/null || true
         restore_stash
         write_result "conflict" "$version_before" "Merge konflikt s $target_tag — vyžaduje ruční řešení" ""
         return 1
@@ -379,7 +380,7 @@ do_deploy() {
 
     # Záloha Docker image
     info "Záloha Docker image: $IMAGE_NAME → $IMAGE_NAME:backup-$timestamp"
-    docker tag "$IMAGE_NAME" "$IMAGE_NAME:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal"
+    docker tag "$IMAGE_NAME" "$IMAGE_REPO:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal"
 
     # Build
     info "Build Docker image..."
