@@ -179,6 +179,44 @@ print(f'ok ({len(mapping)} entities)')
 "
 }
 
+test_pii_codex_format() {
+    # Ověří anonymizaci ve formátu Codex Responses API (input_text content blocks)
+    $COMPOSE exec -T pii-proxy python -c "
+import urllib.request, json
+req = urllib.request.Request('http://localhost:3001/test',
+    data=json.dumps({
+        'format': 'codex-input',
+        'input': [{'role': 'user', 'content': [
+            {'type': 'input_text', 'text': 'Zavolej Janu Novakovi na +420731131426'}
+        ]}]
+    }).encode(),
+    headers={'Content-Type': 'application/json'}, method='POST')
+resp = json.loads(urllib.request.urlopen(req).read())
+assert resp['count'] >= 2, f'Expected >=2 entities, got {resp[\"count\"]}'
+# Verify original PII is NOT in anonymized output
+out_str = json.dumps(resp['input'])
+assert '+420731131426' not in out_str, 'Phone number not anonymized in codex format'
+print(f'{resp[\"count\"]} entities (codex format)')
+"
+}
+
+test_pii_openai_route() {
+    # Ověří, že /openai/ route existuje (vrací non-404 pro POST)
+    $COMPOSE exec -T pii-proxy python -c "
+import urllib.request, json
+# Send minimal request to /openai/ route - expect auth error (401/403), NOT 404
+req = urllib.request.Request('http://localhost:3001/openai/v1/models',
+    method='GET')
+try:
+    urllib.request.urlopen(req)
+    print('ok (unexpected 200)')
+except urllib.error.HTTPError as e:
+    if e.code == 404:
+        raise AssertionError('/openai/ route returns 404 - not configured')
+    print(f'ok (route exists, status {e.code})')
+"
+}
+
 test_vault_indexed() {
     # Ověří, že vault je nakonfigurovaný v extraPaths a adresář není prázdný
     $COMPOSE exec -T openclaw-gateway node -e "
@@ -275,6 +313,8 @@ main() {
     echo "--- Functional ---"
     run_test "pii_anonymization"    "functional" test_pii_anonymization
     run_test "pii_roundtrip"        "functional" test_pii_roundtrip
+    run_test "pii_codex_format"     "functional" test_pii_codex_format
+    run_test "pii_openai_route"     "functional" test_pii_openai_route
     run_test "memory_status"        "functional" test_memory_status
     run_test "vault_indexed"        "functional" test_vault_indexed
     run_test "workspace_writeable"  "functional" test_workspace_writeable
