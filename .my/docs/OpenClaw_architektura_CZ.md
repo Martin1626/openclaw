@@ -169,10 +169,13 @@ Soubory na serveru:
 - Agent může bezpečně spouštět kód uvnitř sandboxu
 - Soubory: `src/agents/sandbox/`
 
-**6. Skills** — vestavěné dovednosti (50+)
-- github, brave-search, weather, obsidian, notion, spotify, skill-creator...
-- Každý skill = samostatný adresář v `skills/`
+**6. Skills** — dvouúrovňový systém
+- **Bundled skills** (50+): v Docker image (`/app/skills/`) — github, weather, obsidian, spotify...
+- **Workspace skills**: v `workspace/skills/` — custom skills, vyšší priorita než bundled
+- Claudie může vytvářet vlastní skills zápisem `SKILL.md` do `workspace/skills/<name>/`
+- Custom skill šablony v repo: `.my/skills/` (kopírovány do workspace při upgrade, nepřepisují existující)
 - ClawHub = marketplace pro komunitní skills
+- Žádné skill volume mounty — vše přes workspace auto-discovery
 
 **7. Plugins & MCP** — rozšiřitelnost
 - Plugin API pro vlastní rozšíření
@@ -613,6 +616,28 @@ container: /home/node/.openclaw/workspace/vault/Inbox/Plaud/FHB/<file>.md
 1. Edit `vault/Inbox/Plaud/projects.json`: `"Nový projekt": "project/Nový-projekt"`
 2. Edit `vault/Inbox/Plaud/linking-map.json` v sekci `projects`: přidat `"project/Nový-projekt": { "related": [...] }`
 3. Pro přepsání existujících záznamů: `docker exec openclaw-openclaw-gateway-1 python3 /home/node/.openclaw/workspace/scripts/plaud_link_enrich.py --all` (nebo počkat na noční job).
+
+---
+
+## Self-service upgrade (od 2026-04-16)
+
+Claudie může sama upgradovat OpenClaw na poslední stabilní verzi.
+
+```
+Claudie (kontejner) → workspace/.upgrade-trigger (JSON)
+       ↓
+systemd path unit (host) → openclaw-upgrade.sh
+       ↓
+git pull + merge upstream + docker compose build + restart + health check
+       ↓
+workspace/.upgrade-result (JSON) ← Claudie čte po restartu
+```
+
+- **Trigger akce:** `upgrade` (merge + build), `deploy` (jen build), `rollback`
+- **Automatický rollback:** Docker image backup + git tag; health check selhání → obnoví předchozí verzi
+- **Konfliktní plocha:** nulová (Anthropic OAuth patche odstraněny)
+- **Skill šablony:** `.my/skills/` → `workspace/skills/` (jen nové, nepřepisuje Claudiiny)
+- **Detaily:** viz `OpenClaw_server_info.md` sekce "Self-service upgrade"
 
 ---
 
