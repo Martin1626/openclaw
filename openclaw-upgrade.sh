@@ -217,7 +217,16 @@ do_upgrade() {
     # --- Upstream remote ---
     ensure_upstream_remote
 
-    # --- Fetch ---
+    # --- Pull z forku (může obsahovat merge provedený lokálně na PC) ---
+    info "Pull origin main..."
+    if ! git pull origin main 2>&1 | tee -a "$LOG_FILE"; then
+        fail "git pull origin selhal"
+        restore_stash
+        write_result "error" "$version_before" "git pull origin selhal" ""
+        return 1
+    fi
+
+    # --- Fetch upstream tags ---
     info "Fetch upstream tags..."
     if ! git fetch upstream --tags 2>&1 | tee -a "$LOG_FILE"; then
         fail "git fetch upstream selhal (síť?)"
