@@ -316,6 +316,18 @@ print(f'ok ({len(expected_tags)} entity types, {len(mapping)} total entities)')
 "
 }
 
+test_pii_proxy_syntax() {
+    # Ověří, že deployovaný proxy.py je syntakticky validní.
+    # Regrese: ad-hoc patche kdysi zanechaly fragmenty (`elif` bez `if`),
+    # což by při příštím rebuildu image zabilo kontejner při startu.
+    $COMPOSE exec -T pii-proxy python -c "
+import ast
+with open('/app/proxy.py', 'r') as f:
+    ast.parse(f.read())
+print('ok')
+"
+}
+
 test_env_vars_present() {
     # Ověří, že kritické env proměnné jsou v kontejneru nastaveny.
     # GROQ_API_KEY: používá se pro Codex fallback / tool calls; prázdný = skryté selhání.
@@ -439,6 +451,7 @@ main() {
     run_test "pii_codex_format"     "functional" test_pii_codex_format
     run_test "pii_noanon_codex"     "functional" test_pii_noanon_codex
     run_test "pii_openai_route"     "functional" test_pii_openai_route
+    run_test "pii_proxy_syntax"     "functional" test_pii_proxy_syntax
     run_test "pii_deanon_return_value" "functional" test_pii_deanon_return_value
     run_test "pii_phone_formats"    "functional" test_pii_phone_formats
     run_test "pii_entity_types"     "functional" test_pii_entity_types
