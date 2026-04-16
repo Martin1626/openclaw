@@ -1,6 +1,9 @@
 # Custom OpenClaw overrides (PII proxy, GROQ, custom skills)
 # This file is auto-merged by Docker Compose with docker-compose.yml.
 # Keep upstream-specific config in docker-compose.yml untouched.
+#
+# Custom skills žijí ve workspace/skills/ (ne jako volume mounty).
+# Repo skills/ slouží jen jako šablony pro počáteční deploy.
 
 services:
   pii-proxy:
@@ -32,7 +35,6 @@ services:
       - /home/deploy/.local/bin/gog:/usr/local/bin/gog:ro
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
-      - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
 
   openclaw-cli:
     environment:
@@ -41,4 +43,3 @@ services:
       - /home/deploy/.local/bin/gog:/usr/local/bin/gog:ro
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
-      - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro

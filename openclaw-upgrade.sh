@@ -78,6 +78,24 @@ restore_stash() {
     fi
 }
 
+sync_skill_templates() {
+    # Kopíruj repo skill šablony do workspace (jen pokud ve workspace ještě neexistují).
+    # Workspace skills mají vyšší prioritu — nepřepisujeme Claudiiny úpravy.
+    local repo_skills="$ROOT_DIR/skills"
+    local ws_skills="$WORKSPACE/skills"
+    if [ -d "$repo_skills" ]; then
+        for skill_dir in "$repo_skills"/*/; do
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            if [ -f "$skill_dir/SKILL.md" ] && [ ! -f "$ws_skills/$skill_name/SKILL.md" ]; then
+                info "Nový skill šablona: $skill_name → workspace"
+                mkdir -p "$ws_skills/$skill_name"
+                cp "$skill_dir/SKILL.md" "$ws_skills/$skill_name/SKILL.md"
+            fi
+        done
+    fi
+}
+
 check_disk_space() {
     local avail_mb
     avail_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
@@ -345,6 +363,9 @@ do_upgrade() {
         return 1
     fi
 
+    # --- Sync skill šablon do workspace ---
+    sync_skill_templates
+
     # --- Push na fork ---
     info "Push na origin (fork)..."
     git push origin main --tags 2>&1 | tee -a "$LOG_FILE" || warn "git push selhal (nic kritického, lokální verze běží)"
@@ -402,6 +423,7 @@ do_deploy() {
         return 1
     fi
 
+    sync_skill_templates
     cleanup_old_backups
 
     info "=========================================="
