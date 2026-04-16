@@ -360,6 +360,58 @@ do_upgrade() {
 }
 
 # ---------------------------------------------------------------------------
+# Deploy (jen build + restart, bez merge)
+# ---------------------------------------------------------------------------
+do_deploy() {
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+
+    info "=========================================="
+    info "OpenClaw deploy (bez merge)"
+    info "=========================================="
+
+    cd "$ROOT_DIR"
+    check_disk_space || { write_result "error" "" "Nedostatek místa na disku" ""; return 1; }
+
+    local version
+    version=$(get_current_version)
+    info "Verze: $version"
+
+    # Záloha Docker image
+    info "Záloha Docker image: $IMAGE_NAME → $IMAGE_NAME:backup-$timestamp"
+    docker tag "$IMAGE_NAME" "$IMAGE_NAME:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal"
+
+    # Build
+    info "Build Docker image..."
+    if ! docker compose build 2>&1 | tee -a "$LOG_FILE"; then
+        fail "Docker build selhal!"
+        write_result "build_failed" "$version" "Docker build selhal" "backup-$timestamp"
+        return 1
+    fi
+
+    # Restart
+    info "Restart kontejnerů..."
+    docker compose down 2>&1 | tee -a "$LOG_FILE"
+    docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+
+    # Health check
+    if ! health_check; then
+        warn "Health check selhal — spouštím automatický rollback..."
+        do_rollback "health check selhal po deploy"
+        return 1
+    fi
+
+    cleanup_old_backups
+
+    info "=========================================="
+    info "DEPLOY ÚSPĚŠNÝ: $version"
+    info "=========================================="
+
+    write_result "success" "$version" "Deploy (rebuild + restart)" "backup-$timestamp"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Hlavní logika
 # ---------------------------------------------------------------------------
 main() {
@@ -421,6 +473,9 @@ main() {
 
     # Akce
     case "$action" in
+        deploy)
+            do_deploy
+            ;;
         upgrade)
             do_upgrade "$target"
             ;;
