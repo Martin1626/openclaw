@@ -166,6 +166,42 @@ test_telegram_bots() {
     fi
 }
 
+test_pii_roundtrip() {
+    # Ověří, že anonymizace + de-anonymizace vrátí původní text
+    $COMPOSE exec -T pii-proxy python -c "
+from proxy import anonymize_text, deanonymize_text
+original = 'Zavolejte Janu Novákovi na +420731131426, email jan@firma.cz'
+anonymized, mapping = anonymize_text(original)
+assert '<PERSON' in anonymized, 'anonymization failed'
+restored = deanonymize_text(anonymized, mapping)
+assert restored == original, f'round-trip failed: {restored!r} != {original!r}'
+print(f'ok ({len(mapping)} entities)')
+"
+}
+
+test_vault_indexed() {
+    # Ověří, že vault je nakonfigurovaný v extraPaths a adresář není prázdný
+    $COMPOSE exec -T openclaw-gateway node -e "
+const fs = require('fs');
+const config = JSON.parse(fs.readFileSync('/home/node/.openclaw/openclaw.json'));
+const extra = config.agents?.defaults?.memorySearch?.extraPaths || [];
+if (!extra.includes('vault')) { console.error('vault not in extraPaths'); process.exit(1); }
+const vaultDir = '/home/node/.openclaw/workspace/vault';
+if (!fs.existsSync(vaultDir)) { console.error('vault dir missing'); process.exit(1); }
+const files = fs.readdirSync(vaultDir, { recursive: true }).filter(f => f.endsWith('.md'));
+if (files.length === 0) { console.error('vault empty (no .md files)'); process.exit(1); }
+console.log(files.length + ' markdown files in vault');
+"
+}
+
+test_workspace_writeable() {
+    # Ověří, že Claudie může zapisovat do workspace (upgrade triggery, skills)
+    $COMPOSE exec -T openclaw-gateway sh -c '
+TESTFILE="/home/node/.openclaw/workspace/.write-test-$$"
+echo "test" > "$TESTFILE" 2>&1 && rm -f "$TESTFILE" && echo "ok" || { rm -f "$TESTFILE"; echo "write failed"; exit 1; }
+'
+}
+
 test_llm_endpoint_reachable() {
     # Ověří, že nakonfigurovaný LLM provider je dosažitelný (bez LLM volání).
     # Čte baseUrl z configu a zkusí HTTP HEAD/GET na známý endpoint.
@@ -238,7 +274,10 @@ main() {
     echo ""
     echo "--- Functional ---"
     run_test "pii_anonymization"    "functional" test_pii_anonymization
+    run_test "pii_roundtrip"        "functional" test_pii_roundtrip
     run_test "memory_status"        "functional" test_memory_status
+    run_test "vault_indexed"        "functional" test_vault_indexed
+    run_test "workspace_writeable"  "functional" test_workspace_writeable
 
     echo ""
     echo "--- Integration ---"
