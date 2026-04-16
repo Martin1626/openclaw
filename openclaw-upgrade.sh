@@ -69,6 +69,14 @@ cleanup_old_backups() {
     done
 }
 
+restore_stash() {
+    if [ "${had_stash:-false}" = true ]; then
+        info "Obnovuji lokální změny (stash pop)..."
+        git stash pop 2>&1 | tee -a "$LOG_FILE" || warn "Stash pop měl konflikty — zkontroluj ručně"
+        had_stash=false
+    fi
+}
+
 check_disk_space() {
     local avail_mb
     avail_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
@@ -185,11 +193,20 @@ do_upgrade() {
     # --- Kontroly ---
     check_disk_space || { write_result "error" "" "Nedostatek místa na disku" ""; return 1; }
 
-    if [ -n "$(git status --porcelain)" ]; then
-        fail "Git working tree není čistý!"
-        git status --short | tee -a "$LOG_FILE"
-        write_result "error" "" "Git working tree není čistý" ""
+    # Kontrola: staged změny (index) nejsou povoleny
+    if [ -n "$(git diff --cached --name-only)" ]; then
+        fail "Git index má staged změny! Commitni nebo resetni před upgrade."
+        git diff --cached --name-only | tee -a "$LOG_FILE"
+        write_result "error" "" "Git index má staged změny" ""
         return 1
+    fi
+
+    # Stash lokálních změn (server má modifikované override, proxy.py atd.)
+    local had_stash=false
+    if [ -n "$(git status --porcelain)" ]; then
+        info "Stashing lokálních změn (server-specific soubory)..."
+        git stash push -m "pre-upgrade-$timestamp" --include-untracked 2>&1 | tee -a "$LOG_FILE"
+        had_stash=true
     fi
 
     # --- Verze před upgradem ---
@@ -267,6 +284,7 @@ do_upgrade() {
         git merge --abort 2>/dev/null || true
         git tag -d "$git_backup_tag" 2>/dev/null || true
         docker rmi "$IMAGE_NAME:backup-$timestamp" 2>/dev/null || true
+        restore_stash
         write_result "conflict" "$version_before" "Merge konflikt s $target_tag — vyžaduje ruční řešení" ""
         return 1
     fi
@@ -278,12 +296,17 @@ do_upgrade() {
     # --- Tag výsledku ---
     git tag "local/$target_tag" 2>/dev/null || true
 
+    # --- Obnovení lokálních změn před buildem ---
+    # (server-specific override, proxy.py atd. musí být přítomny pro build)
+    restore_stash
+
     # --- Build ---
     info "Build Docker image..."
     if ! docker compose build 2>&1 | tee -a "$LOG_FILE"; then
         fail "Docker build selhal! Rollback git..."
         git reset --hard "$git_backup_tag"
         git tag -d "local/$target_tag" 2>/dev/null || true
+        restore_stash
         write_result "build_failed" "$version_before" "Docker build selhal" "backup-$timestamp"
         return 1
     fi
