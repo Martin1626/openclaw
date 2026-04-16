@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw self-service upgrade
+Documentation=https://github.com/Martin1626/openclaw
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/deploy/openclaw
+ExecStart=/bin/bash /home/deploy/openclaw/openclaw-upgrade.sh
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

@@ -405,16 +405,91 @@ docker stats --no-stream
 
 ## Aktualizace OpenClaw
 
-### Rychlá aktualizace (z forku)
+### Self-service upgrade (Claudie provede sama)
 
-```bash
-cd ~/openclaw
-bash update-client.sh
+Claudie může provést upgrade na poslední stabilní verzi bez zásahu uživatele.
+
+**Architektura:**
+```
+Claudie (kontejner) → zapíše .upgrade-trigger do workspace
+       ↓
+systemd path unit (host) → detekuje soubor
+       ↓
+openclaw-upgrade.sh (host) → merge upstream + build + restart + health check
+       ↓
+výsledek → .upgrade-result ve workspace ← Claudie čte po restartu
 ```
 
-Skript provede: git pull → docker build → docker compose restart → health check.
+**Jak Claudie triggernuje upgrade:**
+```bash
+# Uvnitř kontejneru (Claudie):
+cat > /home/node/.openclaw/workspace/.upgrade-trigger << 'EOF'
+{"action":"upgrade","target":"latest-stable","timestamp":"2026-04-16T12:00:00Z"}
+EOF
+# Nebo konkrétní verze:
+{"action":"upgrade","target":"v2026.4.14","timestamp":"..."}
+# Nebo rollback:
+{"action":"rollback","timestamp":"..."}
+```
 
-### Merge z upstreamu (na lokálním PC)
+**Výsledek čte po restartu z:** `/home/node/.openclaw/workspace/.upgrade-result`
+
+**Co se děje na pozadí (host):**
+1. `flock` zamkne (prevence souběžných běhů)
+2. `git fetch upstream --tags` (přidá upstream remote pokud chybí)
+3. Resolve latest stable tag (nebo použije zadaný)
+4. `docker tag openclaw:local openclaw:backup-YYYYMMDD-HHMMSS`
+5. `git tag local/pre-<tag>` (záloha git stavu)
+6. `git merge <tag> --no-ff` (při konfliktu → abort, nic se nestane)
+7. `docker compose build` (automaticky vezme i override)
+8. `docker compose down && up -d`
+9. Health check (gateway + PII proxy, 60s timeout)
+10. Pokud health check selže → automatický rollback (backup image + git tag)
+11. Pokud OK → `git push origin main --tags`, cleanup starých backupů
+
+**Soubory na hostu:**
+| Soubor | Účel |
+|---|---|
+| `/home/deploy/openclaw/openclaw-upgrade.sh` | Hlavní upgrade skript |
+| `~/.config/systemd/user/openclaw-upgrade.path` | Watcher na trigger soubor |
+| `~/.config/systemd/user/openclaw-upgrade.service` | Spouští upgrade skript |
+
+**Soubory ve workspace (sdílené přes volume):**
+| Soubor (host) | Soubor (kontejner) | Účel |
+|---|---|---|
+| `~/.openclaw-gw/workspace/.upgrade-trigger` | `/home/node/.openclaw/workspace/.upgrade-trigger` | Trigger (Claudie zapíše) |
+| `~/.openclaw-gw/workspace/.upgrade-result` | `/home/node/.openclaw/workspace/.upgrade-result` | Výsledek (skript zapíše) |
+| `~/.openclaw-gw/workspace/.upgrade-log` | `/home/node/.openclaw/workspace/.upgrade-log` | Detailní log |
+
+**Správa systemd:**
+```bash
+# Status
+systemctl --user status openclaw-upgrade.path
+
+# Logy posledního upgrade
+journalctl --user -u openclaw-upgrade.service -n 100 --no-pager
+
+# Manuální dry-run
+cd ~/openclaw && bash openclaw-upgrade.sh dry-run
+
+# Manuální rollback
+cd ~/openclaw && bash openclaw-upgrade.sh rollback
+```
+
+**Instalace (jednorázová):**
+```bash
+# Zkopíruj systemd units
+cp ~/openclaw/scripts/systemd/openclaw-upgrade.path ~/.config/systemd/user/
+cp ~/openclaw/scripts/systemd/openclaw-upgrade.service ~/.config/systemd/user/
+
+# Aktivuj
+systemctl --user daemon-reload
+systemctl --user enable --now openclaw-upgrade.path
+```
+
+### Manuální merge z upstreamu (záložní postup)
+
+Použij, pokud automatický upgrade selže na merge konfliktech.
 
 ```bash
 cd ~/GitHub/OpenClaw
@@ -424,28 +499,53 @@ bash scripts/upgrade-from-upstream.sh v2026.X.Y
 git push origin main --tags
 ```
 
-### Deploy na server (po merge)
-
+Pak na serveru Claudie provede deploy (trigger s `"target":"latest-stable"`), nebo manuálně:
 ```bash
 ssh myclaw
-cd ~/openclaw
-git pull
-docker compose build
-docker compose down && docker compose up -d
-curl -f http://localhost:18789/healthz   # health check
+cd ~/openclaw && bash openclaw-upgrade.sh dry-run   # ověř
+# Claudie zapíše trigger, nebo ručně:
+echo '{"action":"upgrade","target":"latest-stable"}' > ~/.openclaw-gw/workspace/.upgrade-trigger
 ```
+
+### Rychlá aktualizace bez merge (zastaralé)
+
+```bash
+cd ~/openclaw
+bash update-client.sh
+```
+
+> **Pozn.:** `update-client.sh` je starší skript bez rollback mechanismu.
+> Pro nové upgrady použij `openclaw-upgrade.sh` (self-service nebo manuálně).
 
 **Architektura docker-compose:**
 - `docker-compose.yml` = čistá upstream verze (nemodifikovat!)
 - `docker-compose.override.yml` = vlastní služby (pii-proxy, GROQ env)
 - Docker Compose automaticky merguje oba soubory
 
-## Záloha před aktualizací
+## Záloha a rollback
 
+**Automatické zálohy při upgrade:**
+- Docker image: `openclaw:backup-YYYYMMDD-HHMMSS` (posledních 3)
+- Git: `local/pre-<tag>` tagy
+
+**Manuální záloha:**
 ```bash
 docker compose down
 tar czf ~/openclaw-backup-$(date +%Y%m%d).tar.gz \
   /home/deploy/.openclaw-gw/
+```
+
+**Rollback:**
+```bash
+# Přes Claudii (trigger soubor):
+echo '{"action":"rollback"}' > ~/.openclaw-gw/workspace/.upgrade-trigger
+
+# Nebo manuálně:
+cd ~/openclaw && bash openclaw-upgrade.sh rollback
+
+# Nebo zcela manuálně:
+docker tag openclaw:backup-YYYYMMDD-HHMMSS openclaw:local
+docker compose down && docker compose up -d
 ```
 
 ## Bezpečnostní architektura

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for OpenClaw upgrade trigger file
+Documentation=https://github.com/Martin1626/openclaw
+
+[Path]
+PathExists=/home/deploy/.openclaw-gw/workspace/.upgrade-trigger
+MakeDirectory=no
+
+[Install]
+WantedBy=default.target
