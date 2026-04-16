@@ -548,6 +548,58 @@ docker tag openclaw:backup-YYYYMMDD-HHMMSS openclaw:local
 docker compose down && docker compose up -d
 ```
 
+## Lokální embeddings (node-llama-cpp)
+
+node-llama-cpp je optional peer dependency, kterou `pnpm prune --prod` odstraní z Docker image.
+Řešení: nainstalovat do workspace volume (persistent) a symlinkovat entrypoint wrapperem.
+
+**Architektura:**
+```
+workspace/node_modules/node-llama-cpp/   (persistent, npm install jednorázově)
+        ↑ symlink (vytvořen při startu kontejneru)
+/app/node_modules/node-llama-cpp
+```
+
+**Jednorázová instalace (v kontejneru):**
+```bash
+docker compose exec openclaw-gateway bash -c \
+  'cd /home/node/.openclaw/workspace && npm install node-llama-cpp@3.18.1'
+```
+
+**Entrypoint wrapper** (`docker-entrypoint-wrapper.sh`):
+- Mountován do kontejneru přes `docker-compose.override.yml`
+- Vytváří symlink `/app/node_modules/node-llama-cpp → workspace/node_modules/node-llama-cpp`
+- Spouští se před gateway procesem
+
+**Ověření:**
+```bash
+docker compose exec openclaw-gateway node -e "import('node-llama-cpp').then(m => console.log('OK'))"
+```
+
+**Při upgradu node-llama-cpp verze:**
+```bash
+docker compose exec openclaw-gateway bash -c \
+  'cd /home/node/.openclaw/workspace && npm install node-llama-cpp@<NOVÁ_VERZE>'
+docker compose restart openclaw-gateway
+```
+
+**Důležité:** Dockerfile zůstává čistý upstream (bez custom changes). Tím se zachovává
+nulová konfliktní plocha při merge z upstreamu.
+
+## Active Memory a Dreaming (od 2026-04-16)
+
+**Active Memory:**
+- Plugin `active-memory` — AI sub-agent automaticky hledá relevantní kontext PŘED odpovědí
+- Config: `plugins.entries.active-memory.enabled: true`
+- Nastavení: `queryMode: "recent"`, `timeoutMs: 15000`, `agents: ["main"]`
+- Monitoring: `/verbose on` (v chatu)
+
+**Dreaming:**
+- Noční konsolidace paměti — promovuje opakující se témata do MEMORY.md
+- Config: `plugins.entries.memory-core.config.dreaming.enabled: true`
+- Schedule: `0 3 * * *` (3:00 CET), timezone `Europe/Prague`
+- Výstup: `DREAMS.md` (Dream Diary)
+
 ## Bezpečnostní architektura
 
 ```
@@ -587,3 +639,4 @@ Mobil (Pixel 8a)                   |   myclaw_default:   [myClaw]     |
 | 2026-02-21 | v2026.2.21 | Počáteční instalace |
 | 2026-02-27 | v2026.2.26 | Update z upstreamu, nové: `controlUi.dangerouslyAllowHostHeaderOriginFallback` |
 | 2026-03-02 | v2026.3.1 | Merge z upstreamu, nové: gateway healthcheck, CLI security hardening, docker-compose.override.yml |
+| 2026-04-16 | v2026.4.14 | Velký upgrade (v2026.3.13→v2026.4.14), self-service upgrade, Active Memory, Dreaming, skills refactor |

@@ -13,7 +13,7 @@ OpenClaw je nainstalován na Hetzner VPS v Docker kontejneru. Gateway běží, w
 ```
 ┌────────────────────────────────────────────────────────┐
 │                    OpenClaw Gateway                    │
-│                  (Node.js 22, TypeScript)              │
+│                  (Node.js 24, TypeScript)              │
 │                                                        │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
 │  │ Web UI   │  │ Channels │  │  Agents  │  │ Skills │  │
@@ -161,7 +161,9 @@ Soubory na serveru:
 **4. Agents & Sessions** — AI agent systém
 - Každá konverzace = session
 - Multi-agent routing (různé kanály → různí agenti)
-- Memory systém (plugin slot)
+- Memory systém: lokální embeddings (node-llama-cpp), sqlite-vec + FTS hybrid search
+- **Active Memory** plugin: automatický recall relevantního kontextu PŘED odpovědí
+- **Dreaming**: noční konsolidace paměti, promovuje vzory do MEMORY.md
 - Soubory: `src/agents/`, `src/sessions/`, `src/memory/`
 
 **5. Sandbox** — izolované prostředí pro spouštění kódu
