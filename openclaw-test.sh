@@ -17,9 +17,11 @@ COMPOSE="docker compose"
 # ---------------------------------------------------------------------------
 # Test framework
 # ---------------------------------------------------------------------------
-TESTS_JSON="[]"
 PASS=0
 FAIL=0
+TESTS_TMPFILE=$(mktemp)
+echo -n "[" > "$TESTS_TMPFILE"
+FIRST_TEST=true
 
 run_test() {
     local name="$1" group="$2"
@@ -42,12 +44,17 @@ run_test() {
     end_ms=$(date +%s%3N)
     local elapsed=$((end_ms - start_ms))
 
-    # Escape JSON strings
-    detail=$(echo "$detail" | head -3 | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c1-200)
+    # Sanitize detail for JSON (remove newlines, escape quotes, truncate)
+    detail=$(printf '%s' "$detail" | head -3 | tr '\n' ' ' | tr '"' "'" | cut -c1-200)
 
-    TESTS_JSON=$(echo "$TESTS_JSON" | sed "s/]$/,{\"name\":\"$name\",\"group\":\"$group\",\"status\":\"$status\",\"ms\":$elapsed,\"detail\":\"$detail\"}]/")
-    # Fix leading comma after [
-    TESTS_JSON=$(echo "$TESTS_JSON" | sed 's/\[,/[/')
+    # Append to temp file (avoid sed on dynamic content)
+    if [ "$FIRST_TEST" = true ]; then
+        FIRST_TEST=false
+    else
+        echo -n "," >> "$TESTS_TMPFILE"
+    fi
+    printf '{"name":"%s","group":"%s","status":"%s","ms":%d,"detail":"%s"}' \
+        "$name" "$group" "$status" "$elapsed" "$detail" >> "$TESTS_TMPFILE"
 
     if [ "$status" = "pass" ]; then
         echo "  ✓ $name (${elapsed}ms)"
@@ -249,6 +256,11 @@ main() {
     echo "=== Results: $PASS passed, $FAIL failed ==="
 
     # Write JSON result
+    echo -n "]" >> "$TESTS_TMPFILE"
+    local tests_json
+    tests_json=$(cat "$TESTS_TMPFILE")
+    rm -f "$TESTS_TMPFILE"
+
     local version
     version=$(git describe --tags --always 2>/dev/null || echo "unknown")
     cat > "$RESULT_FILE" <<EOJSON
@@ -257,7 +269,7 @@ main() {
   "version": "$version",
   "passed": $PASS,
   "failed": $FAIL,
-  "tests": $TESTS_JSON
+  "tests": $tests_json
 }
 EOJSON
     chmod 644 "$RESULT_FILE"
