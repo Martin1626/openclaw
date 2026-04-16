@@ -33,7 +33,6 @@ services:
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
       - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
-      - /home/deploy/openclaw/skills/upgrade/SKILL.md:/app/skills/upgrade/SKILL.md:ro
 
   openclaw-cli:
     environment:
@@ -43,4 +42,3 @@ services:
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
       - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
-      - /home/deploy/openclaw/skills/upgrade/SKILL.md:/app/skills/upgrade/SKILL.md:ro
