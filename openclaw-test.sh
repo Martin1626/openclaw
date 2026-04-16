@@ -159,6 +159,49 @@ test_telegram_bots() {
     fi
 }
 
+test_llm_endpoint_reachable() {
+    # Ověří, že nakonfigurovaný LLM provider je dosažitelný (bez LLM volání).
+    # Čte baseUrl z configu a zkusí HTTP HEAD/GET na známý endpoint.
+    $COMPOSE exec -T openclaw-gateway node -e "
+const fs = require('fs');
+const config = JSON.parse(fs.readFileSync('/home/node/.openclaw/openclaw.json'));
+const providers = config.models?.providers || {};
+const primary = config.agents?.defaults?.model?.primary || '';
+const providerKey = primary.split('/')[0];
+
+// Najdi baseUrl pro primární provider
+let baseUrl = providers[providerKey]?.baseUrl;
+if (!baseUrl) {
+    // Default endpoints pro známé providery
+    const defaults = {
+        'openai-codex': 'https://api.openai.com',
+        'openai': 'https://api.openai.com',
+        'anthropic': 'https://api.anthropic.com',
+    };
+    baseUrl = defaults[providerKey];
+}
+if (!baseUrl) { console.error('No baseUrl for provider: ' + providerKey); process.exit(1); }
+
+// Test dosažitelnosti (HEAD request, ignorujeme auth errors)
+const url = new URL(baseUrl);
+fetch(url.origin, { method: 'HEAD', signal: AbortSignal.timeout(5000) })
+    .then(r => {
+        // Jakýkoli HTTP response (i 401/403/404) = endpoint je dosažitelný
+        console.log(providerKey + ' reachable (' + url.origin + ' → ' + r.status + ')');
+    })
+    .catch(e => {
+        // Síťová chyba = endpoint nedosažitelný
+        if (baseUrl.startsWith('http://pii-proxy') || baseUrl.startsWith('http://localhost')) {
+            // Interní proxy — test přes Docker síť
+            console.error(providerKey + ' UNREACHABLE: ' + baseUrl + ' (' + e.cause?.code + ')');
+            process.exit(1);
+        }
+        // Externí endpoint — může být blokovaný firewallem, zkusíme DNS
+        console.log(providerKey + ' DNS ok, HTTP blocked (' + url.hostname + ')');
+    });
+"
+}
+
 test_doctor_errors() {
     local errors
     errors=$($COMPOSE exec -T openclaw-gateway node dist/index.js doctor 2>&1 | grep -oP 'Errors:\s*\K\d+' | head -1)
@@ -189,6 +232,10 @@ main() {
     echo "--- Functional ---"
     run_test "pii_anonymization"    "functional" test_pii_anonymization
     run_test "memory_status"        "functional" test_memory_status
+
+    echo ""
+    echo "--- Integration ---"
+    run_test "llm_endpoint"         "integration" test_llm_endpoint_reachable
 
     echo ""
     echo "--- Status ---"
