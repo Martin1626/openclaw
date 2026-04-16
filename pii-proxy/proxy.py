@@ -225,7 +225,7 @@ def _has_czech_name_signal(span: str) -> bool:
 # ---------------------------------------------------------------------------
 
 # Czech-specific
-_CZECH_PHONE = re.compile(r"(?:\+420[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3})")
+_CZECH_PHONE = re.compile(r"(?:(?:\+420|00420)[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\b[67]\d{2}[\s-]?\d{3}[\s-]?\d{3}\b)")
 _CZECH_BIRTH_NUMBER = re.compile(r"\b(\d{6})/(\d{3,4})\b")
 _CZECH_PSC = re.compile(r"\b(\d{3})\s(\d{2})\b")
 _CZECH_ICO = re.compile(r"\bIČO?\s*:?\s*(\d{8})\b", re.IGNORECASE)
@@ -491,7 +491,7 @@ def _anonymize_content_block(item, combined, counters, value_to_ph):
     """
     block_type = item.get("type")
 
-    if block_type == "text" and "text" in item:
+    if block_type in ("text", "input_text") and "text" in item:
         anon, m = _anonymize_text_shared(item["text"], counters, value_to_ph)
         combined.update(m)
         return {**item, "text": anon}
@@ -664,7 +664,6 @@ async def _stream_proxy(
                 yield f"data: {data_str}\n\n".encode()
                 continue
 
-            evt_type = data.get("type")
 
             if evt_type == "content_block_start":
                 block = data.get("content_block", {})
@@ -736,6 +735,7 @@ async def _stream_proxy(
 # ---------------------------------------------------------------------------
 
 _NOANON_PATTERN = re.compile(r"^/noanon\b[^\S\n]*", re.IGNORECASE | re.MULTILINE)
+_NOANON_SKILL_PATTERN = re.compile(r'Use the "noanon" skill', re.IGNORECASE)
 
 
 def _check_and_strip_noanon(body: dict) -> bool:
@@ -744,13 +744,19 @@ def _check_and_strip_noanon(body: dict) -> bool:
     If found, strip the marker from the message and return True.
     The gateway wraps user text in metadata, so /noanon may appear
     at the start of any line, not just the start of the string.
+    Supports both Anthropic messages[] and Codex input[] formats.
     """
-    messages = body.get("messages")
+    # Try both "messages" (Anthropic/Chat) and "input" (Codex)
+    messages = body.get("messages") or body.get("input")
     if not messages:
+        return False
+    if not isinstance(messages, list):
         return False
 
     # Find last user message
     for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
         if msg.get("role") != "user":
             continue
         content = msg.get("content")
@@ -760,11 +766,30 @@ def _check_and_strip_noanon(body: dict) -> bool:
                 return True
         elif isinstance(content, list):
             for item in content:
-                if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                if isinstance(item, dict) and item.get("type") in ("text", "input_text") and "text" in item:
                     if _NOANON_PATTERN.search(item["text"]):
                         item["text"] = _NOANON_PATTERN.sub("", item["text"])
                         return True
         break  # only check the last user message
+
+    # Also check: gateway may have already stripped /noanon and replaced it
+    # with a skill instruction like: Use the "noanon" skill for this request.
+    # ONLY check the LAST user message (not history — previous /noanon must not leak).
+    all_msgs = body.get("messages") or body.get("input")
+    if isinstance(all_msgs, list):
+        for msg in reversed(all_msgs):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            c = msg.get("content")
+            if isinstance(c, str) and _NOANON_SKILL_PATTERN.search(c):
+                return True
+            elif isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict) and "text" in item and _NOANON_SKILL_PATTERN.search(item["text"]):
+                        return True
+            break  # only last user message
 
     return False
 
@@ -881,9 +906,286 @@ async def proxy_messages(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI / Codex API proxy with PII anonymization
+# ---------------------------------------------------------------------------
+
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://chatgpt.com/backend-api")
+
+OPENAI_FORWARD_HEADERS = frozenset([
+    "authorization", "openai-organization", "openai-project",
+    "x-request-id", "user-agent",
+])
+
+
+def _anonymize_openai_body(body: dict) -> dict[str, str]:
+    """Anonymize OpenAI/Codex request body. Returns placeholder->original mapping."""
+    counters: dict[str, int] = defaultdict(int)
+    value_to_ph: dict[str, str] = {}
+
+    # Chat Completions format: messages[]
+    if "messages" in body:
+        anon_msgs, _ = anonymize_messages(body["messages"], counters, value_to_ph)
+        body["messages"] = anon_msgs
+
+    # Codex Responses format: input (string or array)
+    if "input" in body:
+        inp = body["input"]
+        if isinstance(inp, str):
+            anon, _map = anonymize_text(inp)
+            body["input"] = anon
+            for ph, orig in _map.items():
+                value_to_ph[orig] = ph
+        elif isinstance(inp, list):
+            anon_inp, _ = anonymize_messages(inp, counters, value_to_ph)
+            body["input"] = anon_inp
+
+    # instructions (Codex system prompt)
+    if "instructions" in body and isinstance(body["instructions"], str):
+        if ANONYMIZE_SYSTEM:
+            anon, _map = anonymize_text(body["instructions"])
+            body["instructions"] = anon
+            for ph, orig in _map.items():
+                value_to_ph[orig] = ph
+
+    return {v: k for k, v in value_to_ph.items()}
+
+
+def _extract_openai_text_delta(data: dict) -> tuple[str | None, str]:
+    """Extract text delta from OpenAI/Codex SSE event."""
+    # Codex Responses: {"type": "response.output_text.delta", "delta": "text"}
+    if data.get("type") == "response.output_text.delta" and "delta" in data:
+        return ("delta", data["delta"])
+    # Chat Completions: {"choices": [{"delta": {"content": "text"}}]}
+    choices = data.get("choices", [])
+    if choices and "delta" in choices[0]:
+        content = choices[0]["delta"].get("content")
+        if content is not None:
+            return ("choices[0].delta.content", content)
+    return (None, "")
+
+
+def _set_openai_text_delta(data: dict, field_path: str, text: str):
+    """Set text delta back into OpenAI/Codex SSE event."""
+    if field_path == "delta":
+        data["delta"] = text
+    elif field_path == "choices[0].delta.content":
+        data["choices"][0]["delta"]["content"] = text
+
+
+async def _stream_proxy_openai(
+    resp: httpx.Response,
+    mapping: dict[str, str],
+    client: httpx.AsyncClient,
+) -> AsyncGenerator[bytes, None]:
+    """Read OpenAI/Codex SSE stream, de-anonymize text deltas, re-emit."""
+    deanon = StreamDeanonymizer(mapping) if mapping else None
+
+    try:
+        async for raw_line in resp.aiter_lines():
+            if not raw_line:
+                yield b"\n"
+                continue
+
+            if raw_line.startswith("event:"):
+                yield (raw_line + "\n").encode()
+                continue
+
+            if not raw_line.startswith("data:"):
+                yield (raw_line + "\n").encode()
+                continue
+
+            data_str = raw_line[5:].strip()
+
+            if data_str == "[DONE]":
+                if deanon:
+                    remaining = deanon.flush()
+                    if remaining:
+                        flush_data = {"type": "response.output_text.delta", "delta": remaining}
+                        yield f"data: {json.dumps(flush_data, ensure_ascii=False)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                continue
+
+            if not deanon:
+                yield f"data: {data_str}\n\n".encode()
+                continue
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                yield f"data: {data_str}\n\n".encode()
+                continue
+
+            evt_type = data.get("type", data.get("object", "?"))
+            field_path, text = _extract_openai_text_delta(data)
+            if field_path and text:
+                processed = deanon.process(text)
+                if processed:
+                    _set_openai_text_delta(data, field_path, processed)
+                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+                continue
+
+            if evt_type in ("response.completed", "response.done"):
+                remaining = deanon.flush()
+                if remaining:
+                    flush_data = {"type": "response.output_text.delta", "delta": remaining}
+                    yield f"data: {json.dumps(flush_data, ensure_ascii=False)}\n\n".encode()
+
+            data = _deanonymize_dict_strings(data, mapping)
+            yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+
+    finally:
+        await resp.aclose()
+        await client.aclose()
+
+
+@app.api_route("/openai/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_openai(request: Request, path: str):
+    """Proxy OpenAI/Codex API with PII anonymization."""
+
+    target_url = f"{OPENAI_API_URL}/{path}"
+    raw_hdrs = {k.lower(): v for k, v in request.headers.items()}
+
+    fwd = {"content-type": raw_hdrs.get("content-type", "application/json")}
+    for h in OPENAI_FORWARD_HEADERS:
+        if h in raw_hdrs:
+            fwd[h] = raw_hdrs[h]
+
+    # GET requests: pass through (model listing etc.)
+    if request.method == "GET":
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(target_url, headers=fwd)
+            return Response(content=resp.content, status_code=resp.status_code,
+                          media_type=resp.headers.get("content-type"))
+
+    body = await request.json()
+
+    skip_pii = raw_hdrs.get("x-pii-skip", "").lower() in ("true", "1", "yes")
+                elif isinstance(_c, str):
+                break
+    if not skip_pii and _check_and_strip_noanon(body):
+        skip_pii = True
+        log.info("OpenAI: PII anonymization skipped (/noanon)")
+
+    is_stream = body.get("stream", False)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+
+    try:
+        if skip_pii:
+            mapping = {}
+        else:
+            mapping = _anonymize_openai_body(body)
+
+        if is_stream:
+            req = client.build_request("POST", target_url, json=body, headers=fwd)
+            resp = await client.send(req, stream=True)
+
+            if resp.status_code != 200:
+                err_body = await resp.aread()
+                await resp.aclose()
+                await client.aclose()
+                return Response(content=err_body, status_code=resp.status_code,
+                              media_type="application/json")
+
+            return StreamingResponse(
+                _stream_proxy_openai(resp, mapping, client),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+            )
+
+        # Non-streaming
+        resp = await client.post(target_url, json=body, headers=fwd, timeout=120.0)
+        await client.aclose()
+
+        if resp.status_code != 200:
+            return Response(content=resp.content, status_code=resp.status_code,
+                          media_type="application/json")
+
+        resp_data = resp.json()
+        if mapping:
+            resp_data = _deanonymize_dict_strings(resp_data, mapping)
+        return JSONResponse(content=resp_data)
+
+    except Exception as e:
+        await client.aclose()
+        log.error("OpenAI proxy error: %s", e, exc_info=True)
+        return JSONResponse({"error": {"type": "proxy_error", "message": str(e)}}, status_code=502)
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Test endpoint — post-upgrade verification
+# ---------------------------------------------------------------------------
+
+@app.post("/test")
+async def test_anonymization(request: Request):
+    """Test PII anonymization without forwarding to LLM.
+
+    Formats:
+      POST /test {"text": "Jan Novak +420731131426"}
+      POST /test {"format": "messages", "messages": [{"role": "user", "content": "PII text"}]}
+      POST /test {"format": "codex-input", "input": [{"role": "user", "content": [{"type": "input_text", "text": "PII"}]}]}
+    """
+    try:
+        body = await request.json()
+        fmt = body.get("format", "text")
+
+        if fmt == "text":
+            text = body.get("text", "")
+            if not text:
+                return JSONResponse({"error": "missing text field"}, status_code=400)
+            entities = detect_pii(text)
+            anonymized, mapping = anonymize_text(text)
+            return {
+                "format": "text",
+                "anonymized": anonymized,
+                "entities": [{"type": e["entity_type"], "start": e["start"], "end": e["end"]} for e in entities],
+                "count": len(entities),
+                "mapping_count": len(mapping),
+            }
+
+        elif fmt == "messages":
+            msgs = body.get("messages", [])
+            if not msgs:
+                return JSONResponse({"error": "missing messages"}, status_code=400)
+            counters = defaultdict(int)
+            value_to_ph = {}
+            anon_msgs, msg_map = anonymize_messages(msgs, counters, value_to_ph)
+            mapping = {v: k for k, v in value_to_ph.items()}
+            return {
+                "format": "messages",
+                "messages": anon_msgs,
+                "count": len(mapping),
+                "mapping_count": len(mapping),
+            }
+
+        elif fmt == "codex-input":
+            inp = body.get("input", [])
+            if not inp:
+                return JSONResponse({"error": "missing input"}, status_code=400)
+            test_body = {"input": inp}
+            if _check_and_strip_noanon(test_body):
+                mapping = {}
+            else:
+                mapping = _anonymize_openai_body(test_body)
+            return {
+                "format": "codex-input",
+                "input": test_body["input"],
+                "count": len(mapping),
+                "mapping_count": len(mapping),
+            }
+
+        else:
+            return JSONResponse({"error": "unknown format: " + fmt}, status_code=400)
+
+    except Exception as e:
+        log.error("Test endpoint error: %s", e, exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
