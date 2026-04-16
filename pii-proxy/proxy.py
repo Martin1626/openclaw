@@ -1060,8 +1060,6 @@ async def proxy_openai(request: Request, path: str):
     body = await request.json()
 
     skip_pii = raw_hdrs.get("x-pii-skip", "").lower() in ("true", "1", "yes")
-                elif isinstance(_c, str):
-                break
     if not skip_pii and _check_and_strip_noanon(body):
         skip_pii = True
         log.info("OpenAI: PII anonymization skipped (/noanon)")
