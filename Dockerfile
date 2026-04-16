@@ -167,11 +167,6 @@ RUN chown node:node /app
 COPY --from=runtime-assets --chown=node:node /app/dist ./dist
 COPY --from=runtime-assets --chown=node:node /app/node_modules ./node_modules
 COPY --from=runtime-assets --chown=node:node /app/package.json .
-
-# Install node-llama-cpp for local embeddings (optional peer dep stripped by pnpm prune).
-# Must run as root before USER switch (node_modules owned by node:node).
-RUN cd /app && npm install --no-save --legacy-peer-deps node-llama-cpp@3.18.1 && \
-    chown -R node:node /app/node_modules/node-llama-cpp /app/node_modules/@node-llama-cpp 2>/dev/null || true
 COPY --from=runtime-assets --chown=node:node /app/openclaw.mjs .
 COPY --from=runtime-assets --chown=node:node /app/${OPENCLAW_BUNDLED_PLUGIN_DIR} ./${OPENCLAW_BUNDLED_PLUGIN_DIR}
 COPY --from=runtime-assets --chown=node:node /app/skills ./skills

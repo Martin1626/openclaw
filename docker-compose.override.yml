@@ -1,9 +1,8 @@
-# Custom OpenClaw overrides (PII proxy, GROQ, custom skills)
+# Custom OpenClaw overrides (PII proxy, GROQ, local embeddings)
 # This file is auto-merged by Docker Compose with docker-compose.yml.
-# Keep upstream-specific config in docker-compose.yml untouched.
 #
 # Custom skills žijí ve workspace/skills/ (ne jako volume mounty).
-# Repo skills/ slouží jen jako šablony pro počáteční deploy.
+# Repo .my/skills/ slouží jen jako šablony pro počáteční deploy.
 
 services:
   pii-proxy:
@@ -23,6 +22,8 @@ services:
       context: .
       args:
         OPENCLAW_INSTALL_BROWSER: "1"
+    entrypoint: ["/home/deploy/openclaw/docker-entrypoint-wrapper.sh"]
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
     ports:
       - "127.0.0.1:3800-3810:3800-3810"
       - "10.10.0.1:3800-3810:3800-3810"
@@ -35,6 +36,7 @@ services:
       - /home/deploy/.local/bin/gog:/usr/local/bin/gog:ro
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
+      - /home/deploy/openclaw/docker-entrypoint-wrapper.sh:/home/deploy/openclaw/docker-entrypoint-wrapper.sh:ro
 
   openclaw-cli:
     environment:
