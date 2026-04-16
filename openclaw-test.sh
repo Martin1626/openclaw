@@ -235,6 +235,111 @@ except urllib.error.HTTPError as e:
 "
 }
 
+test_pii_deanon_return_value() {
+    # Ověří kontrakt _deanonymize_dict_strings: vrací nový objekt, nemutuje vstup.
+    # Regrese: opakovaný bug — volající ignorovali návratovou hodnotu → data zůstala anonymizovaná.
+    $COMPOSE exec -T pii-proxy python -c "
+from proxy import _deanonymize_dict_strings, anonymize_text
+original = 'Kontakt: Jan Novák, +420731131426'
+anon, mapping = anonymize_text(original)
+# Vstupní struktura simulující OpenAI/Anthropic response
+obj = {'output': [{'content': [{'text': anon}]}]}
+import copy
+snapshot = copy.deepcopy(obj)
+result = _deanonymize_dict_strings(obj, mapping)
+# 1. Musí vrátit nový objekt (ne None)
+assert result is not None, 'return value is None'
+# 2. Vstup musí zůstat nezměněný (no mutation)
+assert obj == snapshot, 'input was mutated'
+# 3. Výstup musí obsahovat deanonymizovaný text
+assert original.split(': ')[1] in result['output'][0]['content'][0]['text'], \
+    f'deanon failed: {result}'
+print('ok (returns new object, no mutation)')
+"
+}
+
+test_pii_phone_formats() {
+    # Ověří detekci českých telefonů ve všech formátech (+420, 00420, bare 6xx/7xx, s mezerami).
+    # Regrese: původně regex chytal jen +420 → bare čísla a 00420 prošla neanonymizovaná.
+    $COMPOSE exec -T pii-proxy python -c "
+from proxy import anonymize_text
+test_cases = [
+    ('+420731131426', '+420 no-space'),
+    ('+420 731 131 426', '+420 with spaces'),
+    ('00420731131426', '00420 no-space'),
+    ('00420 731 131 426', '00420 with spaces'),
+    ('731131426', 'bare 7xx'),
+    ('608123456', 'bare 6xx'),
+]
+failed = []
+for phone, label in test_cases:
+    text = f'Zavolej na {phone}'
+    anon, mapping = anonymize_text(text)
+    if phone in anon or '<PHONE' not in anon:
+        failed.append(label)
+if failed:
+    raise AssertionError(f'not anonymized: {failed}')
+print(f'ok ({len(test_cases)} phone formats)')
+"
+}
+
+test_pii_entity_types() {
+    # Ověří, že všechny klíčové PII entity typy jsou detekovány.
+    # Používá >= pro robustnost (regex může generovat více entit než záměrných).
+    $COMPOSE exec -T pii-proxy python -c "
+from proxy import anonymize_text
+# Testovací text obsahující všechny klíčové typy
+text = '''
+Kontakt: Jan Novák, Sokolovská 123, 18600 Praha 8
+Email: jan.novak@firma.cz, tel: +420731131426
+Karta: 4532015112830366
+IBAN: CZ6508000000192000145399
+Rodné číslo: 800101/1234
+IČO: 27082440
+DIČ: CZ27082440
+'''
+anon, mapping = anonymize_text(text)
+# Entity names match proxy.py: CZECH_ICO (ne COMPANY_ID), CZECH_DIC (ne VAT_ID)
+expected_tags = ['<PERSON', '<CZECH_ADDRESS', '<EMAIL', '<PHONE',
+                 '<CREDIT_CARD', '<IBAN', '<CZECH_BIRTH_NUMBER',
+                 '<CZECH_ICO', '<CZECH_DIC']
+missing = [tag for tag in expected_tags if tag not in anon]
+if missing:
+    raise AssertionError(f'missing entity tags: {missing}\\nanon={anon}')
+# Verify original PII is NOT in anonymized output
+sensitive = ['+420731131426', 'jan.novak@firma.cz', '4532015112830366',
+             'CZ6508000000192000145399', '800101/1234', '27082440']
+leaked = [s for s in sensitive if s in anon]
+if leaked:
+    raise AssertionError(f'PII leaked in anonymized output: {leaked}')
+print(f'ok ({len(expected_tags)} entity types, {len(mapping)} total entities)')
+"
+}
+
+test_env_vars_present() {
+    # Ověří, že kritické env proměnné jsou v kontejneru nastaveny.
+    # GROQ_API_KEY: používá se pro Codex fallback / tool calls; prázdný = skryté selhání.
+    # OPENCLAW_GATEWAY_TOKEN: autentizace pro webhooks (Caddy, Zapier).
+    $COMPOSE exec -T openclaw-gateway sh -c '
+MISSING=""
+for VAR in OPENCLAW_GATEWAY_TOKEN; do
+    eval "VAL=\$$VAR"
+    if [ -z "$VAL" ]; then
+        MISSING="$MISSING $VAR"
+    fi
+done
+# GROQ_API_KEY je optional (warning, ne fail)
+if [ -z "$GROQ_API_KEY" ]; then
+    echo "warn: GROQ_API_KEY not set (optional)" >&2
+fi
+if [ -n "$MISSING" ]; then
+    echo "missing critical env vars:$MISSING"
+    exit 1
+fi
+echo "ok"
+'
+}
+
 test_vault_indexed() {
     # Ověří, že vault je nakonfigurovaný v extraPaths a adresář není prázdný
     $COMPOSE exec -T openclaw-gateway node -e "
@@ -334,6 +439,9 @@ main() {
     run_test "pii_codex_format"     "functional" test_pii_codex_format
     run_test "pii_noanon_codex"     "functional" test_pii_noanon_codex
     run_test "pii_openai_route"     "functional" test_pii_openai_route
+    run_test "pii_deanon_return_value" "functional" test_pii_deanon_return_value
+    run_test "pii_phone_formats"    "functional" test_pii_phone_formats
+    run_test "pii_entity_types"     "functional" test_pii_entity_types
     run_test "memory_status"        "functional" test_memory_status
     run_test "vault_indexed"        "functional" test_vault_indexed
     run_test "workspace_writeable"  "functional" test_workspace_writeable
@@ -348,6 +456,7 @@ main() {
     run_test "active_memory"        "status"    test_active_memory_plugin
     run_test "dreaming"             "status"    test_dreaming_configured
     run_test "telegram_bots"        "status"    test_telegram_bots
+    run_test "env_vars_present"     "status"    test_env_vars_present
     run_test "doctor_errors"        "status"    test_doctor_errors
 
     echo ""
