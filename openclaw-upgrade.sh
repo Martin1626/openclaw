@@ -367,6 +367,12 @@ do_upgrade() {
     # --- Sync skill šablon do workspace ---
     sync_skill_templates
 
+    # --- Post-upgrade testy ---
+    if [ -x "$ROOT_DIR/openclaw-test.sh" ]; then
+        info "Spouštím post-upgrade testy..."
+        bash "$ROOT_DIR/openclaw-test.sh" 2>&1 | tee -a "$LOG_FILE" || warn "Některé testy selhaly (viz .upgrade-test-result)"
+    fi
+
     # --- Push na fork ---
     info "Push na origin (fork)..."
     git push origin main --tags 2>&1 | tee -a "$LOG_FILE" || warn "git push selhal (nic kritického, lokální verze běží)"
@@ -425,6 +431,12 @@ do_deploy() {
     fi
 
     sync_skill_templates
+
+    if [ -x "$ROOT_DIR/openclaw-test.sh" ]; then
+        info "Spouštím post-deploy testy..."
+        bash "$ROOT_DIR/openclaw-test.sh" 2>&1 | tee -a "$LOG_FILE" || warn "Některé testy selhaly (viz .upgrade-test-result)"
+    fi
+
     cleanup_old_backups
 
     info "=========================================="
