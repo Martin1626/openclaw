@@ -33,18 +33,26 @@ Po připojení přes `ssh openclaw` je webové rozhraní dostupné na:
 
 SSH konfigurace: `~/.ssh/config`
 
-## WireGuard VPN (přístup z mobilu)
+## WireGuard VPN (přístup z mobilu + notebooku)
 
 | Parametr | Hodnota |
 |---|---|
+| **VPS veřejná IP** | `46.225.142.130` |
 | **VPS WireGuard IP** | `10.10.0.1` |
-| **Mobil WireGuard IP** | `10.1.3.2` |
+| **VPS public key** | `rqDf0OGFvr9ls94SIQ2sfBi4JVOCy1ddFCpfZzG620A=` |
 | **Server config** | `/etc/wireguard/wg0.conf` |
 | **Port** | `51820/udp` |
 | **Subnet** | `10.10.0.0/24` |
 
-WireGuard server na VPS umožňuje přístup k aplikacím z mobilu bez SSH tunelu.
-Mobil má WireGuard profil "HA" se dvěma peery — domácí router + VPS.
+### Peery (klienti)
+
+| Zařízení | WG IP | Public key | UFW 3800–3810 |
+|---|---|---|---|
+| Mobil (Pixel 8a) | `10.1.3.2` | `vyxESQG6X+N9MCeiJFfIyUXleOt6dKQronCZi7oNQ2c=` | ✅ |
+| Notebook (Martin) | `10.10.0.10` | `eXTYKYbdI7p17NouhMQNSyckmESuSBkod8yidrF6XmI=` | ✅ (přidáno 2026-04-13) |
+
+WireGuard server na VPS umožňuje přístup k aplikacím bez SSH tunelu.
+Oba klienti mají WireGuard profil "HA" se dvěma peery — domácí router (Home Assistant) + OpenClaw VPS.
 Porty 3800–3810 jsou dostupné přes WireGuard IP (`10.10.0.1`).
 
 **Poznámka:** Tailscale byl odinstalován (2026-04-03), nahrazen WireGuard.
@@ -68,8 +76,8 @@ Vystaveny na `127.0.0.1` (SSH tunel) i `10.10.0.1` (WireGuard VPN).
 | 3801 | Brainbox (vault-viewer) | systemd (`openclaw-brainbox`) |
 | 3802–3810 | Volné | — |
 
-Přístup z mobilu: `http://10.10.0.1:38XX`
-Přístup z PC: `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:38XX`
+Přístup z mobilu: `http://10.10.0.1:38XX` (WireGuard)
+Přístup z notebooku: `http://10.10.0.1:38XX` (WireGuard) nebo `ssh -L 38XX:localhost:38XX openclaw -N` → `http://localhost:38XX`
 
 ## Systemd služby pro webapps (od 2026-04-09)
 
@@ -443,25 +451,29 @@ tar czf ~/openclaw-backup-$(date +%Y%m%d).tar.gz \
 ## Bezpečnostní architektura
 
 ```
-Váš počítač                          Hetzner VPS
+Notebook (Martin)                    Hetzner VPS
 +---------------+    SSH tunel     +----------------------------------+
 | localhost:    | ===============> | sshd :2222                       |
 |  18789 -------+--tunnel---------+-> 127.0.0.1:18789 -> [OpenClaw]   |
 |  18790 -------+--tunnel---------+-> 127.0.0.1:18790 -> [OpenClaw]   |
 |  8080  -------+--tunnel---------+-> 127.0.0.1:8080  -> [myClaw]     |
-+---------------+                  |                                  |
-                                   | WireGuard VPN (10.10.0.1):       |
-Mobil (Pixel 8a)                   |  3800-3810 -> [Claudie appky]    |
+|               |                  |                                  |
+| 10.10.0.10    |   WireGuard      | WireGuard VPN (10.10.0.1):       |
+| http://10.    | ==============>  |  3800-3810 -> [Claudie appky]    |
+|  10.0.1:38XX  |  (port 51820)    |                                  |
++---------------+                  | Docker sítě (oddělené):          |
+                                   |   openclaw_default: [OpenClaw]   |
+Mobil (Pixel 8a)                   |   myclaw_default:   [myClaw]     |
 +---------------+    WireGuard     |                                  |
-| 10.1.3.2      | ==============>  | Docker sítě (oddělené):          |
-| http://10.    |  (port 51820)    |   openclaw_default: [OpenClaw]   |
-|  10.0.1:38XX  |                  |   myclaw_default:   [myClaw]     |
+| 10.1.3.2      | ==============>  |                                  |
+| http://10.    |  (port 51820)    |                                  |
+|  10.0.1:38XX  |                  |                                  |
 +---------------+                  +----------------------------------+
 ```
 
 - Všechny porty bindované na `127.0.0.1` + WireGuard IP `10.10.0.1` (ne veřejně)
-- Porty 3800–3810 dostupné přes WireGuard VPN (pro mobilní přístup)
-- WireGuard port 51820/udp otevřen v UFW, porty 3800-3810 povoleny jen z `10.1.3.2`
+- Porty 3800–3810 dostupné přes WireGuard VPN (pro mobil i notebook)
+- WireGuard port 51820/udp otevřen v UFW, porty 3800-3810 povoleny jen z `10.1.3.2` (mobil) a `10.10.0.10` (notebook)
 - Kontejnery na oddělených Docker sítích (nevidí se navzájem)
 - PII proxy port 3001 dostupný jen uvnitř Docker sítě (ne z hostu)
 - Přístup přes SSH tunel s klíčem nebo WireGuard VPN
