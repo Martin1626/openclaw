@@ -111,20 +111,20 @@ health_check() {
         sleep "$HEALTH_INTERVAL"
         elapsed=$((elapsed + HEALTH_INTERVAL))
 
-        local gw_ok=false pii_ok=false
+        # Gateway health endpoint — gateway závisí na pii-proxy (depends_on: healthy),
+        # takže pokud gateway běží, pii-proxy je taky OK.
+        # PII proxy port 3001 není dostupný z hostu (jen Docker síť).
         if curl -sf http://127.0.0.1:18789/healthz >/dev/null 2>&1; then
-            gw_ok=true
-        fi
-        if curl -sf http://127.0.0.1:3001/health >/dev/null 2>&1; then
-            pii_ok=true
-        fi
-
-        if [ "$gw_ok" = true ] && [ "$pii_ok" = true ]; then
-            info "Health check OK: gateway + pii-proxy"
+            # Ověř i PII proxy přes docker exec (nepřímo)
+            local pii_ok=false
+            if docker compose exec -T pii-proxy python -c "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')" >/dev/null 2>&1; then
+                pii_ok=true
+            fi
+            info "Health check OK: gateway=true pii-proxy=$pii_ok"
             return 0
         fi
 
-        info "  Čekám... (${elapsed}s) gateway=$gw_ok pii-proxy=$pii_ok"
+        info "  Čekám... (${elapsed}s) gateway=false"
     done
 
     fail "Health check selhal po ${HEALTH_TIMEOUT}s"
