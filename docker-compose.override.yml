@@ -22,7 +22,7 @@ services:
         OPENCLAW_INSTALL_BROWSER: "1"
     ports:
       - "127.0.0.1:3800-3810:3800-3810"
-      - "100.115.228.96:3800-3810:3800-3810"
+      - "10.10.0.1:3800-3810:3800-3810"
     depends_on:
       pii-proxy:
         condition: service_healthy
@@ -33,6 +33,7 @@ services:
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
       - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
+      - /home/deploy/openclaw/skills/upgrade/SKILL.md:/app/skills/upgrade/SKILL.md:ro
 
   openclaw-cli:
     environment:
@@ -42,3 +43,4 @@ services:
       - /home/deploy/.config/gogcli:/home/node/.config/gogcli
       - /home/deploy/.node-llama-cpp-models:/home/node/.node-llama-cpp/models
       - /home/deploy/openclaw/skills/gog/SKILL.md:/app/skills/gog/SKILL.md:ro
+      - /home/deploy/openclaw/skills/upgrade/SKILL.md:/app/skills/upgrade/SKILL.md:ro
