@@ -72,6 +72,36 @@ except Exception:
         "https://api.telegram.org/bot${token}/sendMessage" 2>/dev/null || true
 }
 
+# Spustí heartbeat subshell sledující child PID. Každých $interval s pošle
+# Telegram zprávu s uplynulým časem + poslední BuildKit stage (pokud je k dispozici).
+# Vrací PID heartbeatu — zastav `stop_heartbeat $pid`.
+start_heartbeat() {
+    local label="$1" watch_pid="$2" interval="${3:-90}"
+    local start_ts
+    start_ts=$(date +%s)
+    (
+        while kill -0 "$watch_pid" 2>/dev/null; do
+            sleep "$interval"
+            kill -0 "$watch_pid" 2>/dev/null || break
+            local elapsed=$(($(date +%s) - start_ts))
+            local mm=$((elapsed / 60)) ss=$((elapsed % 60))
+            local stage
+            stage=$(tail -30 "$LOG_FILE" 2>/dev/null | grep -oE '#[0-9]+ \[[^]]+\]' | tail -1)
+            if [ -n "$stage" ]; then
+                telegram_notify "[HB] $label: ${mm}m${ss}s | $stage"
+            else
+                telegram_notify "[HB] $label: ${mm}m${ss}s"
+            fi
+        done
+    ) &
+    echo $!
+}
+stop_heartbeat() {
+    local pid="$1"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 dump_container_logs() {
     local why="${1:-health check failed}"
     info "=== Dump kontejnerových logů ($why) ==="
@@ -168,6 +198,7 @@ get_current_version() {
 
 health_check() {
     local elapsed=0
+    local next_notify=30  # první Telegram heartbeat po 30s, pak co 30s
     info "Čekám na health check (max ${HEALTH_TIMEOUT}s)..."
 
     while [ "$elapsed" -lt "$HEALTH_TIMEOUT" ]; do
@@ -188,6 +219,10 @@ health_check() {
         fi
 
         info "  Čekám... (${elapsed}s) gateway=false"
+        if [ "$elapsed" -ge "$next_notify" ]; then
+            telegram_notify "[HB] Health check: ${elapsed}/${HEALTH_TIMEOUT}s, gateway=false"
+            next_notify=$((next_notify + 30))
+        fi
     done
 
     fail "Health check selhal po ${HEALTH_TIMEOUT}s"
@@ -288,6 +323,7 @@ do_upgrade() {
     ensure_upstream_remote
 
     # --- Pull z forku (může obsahovat merge provedený lokálně na PC) ---
+    telegram_notify "[>>] Stahuji upstream tagy a pull origin main..."
     info "Pull origin main..."
     if ! git pull origin main 2>&1 | tee -a "$LOG_FILE"; then
         fail "git pull origin selhal"
@@ -396,9 +432,16 @@ do_upgrade() {
     info "Volné místo po úklidu: ${free_mb} MB"
     telegram_notify "[>>] Pre-build úklid OK (${free_mb} MB volných). Spouštím build..."
 
-    # --- Build ---
+    # --- Build (s heartbeat — build trvá 15-30 min, Telegram by jinak byl dlouho tichý) ---
     info "Build Docker image..."
-    if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
+    docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null &
+    local BUILD_PID=$!
+    local HB_PID
+    HB_PID=$(start_heartbeat "Build" "$BUILD_PID" 90)
+    wait "$BUILD_PID"
+    local build_exit=$?
+    stop_heartbeat "$HB_PID"
+    if [ "$build_exit" -ne 0 ]; then
         # Telegram NEJDŘÍV — další kroky můžou selhat (plný disk, git errory)
         telegram_notify "[FAIL] Docker build selhal. Vracím git na $version_before."
         fail "Docker build selhal! Rollback git..."
@@ -420,8 +463,10 @@ do_upgrade() {
 
     # --- Restart ---
     info "Restart kontejnerů..."
+    telegram_notify "[>>] Zastavuji staré kontejnery a spouštím nové..."
     docker compose down 2>&1 | tee -a "$LOG_FILE"
     docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+    telegram_notify "[>>] Kontejnery spuštěny. Čekám na health check (max ${HEALTH_TIMEOUT}s)..."
 
     # --- Health check ---
     if ! health_check; then
@@ -497,9 +542,16 @@ do_deploy() {
     info "Volné místo po úklidu: ${free_mb} MB"
     telegram_notify "[>>] Pre-build úklid OK (${free_mb} MB volných). Spouštím build..."
 
-    # Build
+    # Build (s heartbeat)
     info "Build Docker image..."
-    if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
+    docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null &
+    local BUILD_PID=$!
+    local HB_PID
+    HB_PID=$(start_heartbeat "Build" "$BUILD_PID" 90)
+    wait "$BUILD_PID"
+    local build_exit=$?
+    stop_heartbeat "$HB_PID"
+    if [ "$build_exit" -ne 0 ]; then
         telegram_notify "[FAIL] Docker build selhal při deploy."
         fail "Docker build selhal!"
         write_result "build_failed" "$version" "Docker build selhal" "backup-$timestamp" || true
@@ -508,8 +560,10 @@ do_deploy() {
 
     # Restart
     info "Restart kontejnerů..."
+    telegram_notify "[>>] Zastavuji a spouštím kontejnery..."
     docker compose down 2>&1 | tee -a "$LOG_FILE"
     docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+    telegram_notify "[>>] Kontejnery spuštěny. Čekám na health check (max ${HEALTH_TIMEOUT}s)..."
 
     # Health check
     if ! health_check; then
