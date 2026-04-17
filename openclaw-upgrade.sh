@@ -27,7 +27,7 @@ RESULT_FILE="$WORKSPACE/.upgrade-result"
 LOG_FILE="$WORKSPACE/.upgrade-log"
 LOCK_FILE="/tmp/openclaw-upgrade.lock"
 
-MIN_DISK_MB=2048
+MIN_DISK_MB=6144
 MAX_BACKUP_IMAGES=3
 HEALTH_TIMEOUT=120
 HEALTH_INTERVAL=5
@@ -38,9 +38,10 @@ OPENCLAW_CONFIG="${OPENCLAW_CONFIG:-/home/deploy/.openclaw-gw/openclaw.json}"
 # Pomocné funkce
 # ---------------------------------------------------------------------------
 TS() { date '+%Y-%m-%d %H:%M:%S'; }
-info()  { echo "[$(TS)] INFO:  $*" | tee -a "$LOG_FILE"; }
-warn()  { echo "[$(TS)] WARN:  $*" | tee -a "$LOG_FILE"; }
-fail()  { echo "[$(TS)] ERROR: $*" | tee -a "$LOG_FILE" >&2; }
+# Tee s tolerancí na plný disk — log I/O error nezabije skript pod set -euo pipefail.
+info()  { echo "[$(TS)] INFO:  $*"      | tee -a "$LOG_FILE" 2>/dev/null || echo "[$(TS)] INFO:  $*"; }
+warn()  { echo "[$(TS)] WARN:  $*"      | tee -a "$LOG_FILE" 2>/dev/null || echo "[$(TS)] WARN:  $*"; }
+fail()  { echo "[$(TS)] ERROR: $*" >&2; echo "[$(TS)] ERROR: $*" >> "$LOG_FILE" 2>/dev/null || true; }
 
 # Telegram notifikace přes @ClaudieReporterBot. Tichý fallback — nikdy nezabije upgrade.
 # Token a chat ID čte z openclaw.json (zdroj pravdy), žádné secrets v skriptu.
@@ -383,12 +384,16 @@ do_upgrade() {
     # (server-specific override, proxy.py atd. musí být přítomny pro build)
     restore_stash
 
+    # --- Pre-build úklid (prevence no-space-left during extract) ---
+    info "Docker builder prune (uvolňuji cache před buildem)..."
+    docker builder prune -af 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+
     # --- Build ---
     info "Build Docker image..."
-    if ! docker compose build 2>&1 | tee -a "$LOG_FILE"; then
+    if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
         fail "Docker build selhal! Rollback git..."
         telegram_notify "[FAIL] Docker build selhal. Vracím git na $version_before."
-        git reset --hard "$git_backup_tag"
+        git reset --hard "$git_backup_tag" 2>&1 | tee -a "$LOG_FILE" 2>/dev/null || true
         git tag -d "local/$target_tag" 2>/dev/null || true
         restore_stash
         write_result "build_failed" "$version_before" "Docker build selhal" "backup-$timestamp"
@@ -473,10 +478,15 @@ do_deploy() {
     info "Záloha Docker image: $IMAGE_NAME → $IMAGE_NAME:backup-$timestamp"
     docker tag "$IMAGE_NAME" "$IMAGE_REPO:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal"
 
+    # Pre-build úklid
+    info "Docker builder prune..."
+    docker builder prune -af 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+
     # Build
     info "Build Docker image..."
-    if ! docker compose build 2>&1 | tee -a "$LOG_FILE"; then
+    if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
         fail "Docker build selhal!"
+        telegram_notify "[FAIL] Docker build selhal při deploy."
         write_result "build_failed" "$version" "Docker build selhal" "backup-$timestamp"
         return 1
     fi
