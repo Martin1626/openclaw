@@ -27,8 +27,8 @@ RESULT_FILE="$WORKSPACE/.upgrade-result"
 LOG_FILE="$WORKSPACE/.upgrade-log"
 LOCK_FILE="/tmp/openclaw-upgrade.lock"
 
-MIN_DISK_MB=6144
-MAX_BACKUP_IMAGES=3
+MIN_DISK_MB=10240
+MAX_BACKUP_IMAGES=1
 HEALTH_TIMEOUT=120
 HEALTH_INTERVAL=5
 
@@ -384,19 +384,28 @@ do_upgrade() {
     # (server-specific override, proxy.py atd. musí být přítomny pro build)
     restore_stash
 
-    # --- Pre-build úklid (prevence no-space-left during extract) ---
-    info "Docker builder prune (uvolňuji cache před buildem)..."
-    docker builder prune -af 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+    # --- Pre-build úklid (prevence no-space-left během extract) ---
+    # Klíčové: smazat staré backupy + dangling images PŘED buildem, ne po.
+    # Při opakovaných neúspěšných buildech se jinak backupy kumulují a přeplní disk.
+    info "Pre-build úklid: staré backupy, dangling images, build cache..."
+    cleanup_old_backups
+    docker image prune -f 2>&1 | tail -2 | tee -a "$LOG_FILE" 2>/dev/null || true
+    docker builder prune -af 2>&1 | tail -2 | tee -a "$LOG_FILE" 2>/dev/null || true
+    local free_mb
+    free_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
+    info "Volné místo po úklidu: ${free_mb} MB"
+    telegram_notify "[>>] Pre-build úklid OK (${free_mb} MB volných). Spouštím build..."
 
     # --- Build ---
     info "Build Docker image..."
     if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
-        fail "Docker build selhal! Rollback git..."
+        # Telegram NEJDŘÍV — další kroky můžou selhat (plný disk, git errory)
         telegram_notify "[FAIL] Docker build selhal. Vracím git na $version_before."
+        fail "Docker build selhal! Rollback git..."
         git reset --hard "$git_backup_tag" 2>&1 | tee -a "$LOG_FILE" 2>/dev/null || true
         git tag -d "local/$target_tag" 2>/dev/null || true
-        restore_stash
-        write_result "build_failed" "$version_before" "Docker build selhal" "backup-$timestamp"
+        restore_stash || true
+        write_result "build_failed" "$version_before" "Docker build selhal" "backup-$timestamp" || true
         return 1
     fi
     telegram_notify "[>>] Build OK. Restartuji kontejnery..."
@@ -478,16 +487,22 @@ do_deploy() {
     info "Záloha Docker image: $IMAGE_NAME → $IMAGE_NAME:backup-$timestamp"
     docker tag "$IMAGE_NAME" "$IMAGE_REPO:backup-$timestamp" 2>/dev/null || warn "Backup image tagging selhal"
 
-    # Pre-build úklid
-    info "Docker builder prune..."
-    docker builder prune -af 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+    # Pre-build úklid (agresivní)
+    info "Pre-build úklid: staré backupy, dangling images, build cache..."
+    cleanup_old_backups
+    docker image prune -f 2>&1 | tail -2 | tee -a "$LOG_FILE" 2>/dev/null || true
+    docker builder prune -af 2>&1 | tail -2 | tee -a "$LOG_FILE" 2>/dev/null || true
+    local free_mb
+    free_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
+    info "Volné místo po úklidu: ${free_mb} MB"
+    telegram_notify "[>>] Pre-build úklid OK (${free_mb} MB volných). Spouštím build..."
 
     # Build
     info "Build Docker image..."
     if ! docker compose build 2>&1 | tee -a "$LOG_FILE" 2>/dev/null; then
-        fail "Docker build selhal!"
         telegram_notify "[FAIL] Docker build selhal při deploy."
-        write_result "build_failed" "$version" "Docker build selhal" "backup-$timestamp"
+        fail "Docker build selhal!"
+        write_result "build_failed" "$version" "Docker build selhal" "backup-$timestamp" || true
         return 1
     fi
 
