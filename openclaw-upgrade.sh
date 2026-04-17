@@ -29,8 +29,10 @@ LOCK_FILE="/tmp/openclaw-upgrade.lock"
 
 MIN_DISK_MB=2048
 MAX_BACKUP_IMAGES=3
-HEALTH_TIMEOUT=60
+HEALTH_TIMEOUT=120
 HEALTH_INTERVAL=5
+
+OPENCLAW_CONFIG="${OPENCLAW_CONFIG:-/home/deploy/.openclaw-gw/openclaw.json}"
 
 # ---------------------------------------------------------------------------
 # Pomocné funkce
@@ -39,6 +41,46 @@ TS() { date '+%Y-%m-%d %H:%M:%S'; }
 info()  { echo "[$(TS)] INFO:  $*" | tee -a "$LOG_FILE"; }
 warn()  { echo "[$(TS)] WARN:  $*" | tee -a "$LOG_FILE"; }
 fail()  { echo "[$(TS)] ERROR: $*" | tee -a "$LOG_FILE" >&2; }
+
+# Telegram notifikace přes @ClaudieReporterBot. Tichý fallback — nikdy nezabije upgrade.
+# Token a chat ID čte z openclaw.json (zdroj pravdy), žádné secrets v skriptu.
+telegram_notify() {
+    local text="$1"
+    [ -f "$OPENCLAW_CONFIG" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local creds token chat_id
+    creds=$(python3 -c "
+import json, sys
+try:
+    with open('$OPENCLAW_CONFIG') as f:
+        c = json.load(f)
+    r = c.get('channels', {}).get('telegram', {}).get('accounts', {}).get('reporter', {})
+    print(r.get('botToken', ''))
+    allow = r.get('allowFrom') or []
+    print(allow[0] if allow else '')
+except Exception:
+    pass
+" 2>/dev/null)
+    token=$(echo "$creds" | sed -n '1p')
+    chat_id=$(echo "$creds" | sed -n '2p')
+    [ -n "$token" ] && [ -n "$chat_id" ] || return 0
+    curl -fsS -m 10 -o /dev/null \
+        --data-urlencode "chat_id=$chat_id" \
+        --data-urlencode "text=$text" \
+        --data-urlencode "disable_web_page_preview=true" \
+        "https://api.telegram.org/bot${token}/sendMessage" 2>/dev/null || true
+}
+
+dump_container_logs() {
+    local why="${1:-health check failed}"
+    info "=== Dump kontejnerových logů ($why) ==="
+    for svc in openclaw-gateway pii-proxy; do
+        local cname="openclaw-${svc}-1"
+        info "--- docker logs $cname (last 100) ---"
+        docker logs --tail 100 "$cname" >> "$LOG_FILE" 2>&1 || info "  (logs neodstupné: $cname)"
+    done
+    info "=== Konec dumpu ==="
+}
 
 write_result() {
     local status="$1" version="${2:-}" message="${3:-}" rollback_tag="${4:-}"
@@ -148,6 +190,7 @@ health_check() {
     done
 
     fail "Health check selhal po ${HEALTH_TIMEOUT}s"
+    dump_container_logs "health check timeout po ${HEALTH_TIMEOUT}s"
     return 1
 }
 
@@ -157,6 +200,7 @@ health_check() {
 do_rollback() {
     local reason="${1:-manuální rollback}"
     info "=== ROLLBACK: $reason ==="
+    telegram_notify "[ROLLBACK] Spouštím rollback. Důvod: $reason"
 
     cd "$ROOT_DIR"
 
@@ -186,10 +230,14 @@ do_rollback() {
 
     if health_check; then
         info "=== ROLLBACK ÚSPĚŠNÝ ==="
-        write_result "rollback_ok" "$(get_current_version)" "Rollback z důvodu: $reason" "$backup_tag"
+        local ver
+        ver=$(get_current_version)
+        telegram_notify "[OK] Rollback úspěšný. Verze: $ver"
+        write_result "rollback_ok" "$ver" "Rollback z důvodu: $reason" "$backup_tag"
         return 0
     else
         fail "=== ROLLBACK SELHAL — systém může být nestabilní ==="
+        telegram_notify "[FAIL] ROLLBACK SELHAL — systém může být nestabilní! Zkontroluj server ručně."
         write_result "rollback_failed" "$(get_current_version)" "Rollback i health check selhaly" "$backup_tag"
         return 1
     fi
@@ -207,6 +255,7 @@ do_upgrade() {
     info "OpenClaw upgrade zahájen"
     info "Cíl: $target"
     info "=========================================="
+    telegram_notify "[START] Upgrade zahájen. Cíl: $target"
 
     cd "$ROOT_DIR"
 
@@ -325,6 +374,7 @@ do_upgrade() {
     local version_after
     version_after=$(get_current_version)
     info "Merge úspěšný: $version_before → $version_after"
+    telegram_notify "[>>] Merge OK: $version_before → $version_after. Spouštím build..."
 
     # --- Tag výsledku ---
     git tag "local/$target_tag" 2>/dev/null || true
@@ -337,12 +387,14 @@ do_upgrade() {
     info "Build Docker image..."
     if ! docker compose build 2>&1 | tee -a "$LOG_FILE"; then
         fail "Docker build selhal! Rollback git..."
+        telegram_notify "[FAIL] Docker build selhal. Vracím git na $version_before."
         git reset --hard "$git_backup_tag"
         git tag -d "local/$target_tag" 2>/dev/null || true
         restore_stash
         write_result "build_failed" "$version_before" "Docker build selhal" "backup-$timestamp"
         return 1
     fi
+    telegram_notify "[>>] Build OK. Restartuji kontejnery..."
 
     # --- Rebuild PII proxy (pokud se změnilo pii-proxy/) ---
     if git diff --name-only "$git_backup_tag..HEAD" -- pii-proxy/ 2>/dev/null | grep -q .; then
@@ -360,9 +412,11 @@ do_upgrade() {
     # --- Health check ---
     if ! health_check; then
         warn "Health check selhal — spouštím automatický rollback..."
+        telegram_notify "[FAIL] Health check selhal po upgrade na $target_tag. Spouštím rollback..."
         do_rollback "health check selhal po upgrade na $target_tag"
         return 1
     fi
+    telegram_notify "[OK] Health check OK. Spouštím post-upgrade testy..."
 
     # --- Sync skill šablon do workspace ---
     sync_skill_templates
@@ -371,6 +425,13 @@ do_upgrade() {
     if [ -x "$ROOT_DIR/openclaw-test.sh" ]; then
         info "Spouštím post-upgrade testy..."
         bash "$ROOT_DIR/openclaw-test.sh" 2>&1 | tee -a "$LOG_FILE" || warn "Některé testy selhaly (viz .upgrade-test-result)"
+        # Report výsledků testů
+        if [ -f "$WORKSPACE/.upgrade-test-result" ] && command -v jq >/dev/null 2>&1; then
+            local t_pass t_fail
+            t_pass=$(jq -r '.passed // 0' "$WORKSPACE/.upgrade-test-result" 2>/dev/null)
+            t_fail=$(jq -r '.failed // 0' "$WORKSPACE/.upgrade-test-result" 2>/dev/null)
+            telegram_notify "[TESTS] Výsledek: ${t_pass} passed, ${t_fail} failed"
+        fi
     fi
 
     # --- Push na fork ---
@@ -383,6 +444,7 @@ do_upgrade() {
     info "=========================================="
     info "UPGRADE ÚSPĚŠNÝ: $version_before → $version_after ($target_tag)"
     info "=========================================="
+    telegram_notify "[DONE] Upgrade úspěšný: $version_before → $version_after ($target_tag)"
 
     write_result "success" "$version_after" "Upgrade z $version_before na $target_tag" "backup-$timestamp"
     return 0
@@ -398,6 +460,7 @@ do_deploy() {
     info "=========================================="
     info "OpenClaw deploy (bez merge)"
     info "=========================================="
+    telegram_notify "[START] Deploy zahájen (rebuild + restart, bez merge)"
 
     cd "$ROOT_DIR"
     check_disk_space || { write_result "error" "" "Nedostatek místa na disku" ""; return 1; }
@@ -426,15 +489,23 @@ do_deploy() {
     # Health check
     if ! health_check; then
         warn "Health check selhal — spouštím automatický rollback..."
+        telegram_notify "[FAIL] Health check selhal po deploy. Spouštím rollback..."
         do_rollback "health check selhal po deploy"
         return 1
     fi
+    telegram_notify "[OK] Health check OK."
 
     sync_skill_templates
 
     if [ -x "$ROOT_DIR/openclaw-test.sh" ]; then
         info "Spouštím post-deploy testy..."
         bash "$ROOT_DIR/openclaw-test.sh" 2>&1 | tee -a "$LOG_FILE" || warn "Některé testy selhaly (viz .upgrade-test-result)"
+        if [ -f "$WORKSPACE/.upgrade-test-result" ] && command -v jq >/dev/null 2>&1; then
+            local t_pass t_fail
+            t_pass=$(jq -r '.passed // 0' "$WORKSPACE/.upgrade-test-result" 2>/dev/null)
+            t_fail=$(jq -r '.failed // 0' "$WORKSPACE/.upgrade-test-result" 2>/dev/null)
+            telegram_notify "[TESTS] Výsledek: ${t_pass} passed, ${t_fail} failed"
+        fi
     fi
 
     cleanup_old_backups
@@ -442,6 +513,7 @@ do_deploy() {
     info "=========================================="
     info "DEPLOY ÚSPĚŠNÝ: $version"
     info "=========================================="
+    telegram_notify "[DONE] Deploy úspěšný. Verze: $version"
 
     write_result "success" "$version" "Deploy (rebuild + restart)" "backup-$timestamp"
     return 0
