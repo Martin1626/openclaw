@@ -63,6 +63,18 @@ cat > /home/node/.openclaw/workspace/.upgrade-trigger << 'EOF'
 EOF
 ```
 
+## Trigger Disk Cleanup (no downtime)
+
+The upgrade script needs ~17 GB free on `/` for the Docker build. If a previous `upgrade` failed with `status: "error"` and `message: "Nedostatek místa na disku"`, run this first — it prunes Docker build cache, dangling images, and old backup images **without restarting the container**:
+
+```bash
+cat > /home/node/.openclaw/workspace/.upgrade-trigger << 'EOF'
+{"action":"cleanup-disk"}
+EOF
+```
+
+This does not interrupt your session. After it finishes, read `.upgrade-result` — status will be `cleanup_ok` and the message reports how many MB were freed and how many are now available. If available disk is still under the minimum after cleanup, tell the user — manual intervention is needed (files outside Docker, or VPS disk resize).
+
 ## Read Result (after restart)
 
 After your container restarts, read the result:
@@ -72,7 +84,7 @@ cat /home/node/.openclaw/workspace/.upgrade-result
 ```
 
 Result JSON fields:
-- `status`: `success`, `already_current`, `conflict`, `build_failed`, `error`, `rollback_ok`, `rollback_failed`
+- `status`: `success`, `already_current`, `conflict`, `build_failed`, `error`, `rollback_ok`, `rollback_failed`, `cleanup_ok`
 - `version`: current version after operation (this reads `git describe` — **not** the Docker image version)
 - `message`: human-readable description
 - `rollback_tag`: Docker backup image tag (for manual rollback reference)
@@ -118,8 +130,9 @@ Do not report an upgrade as successful to the user until `/app/package.json` mat
 
 - In the middle of an important conversation (warn user about session loss)
 - When the user hasn't confirmed they want to upgrade
-- When disk space is low (check with `df -h` — need at least 2 GB free)
 - When the result of a previous upgrade shows `conflict` (needs manual resolution on PC)
+
+If a previous `upgrade` attempt returned `status: "error"` with `"Nedostatek místa na disku"`, trigger `cleanup-disk` first (see section above) — then retry the upgrade. Don't ask the user to SSH in and run Docker commands manually; the host can free space on its own via the cleanup trigger.
 
 ## When Conflicts Occur
 

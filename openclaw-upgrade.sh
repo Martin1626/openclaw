@@ -8,7 +8,9 @@
 # Trigger soubor (JSON):
 #   {"action":"upgrade","target":"latest-stable","timestamp":"..."}
 #   {"action":"upgrade","target":"v2026.3.22","timestamp":"..."}
+#   {"action":"deploy","timestamp":"..."}
 #   {"action":"rollback","timestamp":"..."}
+#   {"action":"cleanup-disk","timestamp":"..."}
 #
 # ==========================================================================
 set -euo pipefail
@@ -277,6 +279,40 @@ do_rollback() {
         write_result "rollback_failed" "$(get_current_version)" "Rollback i health check selhaly" "$backup_tag"
         return 1
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup disk (bez downtime) — build cache + dangling images + staré backupy
+# ---------------------------------------------------------------------------
+do_cleanup_disk() {
+    info "=========================================="
+    info "OpenClaw disk cleanup"
+    info "=========================================="
+    telegram_notify "[START] Disk cleanup zahájen"
+
+    cd "$ROOT_DIR"
+
+    local before_mb
+    before_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
+    info "Volné místo před úklidem: ${before_mb} MB"
+
+    info "Builder cache prune..."
+    docker builder prune -af 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+
+    info "Dangling image prune..."
+    docker image prune -f 2>&1 | tail -3 | tee -a "$LOG_FILE" 2>/dev/null || true
+
+    info "Staré backup images (keep last $MAX_BACKUP_IMAGES)..."
+    cleanup_old_backups
+
+    local after_mb
+    after_mb=$(df -m "$ROOT_DIR" | awk 'NR==2 {print $4}')
+    local freed_mb=$((after_mb - before_mb))
+    info "Volné místo po úklidu: ${after_mb} MB (uvolněno ${freed_mb} MB)"
+    telegram_notify "[OK] Disk cleanup hotov. Uvolněno ${freed_mb} MB. Volné: ${after_mb} MB."
+
+    write_result "cleanup_ok" "$(get_current_version)" "Uvolněno ${freed_mb} MB. Volné: ${after_mb} MB (min pro upgrade: ${MIN_DISK_MB} MB)" ""
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -668,6 +704,9 @@ main() {
             ;;
         rollback)
             do_rollback "trigger soubor"
+            ;;
+        cleanup-disk)
+            do_cleanup_disk
             ;;
         *)
             fail "Neznámá akce: $action"
