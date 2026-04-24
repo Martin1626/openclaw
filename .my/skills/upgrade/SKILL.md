@@ -73,9 +73,32 @@ cat /home/node/.openclaw/workspace/.upgrade-result
 
 Result JSON fields:
 - `status`: `success`, `already_current`, `conflict`, `build_failed`, `error`, `rollback_ok`, `rollback_failed`
-- `version`: current version after operation
+- `version`: current version after operation (this reads `git describe` — **not** the Docker image version)
 - `message`: human-readable description
 - `rollback_tag`: Docker backup image tag (for manual rollback reference)
+
+## Verify Runtime Matches Git (do this every time)
+
+The `version` field in the result comes from `git describe HEAD` — it tells you what code is in the repo, **not** what the running Docker image was built from. These two can drift apart. Always confirm the container actually runs the version you intended:
+
+```bash
+# What the running Docker image was built from:
+grep '"version"' /app/package.json
+```
+
+Compare this with the target tag. If they disagree, the git state advanced but the image is stale → the upgrade did not actually apply to the runtime.
+
+**Known scenario for a silent desync:** after a `rollback`, git is reset to a pre-upgrade tag but the merge commit that brought the target tag in still lives on `origin/main`. The next `upgrade` runs `git pull origin main` first, which fast-forwards past the target again. The script then sees "target is already an ancestor of HEAD" and exits `already_current` **without rebuilding the Docker image**. Git is on the new version, runtime is still on the old one.
+
+**Fix:** trigger a rebuild without merge:
+
+```bash
+cat > /home/node/.openclaw/workspace/.upgrade-trigger << 'EOF'
+{"action":"deploy"}
+EOF
+```
+
+Do not report an upgrade as successful to the user until `/app/package.json` matches the target tag.
 
 ## What Happens During Upgrade
 
