@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { summarizeRunTimings } from "../../scripts/ci-run-timings.mjs";
+import {
+  parseRunTimingArgs,
+  selectLatestMainPushCiRun,
+  summarizePnpmStoreWarmupBarrier,
+  summarizeRunTimings,
+} from "../../scripts/ci-run-timings.mjs";
 
 describe("scripts/ci-run-timings.mjs", () => {
   it("separates queue time from job duration", () => {
@@ -45,5 +50,132 @@ describe("scripts/ci-run-timings.mjs", () => {
       ["queued", 50],
       ["slow", 20],
     ]);
+  });
+
+  it("selects the push CI run for the current main SHA", () => {
+    expect(
+      selectLatestMainPushCiRun(
+        [
+          {
+            databaseId: 3,
+            event: "issue_comment",
+            headSha: "current",
+          },
+          {
+            databaseId: 2,
+            event: "push",
+            headSha: "older",
+          },
+          {
+            databaseId: 1,
+            event: "push",
+            headSha: "current",
+          },
+        ],
+        "current",
+      ),
+    ).toEqual({
+      databaseId: 1,
+      event: "push",
+      headSha: "current",
+    });
+  });
+
+  it("summarizes the pnpm store warmup fanout barrier", () => {
+    expect(
+      summarizePnpmStoreWarmupBarrier({
+        conclusion: "success",
+        createdAt: "2026-05-28T23:03:01Z",
+        jobs: [
+          {
+            completedAt: "2026-05-28T23:04:05Z",
+            conclusion: "success",
+            name: "preflight",
+            startedAt: "2026-05-28T23:03:55Z",
+            status: "completed",
+          },
+          {
+            completedAt: "2026-05-28T23:04:27Z",
+            conclusion: "success",
+            name: "pnpm-store-warmup",
+            startedAt: "2026-05-28T23:04:07Z",
+            status: "completed",
+          },
+          {
+            completedAt: "2026-05-28T23:06:26Z",
+            conclusion: "success",
+            name: "checks-fast-bundled-protocol",
+            startedAt: "2026-05-28T23:04:29Z",
+            status: "completed",
+          },
+          {
+            completedAt: "2026-05-28T23:04:28Z",
+            conclusion: "skipped",
+            name: "check-docs",
+            startedAt: "2026-05-28T23:04:28Z",
+            status: "completed",
+          },
+          {
+            completedAt: "2026-05-28T23:04:35Z",
+            conclusion: "success",
+            name: "security-fast",
+            startedAt: "2026-05-28T23:03:55Z",
+            status: "completed",
+          },
+          {
+            completedAt: "2026-05-28T23:05:30Z",
+            conclusion: "success",
+            name: "checks-node-compat-node22",
+            startedAt: "2026-05-28T23:04:30Z",
+            status: "completed",
+          },
+        ],
+        status: "completed",
+        updatedAt: "2026-05-28T23:07:33Z",
+      }),
+    ).toEqual({
+      activePostWarmupJobCount: 1,
+      firstPostWarmupStartDelaySeconds: 2,
+      postWarmupP95StartDelaySeconds: 2,
+      postWarmupStartedWithinWindow: 1,
+      preflightToWarmupCompleteSeconds: 22,
+      preflightToWarmupStartSeconds: 2,
+      warmupDurationSeconds: 20,
+      warmupResult: "completed/success",
+      windowSeconds: 5,
+    });
+  });
+
+  it("falls back to the newest push CI run when the exact SHA has not appeared yet", () => {
+    expect(
+      selectLatestMainPushCiRun(
+        [
+          {
+            databaseId: 4,
+            event: "issue_comment",
+            headSha: "current",
+          },
+          {
+            databaseId: 3,
+            event: "push",
+            headSha: "previous",
+          },
+        ],
+        "current",
+      ),
+    ).toEqual({
+      databaseId: 3,
+      event: "push",
+      headSha: "previous",
+    });
+  });
+
+  it("ignores pnpm passthrough sentinels when parsing monitor args", () => {
+    expect(parseRunTimingArgs(["--latest-main", "--", "--limit", "3"])).toEqual({
+      explicitRunId: undefined,
+      limit: 3,
+      recentLimit: null,
+      useLatestMain: true,
+    });
   });
 });

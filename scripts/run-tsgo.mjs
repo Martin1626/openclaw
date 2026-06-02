@@ -1,14 +1,23 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { readFlagValue } from "./lib/arg-utils.mjs";
 import {
   acquireLocalHeavyCheckLockSync,
   applyLocalTsgoPolicy,
+  resolveLocalHeavyCheckEnv,
   shouldAcquireLocalHeavyCheckLockForTsgo,
 } from "./lib/local-heavy-check-runtime.mjs";
-import { getSparseTsgoGuardError } from "./lib/tsgo-sparse-guard.mjs";
+import {
+  getSparseTsgoGuardError,
+  shouldSkipSparseTsgoGuardError,
+} from "./lib/tsgo-sparse-guard.mjs";
+import { createManagedCommandInvocation } from "./lib/managed-child-process.mjs";
 
-const { args: finalArgs, env } = applyLocalTsgoPolicy(process.argv.slice(2), process.env);
+const { args: finalArgs, env } = applyLocalTsgoPolicy(
+  process.argv.slice(2),
+  resolveLocalHeavyCheckEnv(process.env),
+);
 
 const tsgoPath = path.resolve("node_modules", ".bin", "tsgo");
 const tsBuildInfoFile = readFlagValue(finalArgs, "--tsBuildInfoFile");
@@ -17,7 +26,9 @@ if (tsBuildInfoFile) {
 }
 const sparseGuardError = getSparseTsgoGuardError(finalArgs, { cwd: process.cwd() });
 const releaseLock =
-  sparseGuardError || !shouldAcquireLocalHeavyCheckLockForTsgo(finalArgs, env)
+  sparseGuardError ||
+  env.OPENCLAW_TSGO_HEAVY_CHECK_LOCK_HELD === "1" ||
+  !shouldAcquireLocalHeavyCheckLockForTsgo(finalArgs, env)
     ? () => {}
     : acquireLocalHeavyCheckLockSync({
         cwd: process.cwd(),
@@ -28,12 +39,23 @@ const releaseLock =
 try {
   if (sparseGuardError) {
     console.error(sparseGuardError);
-    process.exitCode = 1;
+    if (shouldSkipSparseTsgoGuardError(env)) {
+      console.error("[tsgo] skipping sparse-missing project because OPENCLAW_TSGO_SPARSE_SKIP=1");
+      process.exitCode = 0;
+    } else {
+      process.exitCode = 1;
+    }
   } else {
-    const result = spawnSync(tsgoPath, finalArgs, {
+    const tsgo = createManagedCommandInvocation({
+      args: finalArgs,
+      bin: tsgoPath,
+      env,
+    });
+    const result = spawnSync(tsgo.command, tsgo.args, {
       stdio: "inherit",
       env,
-      shell: process.platform === "win32",
+      shell: tsgo.shell,
+      windowsVerbatimArguments: tsgo.windowsVerbatimArguments,
     });
 
     if (result.error) {
@@ -44,17 +66,4 @@ try {
   }
 } finally {
   releaseLock();
-}
-
-function readFlagValue(args, name) {
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if (arg === name) {
-      return args[index + 1];
-    }
-    if (arg.startsWith(`${name}=`)) {
-      return arg.slice(name.length + 1);
-    }
-  }
-  return undefined;
 }

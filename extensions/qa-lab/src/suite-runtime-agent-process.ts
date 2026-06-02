@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import {
+  appendQaChildOutput,
+  appendQaChildOutputTail,
+  createQaChildOutputCapture,
+  createQaChildOutputTail,
+  formatQaChildOutputTail,
+  QA_CHILD_STDOUT_MAX_BYTES,
+  readQaChildOutput,
+} from "./child-output.js";
 import { resolveQaNodeExecPath } from "./node-exec.js";
 import { liveTurnTimeoutMs } from "./suite-runtime-agent-common.js";
 import { waitForGatewayHealthy, waitForTransportReady } from "./suite-runtime-gateway.js";
@@ -10,7 +19,20 @@ type QaMemorySearchResult = {
   results?: Array<{ snippet?: string; text?: string; path?: string }>;
 };
 
+type QaCronJob = {
+  delivery?: { mode?: string };
+  description?: string;
+  id?: string;
+  name?: string;
+  payload?: { kind?: string; message?: string; text?: string; lightContext?: boolean };
+  sessionTarget?: string;
+  state?: { nextRunAtMs?: number };
+};
+
 const ANSI_ESCAPE_PATTERN = new RegExp(String.raw`\x1B\[[0-?]*[ -/]*[@-~]`, "g");
+const MANAGED_DREAMING_CRON_MARKER = "[managed-by=memory-core.short-term-promotion]";
+const MANAGED_DREAMING_CRON_NAME = "Memory Dreaming Promotion";
+const MANAGED_DREAMING_PROMPT = "__openclaw_memory_core_short_term_promotion_dream__";
 
 function stripAnsiCodes(text: string) {
   return text.replace(ANSI_ESCAPE_PATTERN, "");
@@ -60,24 +82,27 @@ async function runQaCli(
     "gateway" | "repoRoot" | "primaryModel" | "alternateModel" | "providerMode"
   >,
   args: string[],
-  opts?: { timeoutMs?: number; json?: boolean },
+  opts?: { timeoutMs?: number; json?: boolean; env?: NodeJS.ProcessEnv },
 ) {
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
+  const stdout = createQaChildOutputCapture();
+  const stderr = createQaChildOutputTail();
   const distEntryPath = path.join(env.repoRoot, "dist", "index.js");
   const nodeExecPath = await resolveQaNodeExecPath();
   await new Promise<void>((resolve, reject) => {
     const child = spawn(nodeExecPath, [distEntryPath, ...args], {
       cwd: env.gateway.tempRoot,
-      env: env.gateway.runtimeEnv,
+      env: {
+        ...env.gateway.runtimeEnv,
+        ...opts?.env,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`qa cli timed out: openclaw ${args.join(" ")}`));
     }, opts?.timeoutMs ?? 60_000);
-    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
-    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+    child.stdout.on("data", (chunk) => appendQaChildOutput(stdout, chunk));
+    child.stderr.on("data", (chunk) => appendQaChildOutputTail(stderr, chunk));
     child.once("error", (error) => {
       clearTimeout(timeout);
       reject(error);
@@ -85,17 +110,22 @@ async function runQaCli(
     child.once("exit", (code) => {
       clearTimeout(timeout);
       if (code === 0) {
+        if (stdout.exceeded) {
+          reject(
+            new Error(
+              `qa cli stdout exceeded ${QA_CHILD_STDOUT_MAX_BYTES} bytes; refusing to parse truncated output`,
+            ),
+          );
+          return;
+        }
         resolve();
         return;
       }
-      reject(
-        new Error(
-          `qa cli failed (${code ?? "unknown"}): ${Buffer.concat(stderr).toString("utf8").trim()}`,
-        ),
-      );
+      const stderrText = formatQaChildOutputTail(stderr, "qa cli stderr");
+      reject(new Error(`qa cli failed (${code ?? "unknown"}): ${stderrText}`));
     });
   });
-  const text = Buffer.concat(stdout).toString("utf8").trim();
+  const text = readQaChildOutput(stdout).trim();
   if (!opts?.json) {
     return text;
   }
@@ -176,14 +206,32 @@ async function listCronJobs(env: Pick<QaSuiteRuntimeEnv, "gateway">) {
     },
     { timeoutMs: 30_000 },
   )) as {
-    jobs?: Array<{
-      id?: string;
-      name?: string;
-      payload?: { kind?: string; text?: string };
-      state?: { nextRunAtMs?: number };
-    }>;
+    jobs?: QaCronJob[];
   };
   return payload.jobs ?? [];
+}
+
+function isManagedDreamingCronJob(job: QaCronJob) {
+  if (job.description?.includes(MANAGED_DREAMING_CRON_MARKER)) {
+    return true;
+  }
+  if (job.name !== MANAGED_DREAMING_CRON_NAME) {
+    return false;
+  }
+  if (job.payload?.kind === "systemEvent" && job.payload.text === MANAGED_DREAMING_PROMPT) {
+    return true;
+  }
+  return (
+    job.payload?.kind === "agentTurn" &&
+    job.payload.message === MANAGED_DREAMING_PROMPT &&
+    job.payload.lightContext === true &&
+    job.sessionTarget === "isolated" &&
+    job.delivery?.mode === "none"
+  );
+}
+
+function findManagedDreamingCronJob(jobs: readonly QaCronJob[]) {
+  return jobs.find(isManagedDreamingCronJob);
 }
 
 async function readDoctorMemoryStatus(env: Pick<QaSuiteRuntimeEnv, "gateway">) {
@@ -222,7 +270,7 @@ async function forceMemoryIndex(params: {
   await runQaCli(params.env, ["memory", "index", "--agent", "qa", "--force"], {
     timeoutMs: liveTurnTimeoutMs(params.env, 60_000),
   });
-  return await waitForMemorySearchMatch({
+  const result = await waitForMemorySearchMatch({
     expectedNeedle: params.expectedNeedle,
     timeoutMs: liveTurnTimeoutMs(params.env, 20_000),
     search: async () =>
@@ -235,6 +283,8 @@ async function forceMemoryIndex(params: {
         },
       )) as QaMemorySearchResult,
   });
+  await params.env.gateway.restartAfterStateMutation?.(async () => {});
+  return result;
 }
 
 async function runAgentPrompt(
@@ -269,6 +319,8 @@ async function runAgentPrompt(
 
 export {
   forceMemoryIndex,
+  findManagedDreamingCronJob,
+  isManagedDreamingCronJob,
   listCronJobs,
   readDoctorMemoryStatus,
   runAgentPrompt,

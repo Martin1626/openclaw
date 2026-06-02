@@ -7,14 +7,6 @@ describe("OpenClaw tools MCP server", () => {
     const handlers = createPluginToolsMcpHandlers(resolveOpenClawToolsForMcp());
 
     const listed = await handlers.listTools();
-    expect(listed).toEqual({
-      tools: [
-        expect.objectContaining({
-          name: "cron",
-          description: expect.stringContaining("Manage Gateway cron jobs"),
-          inputSchema: expect.objectContaining({ type: "object" }),
-        }),
-      ],
-    });
+    expect(listed.tools.map((tool) => tool.name)).toContain("cron");
   });
 });

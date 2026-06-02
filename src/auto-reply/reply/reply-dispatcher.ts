@@ -1,5 +1,4 @@
 import type { TypingCallbacks } from "../../channels/typing.js";
-import { resolveSilentReplyPolicy } from "../../config/silent-reply.js";
 import type { HumanDelayConfig } from "../../config/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { generateSecureInt } from "../../infra/secure-random.js";
@@ -10,7 +9,11 @@ import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { registerDispatcher } from "./dispatcher-registry.js";
 import { normalizeReplyPayload, type NormalizeReplySkipReason } from "./normalize-reply.js";
-import type { ReplyDispatchKind, ReplyDispatcher } from "./reply-dispatcher.types.js";
+import type {
+  ReplyDispatchBeforeDeliver,
+  ReplyDispatchKind,
+  ReplyDispatcher,
+} from "./reply-dispatcher.types.js";
 import type { ResponsePrefixContext } from "./response-prefix-template.js";
 import type { TypingController } from "./typing.js";
 
@@ -26,7 +29,9 @@ type ReplyDispatchSkipHandler = (
 type ReplyDispatchDeliverer = (
   payload: ReplyPayload,
   info: { kind: ReplyDispatchKind },
-) => Promise<void>;
+) => Promise<unknown>;
+
+export type { ReplyDispatchBeforeDeliver };
 
 const DEFAULT_HUMAN_DELAY_MIN_MS = 800;
 const DEFAULT_HUMAN_DELAY_MAX_MS = 2500;
@@ -70,12 +75,15 @@ export type ReplyDispatcherOptions = {
   onSkip?: ReplyDispatchSkipHandler;
   /** Human-like delay between block replies for natural rhythm. */
   humanDelay?: HumanDelayConfig;
+  beforeDeliver?: ReplyDispatchBeforeDeliver;
 };
 
 export type ReplyDispatcherWithTypingOptions = Omit<ReplyDispatcherOptions, "onIdle"> & {
   typingCallbacks?: TypingCallbacks;
   onReplyStart?: () => Promise<void> | void;
   onIdle?: () => void;
+  onSettled?: () => unknown;
+  onFreshSettledDelivery?: () => unknown;
   /** Called when the typing controller is cleaned up (e.g., on NO_REPLY). */
   onCleanup?: () => void;
 };
@@ -115,40 +123,8 @@ function normalizeReplyPayloadInternal(
   });
 }
 
-function shouldPreserveSilentFinalPayload(params: {
-  kind: ReplyDispatchKind;
-  payload: ReplyPayload;
-  silentReplyContext?: ReplyDispatcherOptions["silentReplyContext"];
-}): boolean {
-  if (params.kind !== "final") {
-    return false;
-  }
-  if (!isSilentReplyText(params.payload.text, SILENT_REPLY_TOKEN)) {
-    return false;
-  }
-  const context = params.silentReplyContext;
-  if (!context) {
-    return false;
-  }
-  const resolvedPolicy = resolveSilentReplyPolicy({
-    cfg: context.cfg,
-    sessionKey: context.sessionKey,
-    surface: context.surface,
-    conversationType: context.conversationType,
-  });
-  const shouldPreserve = resolvedPolicy !== "allow";
-  if (shouldPreserve) {
-    silentReplyLogger.debug("preserving exact NO_REPLY final payload before normalization", {
-      hasSessionKey: Boolean(context.sessionKey),
-      surface: context.surface,
-      conversationType: context.conversationType,
-      resolvedPolicy,
-    });
-  }
-  return shouldPreserve;
-}
-
 export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDispatcher {
+  let beforeDeliver = options.beforeDeliver;
   let sendChain: Promise<void> = Promise.resolve();
   // Track in-flight deliveries so we can emit a reliable "idle" signal.
   // Start with pending=1 as a "reservation" to prevent premature gateway restart.
@@ -168,6 +144,11 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
     block: 0,
     final: 0,
   };
+  const cancelledCounts: Record<ReplyDispatchKind, number> = {
+    tool: 0,
+    block: 0,
+    final: 0,
+  };
 
   // Register this dispatcher globally for gateway restart coordination.
   const { unregister } = registerDispatcher({
@@ -177,23 +158,14 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
 
   const enqueue = (kind: ReplyDispatchKind, payload: ReplyPayload) => {
     const originalWasExactSilent = isSilentReplyText(payload.text, SILENT_REPLY_TOKEN);
-    const normalized = shouldPreserveSilentFinalPayload({
-      kind,
-      payload,
-      silentReplyContext: options.silentReplyContext,
-    })
-      ? {
-          ...payload,
-          text: payload.text?.trim() || SILENT_REPLY_TOKEN,
-        }
-      : normalizeReplyPayloadInternal(payload, {
-          responsePrefix: options.responsePrefix,
-          responsePrefixContext: options.responsePrefixContext,
-          responsePrefixContextProvider: options.responsePrefixContextProvider,
-          transformReplyPayload: options.transformReplyPayload,
-          onHeartbeatStrip: options.onHeartbeatStrip,
-          onSkip: (reason) => options.onSkip?.(payload, { kind, reason }),
-        });
+    const normalized = normalizeReplyPayloadInternal(payload, {
+      responsePrefix: options.responsePrefix,
+      responsePrefixContext: options.responsePrefixContext,
+      responsePrefixContextProvider: options.responsePrefixContextProvider,
+      transformReplyPayload: options.transformReplyPayload,
+      onHeartbeatStrip: options.onHeartbeatStrip,
+      onSkip: (reason) => options.onSkip?.(payload, { kind, reason }),
+    });
     if (!normalized) {
       if (kind === "final" && originalWasExactSilent) {
         silentReplyLogger.debug("exact NO_REPLY final payload was skipped before delivery", {
@@ -222,9 +194,15 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
             await sleep(delayMs);
           }
         }
-        // Safe: deliver is called inside an async .then() callback, so even a synchronous
-        // throw becomes a rejection that flows through .catch()/.finally(), ensuring cleanup.
-        await options.deliver(normalized, { kind });
+        let deliverPayload: ReplyPayload | null = normalized;
+        if (beforeDeliver) {
+          deliverPayload = await beforeDeliver(normalized, { kind });
+          if (!deliverPayload) {
+            cancelledCounts[kind] += 1;
+            return;
+          }
+        }
+        await options.deliver(deliverPayload, { kind });
       })
       .catch((err) => {
         failedCounts[kind] += 1;
@@ -272,17 +250,59 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
     sendToolResult: (payload) => enqueue("tool", payload),
     sendBlockReply: (payload) => enqueue("block", payload),
     sendFinalReply: (payload) => enqueue("final", payload),
+    appendBeforeDeliver: (hook) => {
+      const previousBeforeDeliver = beforeDeliver;
+      beforeDeliver = previousBeforeDeliver
+        ? async (payload, info) => {
+            const previousPayload = await previousBeforeDeliver(payload, info);
+            return previousPayload ? hook(previousPayload, info) : null;
+          }
+        : hook;
+    },
     waitForIdle: () => sendChain,
     getQueuedCounts: () => ({ ...queuedCounts }),
+    getCancelledCounts: () => ({ ...cancelledCounts }),
     getFailedCounts: () => ({ ...failedCounts }),
     markComplete,
   };
 }
 
+export async function waitForReplyDispatcherIdle(
+  dispatcher: Pick<ReplyDispatcher, "waitForIdle">,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  if (!abortSignal) {
+    await dispatcher.waitForIdle();
+    return;
+  }
+  if (abortSignal.aborted) {
+    return;
+  }
+  let removeAbortListener: (() => void) | undefined;
+  const aborted = new Promise<void>((resolve) => {
+    const onAbort = () => resolve();
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => abortSignal.removeEventListener("abort", onAbort);
+  });
+  try {
+    await Promise.race([dispatcher.waitForIdle(), aborted]);
+  } finally {
+    removeAbortListener?.();
+  }
+}
+
 export function createReplyDispatcherWithTyping(
   options: ReplyDispatcherWithTypingOptions,
 ): ReplyDispatcherWithTypingResult {
-  const { typingCallbacks, onReplyStart, onIdle, onCleanup, ...dispatcherOptions } = options;
+  const {
+    typingCallbacks,
+    onReplyStart,
+    onIdle,
+    onSettled: _onSettled,
+    onFreshSettledDelivery: _onFreshSettledDelivery,
+    onCleanup,
+    ...dispatcherOptions
+  } = options;
   const resolvedOnReplyStart = onReplyStart ?? typingCallbacks?.onReplyStart;
   const resolvedOnIdle = onIdle ?? typingCallbacks?.onIdle;
   const resolvedOnCleanup = onCleanup ?? typingCallbacks?.onCleanup;

@@ -93,6 +93,15 @@ function baseProfileContext() {
       url: "https://example.com",
       type: "page",
     })),
+    labelTab: vi.fn(async (_targetId: string, label: string) => ({
+      suggestedTargetId: label,
+      targetId: "T1",
+      tabId: "t1",
+      label,
+      title: "Tab 1",
+      url: "https://example.com",
+      type: "page",
+    })),
     focusTab: vi.fn(async () => {}),
     closeTab: vi.fn(async () => {}),
     stopRunningBrowser: vi.fn(async () => ({ stopped: false })),
@@ -118,6 +127,7 @@ function createRouteContext(profileCtx: ProfileContext, options?: { ssrfPolicy?:
     isReachable: profileCtx.isReachable,
     listTabs: profileCtx.listTabs,
     openTab: profileCtx.openTab,
+    labelTab: profileCtx.labelTab,
     focusTab: profileCtx.focusTab,
     closeTab: profileCtx.closeTab,
     stopRunningBrowser: profileCtx.stopRunningBrowser,
@@ -323,6 +333,56 @@ describe("browser tab routes", () => {
     expect(response.body).toEqual({ ok: true, targetId: "T2" });
     expect(profileCtx.focusTab).toHaveBeenCalledWith("T2");
     expect(navigationGuardMocks.assertBrowserNavigationResultAllowed).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid tab action indexes instead of treating them as omitted", async () => {
+    const profileCtx = createProfileContext();
+
+    const closeResponse = await callTabsAction({
+      body: { action: "close", index: "nope" },
+      profileCtx,
+    });
+    const selectResponse = await callTabsAction({
+      body: { action: "select", index: "1e0" },
+      profileCtx,
+    });
+    const nullSelectResponse = await callTabsAction({
+      body: { action: "select", index: null },
+      profileCtx,
+    });
+
+    expect(closeResponse.statusCode).toBe(400);
+    expect(closeResponse.body).toEqual({ error: "index must be a non-negative integer" });
+    expect(selectResponse.statusCode).toBe(400);
+    expect(selectResponse.body).toEqual({ error: "index must be a non-negative integer" });
+    expect(nullSelectResponse.statusCode).toBe(400);
+    expect(nullSelectResponse.body).toEqual({ error: "index must be a non-negative integer" });
+    expect(profileCtx.closeTab).not.toHaveBeenCalled();
+    expect(profileCtx.focusTab).not.toHaveBeenCalled();
+  });
+
+  it("labels tabs by friendly target handles", async () => {
+    const profileCtx = createProfileContext();
+
+    const response = await callTabsAction({
+      body: { action: "label", targetId: "t1", label: "meet" },
+      profileCtx,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({
+      ok: true,
+      tab: {
+        targetId: "T1",
+        suggestedTargetId: "meet",
+        tabId: "t1",
+        label: "meet",
+        title: "Tab 1",
+        url: "https://example.com",
+        type: "page",
+      },
+    });
+    expect(profileCtx.labelTab).toHaveBeenCalledWith("t1", "meet");
   });
 
   it("redacts blocked tab URLs for /tabs/action list", async () => {

@@ -25,8 +25,70 @@ export const getCronChannelOptions = () => {
   return pluginIds.length > 0 ? ["last", ...pluginIds].join("|") : "last|<channel-id>";
 };
 
+function addCronRunCauseFields(value: unknown): unknown {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const entries = record.entries;
+  if (!Array.isArray(entries)) {
+    return value;
+  }
+  const nextEntries = entries.map((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return entry;
+    }
+    const item = entry as Record<string, unknown>;
+    if (item.action !== "finished" || typeof item.errorReason !== "string") {
+      return item;
+    }
+    const cause = item.errorReason.trim();
+    return cause ? Object.assign({}, item, { cause }) : item;
+  });
+  return { ...record, entries: nextEntries };
+}
+
 export function printCronJson(value: unknown) {
-  defaultRuntime.writeJson(value);
+  defaultRuntime.writeJson(addCronRunCauseFields(value));
+}
+
+/**
+ * Enrich a CronJob (or list response) with a computed `status` field
+ * derived from enabled + state.runningAtMs + state.lastRunStatus.
+ * This mirrors the human-readable status shown by `cron list` / `cron show`.
+ */
+export function enrichCronJsonWithStatus(value: unknown): unknown {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const obj = value as Record<string, unknown>;
+
+  // Single job object (has 'state' and 'enabled')
+  if ("state" in obj && "enabled" in obj) {
+    return { ...obj, status: computeStatus(obj as unknown as CronJob) };
+  }
+
+  // List response (has 'jobs' array)
+  if ("jobs" in obj && Array.isArray(obj.jobs)) {
+    const enrichedJobs = (obj.jobs as CronJob[]).map((job) => {
+      const status = computeStatus(job);
+      return Object.assign({}, job, { status });
+    });
+    return { ...obj, jobs: enrichedJobs };
+  }
+
+  return value;
+}
+
+function computeStatus(job: CronJob): string {
+  if (!job.enabled) {
+    return "disabled";
+  }
+  const state = job.state ?? {};
+  if (state.runningAtMs) {
+    return "running";
+  }
+  return state.lastRunStatus ?? state.lastStatus ?? "idle";
 }
 
 export function handleCronCliError(err: unknown) {
@@ -138,7 +200,8 @@ export function parseAt(input: string, tz?: string): string | null {
   if (absolute !== null) {
     return new Date(absolute).toISOString();
   }
-  const dur = parseDurationMs(raw);
+  const durationInput = raw.startsWith("+") ? raw.slice(1) : raw;
+  const dur = parseDurationMs(durationInput);
   if (dur !== null) {
     return new Date(Date.now() + dur).toISOString();
   }
@@ -156,7 +219,17 @@ const CRON_DELIVERY_PAD = 64;
 const CRON_AGENT_PAD = 10;
 const CRON_MODEL_PAD = 20;
 
-const pad = (value: string, width: number) => value.padEnd(width);
+const stringifyCell = (value: unknown, fallback = "-") => {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return fallback;
+};
+
+const pad = (value: unknown, width: number) => stringifyCell(value).padEnd(width);
 
 const truncate = (value: string, width: number) => {
   if (value.length <= width) {
@@ -200,12 +273,15 @@ const formatRelative = (ms: number | null | undefined, nowMs: number) => {
   return delta >= 0 ? `in ${label}` : `${label} ago`;
 };
 
-const formatSchedule = (schedule: CronSchedule) => {
-  if (schedule.kind === "at") {
+const formatSchedule = (schedule: CronSchedule | undefined) => {
+  if (schedule?.kind === "at") {
     return `at ${formatIsoMinute(schedule.at)}`;
   }
-  if (schedule.kind === "every") {
+  if (schedule?.kind === "every") {
     return `every ${formatDurationHuman(schedule.everyMs)}`;
+  }
+  if (schedule?.kind !== "cron") {
+    return "-";
   }
   const base = schedule.tz ? `cron ${schedule.expr} @ ${schedule.tz}` : `cron ${schedule.expr}`;
   const staggerMs = resolveCronStaggerMs(schedule);
@@ -219,10 +295,11 @@ const formatStatus = (job: CronJob) => {
   if (!job.enabled) {
     return "disabled";
   }
-  if (job.state.runningAtMs) {
+  const state = job.state ?? {};
+  if (state.runningAtMs) {
     return "running";
   }
-  return job.state.lastStatus ?? "idle";
+  return state.lastStatus ?? "idle";
 };
 
 export function coerceCronDeliveryPreviews(value: unknown): Map<string, CronDeliveryPreview> {
@@ -275,17 +352,18 @@ export function printCronList(
   const now = Date.now();
 
   for (const job of jobs) {
+    const state = job.state ?? {};
     const idLabel = pad(job.id, CRON_ID_PAD);
-    const nameLabel = pad(truncate(job.name, CRON_NAME_PAD), CRON_NAME_PAD);
+    const nameLabel = pad(truncate(stringifyCell(job.name), CRON_NAME_PAD), CRON_NAME_PAD);
     const scheduleLabel = pad(
       truncate(formatSchedule(job.schedule), CRON_SCHEDULE_PAD),
       CRON_SCHEDULE_PAD,
     );
     const nextLabel = pad(
-      job.enabled ? formatRelative(job.state.nextRunAtMs, now) : "-",
+      job.enabled ? formatRelative(state.nextRunAtMs, now) : "-",
       CRON_NEXT_PAD,
     );
-    const lastLabel = pad(formatRelative(job.state.lastRunAtMs, now), CRON_LAST_PAD);
+    const lastLabel = pad(formatRelative(state.lastRunAtMs, now), CRON_LAST_PAD);
     const statusRaw = formatStatus(job);
     const statusLabel = pad(statusRaw, CRON_STATUS_PAD);
     const targetLabel = pad(job.sessionTarget ?? "-", CRON_TARGET_PAD);
@@ -297,7 +375,7 @@ export function printCronList(
     const agentLabel = pad(truncate(job.agentId ?? "-", CRON_AGENT_PAD), CRON_AGENT_PAD);
     const modelLabel = pad(
       truncate(
-        (job.payload.kind === "agentTurn" ? job.payload.model : undefined) ?? "-",
+        (job.payload?.kind === "agentTurn" ? job.payload.model : undefined) ?? "-",
         CRON_MODEL_PAD,
       ),
       CRON_MODEL_PAD,
@@ -339,7 +417,7 @@ export function printCronList(
         ? colorize(rich, theme.info, deliveryLabel)
         : colorize(rich, theme.muted, deliveryLabel),
       coloredAgent,
-      job.payload.kind === "agentTurn" && job.payload.model
+      job.payload?.kind === "agentTurn" && job.payload.model
         ? colorize(rich, theme.info, modelLabel)
         : colorize(rich, theme.muted, modelLabel),
     ].join(" ");
@@ -365,4 +443,5 @@ export function printCronShow(
   runtime.log(`next: ${formatRelative(job.state.nextRunAtMs, Date.now())}`);
   runtime.log(`last: ${formatRelative(job.state.lastRunAtMs, Date.now())}`);
   runtime.log(`status: ${formatStatus(job)}`);
+  runtime.log(`diagnostic: ${job.state.lastDiagnosticSummary ?? "-"}`);
 }

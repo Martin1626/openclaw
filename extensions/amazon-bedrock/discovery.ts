@@ -1,13 +1,10 @@
 import {
-  BedrockClient,
-  ListFoundationModelsCommand,
+  type BedrockClient,
   type ListFoundationModelsCommandOutput,
-  ListInferenceProfilesCommand,
   type ListInferenceProfilesCommandOutput,
 } from "@aws-sdk/client-bedrock";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/core";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { resolveAwsSdkEnvVarName } from "openclaw/plugin-sdk/provider-auth-runtime";
 import type {
   BedrockDiscoveryConfig,
   ModelDefinitionConfig,
@@ -16,7 +13,9 @@ import type {
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
-} from "openclaw/plugin-sdk/text-runtime";
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { refreshAwsSharedConfigCacheForBedrock } from "./aws-credential-refresh.js";
+import { resolveBedrockConfigApiKey } from "./discovery-shared.js";
 
 const log = createSubsystemLogger("bedrock-discovery");
 
@@ -47,6 +46,7 @@ const DEFAULT_MAX_TOKENS = 4096;
 const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
   // Anthropic Claude
   "anthropic.claude-3-7-sonnet-20250219-v1:0": 200_000,
+  "anthropic.claude-opus-4-8": 1_000_000,
   "anthropic.claude-opus-4-7": 1_000_000,
   "anthropic.claude-opus-4-6-v1": 1_000_000,
   "anthropic.claude-opus-4-6-v1:0": 1_000_000,
@@ -122,6 +122,9 @@ function resolveKnownContextWindow(modelId: string): number | undefined {
   const stripped = modelId.replace(/^(?:us|eu|ap|apac|au|jp|global)\./, "");
   const candidates = [modelId, stripped];
   for (const candidate of candidates) {
+    if (/(?:^|[/.:])anthropic\.claude-opus-4[.-]8(?:$|[-.:/])/i.test(candidate)) {
+      return 1_000_000;
+    }
     if (KNOWN_CONTEXT_WINDOWS[candidate] !== undefined) {
       return KNOWN_CONTEXT_WINDOWS[candidate];
     }
@@ -136,6 +139,22 @@ function resolveKnownContextWindow(modelId: string): number | undefined {
   return undefined;
 }
 
+function isKnownClaudeOpus47OrNewerModelId(modelId: string): boolean {
+  const stripped = modelId.replace(/^(?:us|eu|ap|apac|au|jp|global)\./, "");
+  return [modelId, stripped].some((candidate) =>
+    /(?:^|[/.:])anthropic\.claude-opus-4[.-][78](?:$|[-.:/])/i.test(candidate),
+  );
+}
+
+function resolveKnownThinkingLevelMap(
+  modelId: string,
+): ModelDefinitionConfig["thinkingLevelMap"] | undefined {
+  if (!isKnownClaudeOpus47OrNewerModelId(modelId)) {
+    return undefined;
+  }
+  return { xhigh: "xhigh", max: "max" };
+}
+
 const DEFAULT_COST = {
   input: 0,
   output: 0,
@@ -148,6 +167,38 @@ type BedrockModelSummary = NonNullable<ListFoundationModelsCommandOutput["modelS
 type InferenceProfileSummary = NonNullable<
   ListInferenceProfilesCommandOutput["inferenceProfileSummaries"]
 >[number];
+
+type BedrockDiscoverySdk = {
+  createClient(region: string): BedrockClient;
+  createListFoundationModelsCommand(): unknown;
+  createListInferenceProfilesCommand(input: { nextToken?: string }): unknown;
+};
+
+async function loadBedrockDiscoverySdk(): Promise<BedrockDiscoverySdk> {
+  const { BedrockClient, ListFoundationModelsCommand, ListInferenceProfilesCommand } =
+    await import("@aws-sdk/client-bedrock");
+  return {
+    createClient: (region) => new BedrockClient({ region }),
+    createListFoundationModelsCommand: () => new ListFoundationModelsCommand({}),
+    createListInferenceProfilesCommand: (input) => new ListInferenceProfilesCommand(input),
+  };
+}
+
+function createInjectedClientDiscoverySdk(): BedrockDiscoverySdk {
+  class ListFoundationModelsCommand {
+    constructor(readonly input: Record<string, unknown> = {}) {}
+  }
+  class ListInferenceProfilesCommand {
+    constructor(readonly input: Record<string, unknown> = {}) {}
+  }
+  return {
+    createClient() {
+      throw new Error("clientFactory is required for injected Bedrock discovery commands");
+    },
+    createListFoundationModelsCommand: () => new ListFoundationModelsCommand({}),
+    createListInferenceProfilesCommand: (input) => new ListInferenceProfilesCommand(input),
+  };
+}
 
 type BedrockDiscoveryCacheEntry = {
   expiresAt: number;
@@ -212,6 +263,9 @@ function mapInputModalities(summary: BedrockModelSummary): Array<"text" | "image
 }
 
 function inferReasoningSupport(summary: BedrockModelSummary): boolean {
+  if (isKnownClaudeOpus47OrNewerModelId(summary.modelId ?? "")) {
+    return true;
+  }
   const haystack = normalizeLowercaseStringOrEmpty(
     `${summary.modelId ?? ""} ${summary.modelName ?? ""}`,
   );
@@ -270,6 +324,7 @@ function toModelDefinition(
   defaults: { contextWindow: number; maxTokens: number },
 ): ModelDefinitionConfig {
   const id = summary.modelId?.trim() ?? "";
+  const thinkingLevelMap = resolveKnownThinkingLevelMap(id);
   return {
     id,
     name: summary.modelName?.trim() || id,
@@ -278,6 +333,7 @@ function toModelDefinition(
     cost: DEFAULT_COST,
     contextWindow: resolveKnownContextWindow(id) ?? defaults.contextWindow,
     maxTokens: defaults.maxTokens,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
   };
 }
 
@@ -320,13 +376,14 @@ function resolveBaseModelId(profile: InferenceProfileSummary): string | undefine
  */
 async function fetchInferenceProfileSummaries(
   client: BedrockClient,
+  createListInferenceProfilesCommand: BedrockDiscoverySdk["createListInferenceProfilesCommand"],
 ): Promise<InferenceProfileSummary[]> {
   try {
     const profiles: InferenceProfileSummary[] = [];
     let nextToken: string | undefined;
     do {
       const response: ListInferenceProfilesCommandOutput = await client.send(
-        new ListInferenceProfilesCommand({ nextToken }),
+        createListInferenceProfilesCommand({ nextToken }) as never,
       );
       for (const summary of response.inferenceProfileSummaries ?? []) {
         profiles.push(summary);
@@ -388,11 +445,16 @@ function resolveInferenceProfiles(
     const baseModel = baseModelId
       ? foundationModels.get(normalizeLowercaseStringOrEmpty(baseModelId))
       : undefined;
+    const knownThinkingLevelMap = resolveKnownThinkingLevelMap(
+      baseModelId ?? profile.inferenceProfileId,
+    );
 
     discovered.push({
       id: profile.inferenceProfileId,
       name: profile.inferenceProfileName?.trim() || profile.inferenceProfileId,
-      reasoning: baseModel?.reasoning ?? false,
+      reasoning:
+        baseModel?.reasoning ??
+        isKnownClaudeOpus47OrNewerModelId(baseModelId ?? profile.inferenceProfileId),
       input: baseModel?.input ?? ["text"],
       cost: baseModel?.cost ?? DEFAULT_COST,
       contextWindow:
@@ -400,6 +462,9 @@ function resolveInferenceProfiles(
         resolveKnownContextWindow(baseModelId ?? profile.inferenceProfileId ?? "") ??
         defaults.contextWindow,
       maxTokens: baseModel?.maxTokens ?? defaults.maxTokens,
+      ...(baseModel?.thinkingLevelMap || knownThinkingLevelMap
+        ? { thinkingLevelMap: baseModel?.thinkingLevelMap ?? knownThinkingLevelMap }
+        : {}),
     });
   }
   return discovered;
@@ -412,14 +477,6 @@ function resolveInferenceProfiles(
 export function resetBedrockDiscoveryCacheForTest(): void {
   discoveryCache.clear();
   hasLoggedBedrockError = false;
-}
-
-export function resolveBedrockConfigApiKey(
-  env: NodeJS.ProcessEnv = process.env,
-): string | undefined {
-  // When no AWS auth env marker is present, Bedrock should fall back to the
-  // AWS SDK default credential chain instead of persisting a fake apiKey marker.
-  return resolveAwsSdkEnvVarName(env);
 }
 
 export async function discoverBedrockModels(params: {
@@ -454,7 +511,13 @@ export async function discoverBedrockModels(params: {
     }
   }
 
-  const clientFactory = params.clientFactory ?? ((region: string) => new BedrockClient({ region }));
+  const sdk = params.clientFactory
+    ? createInjectedClientDiscoverySdk()
+    : await loadBedrockDiscoverySdk();
+  const clientFactory = params.clientFactory ?? ((region: string) => sdk.createClient(region));
+  if (!params.clientFactory) {
+    await refreshAwsSharedConfigCacheForBedrock();
+  }
   const client = clientFactory(params.region);
 
   const discoveryPromise = (async () => {
@@ -462,10 +525,13 @@ export async function discoverBedrockModels(params: {
     // Both API calls are independent, but we need the foundation model data
     // to resolve inference profile capabilities — so we fetch in parallel,
     // then build the lookup map before processing profiles.
-    const [foundationResponse, profileSummaries] = await Promise.all([
-      client.send(new ListFoundationModelsCommand({})),
-      fetchInferenceProfileSummaries(client),
+    const [rawFoundationResponse, profileSummaries] = await Promise.all([
+      client.send(sdk.createListFoundationModelsCommand() as never),
+      fetchInferenceProfileSummaries(client, (input) =>
+        sdk.createListInferenceProfilesCommand(input),
+      ),
     ]);
+    const foundationResponse = rawFoundationResponse as ListFoundationModelsCommandOutput;
 
     const discovered: ModelDefinitionConfig[] = [];
     const seenIds = new Set<string>();
@@ -545,18 +611,14 @@ export async function discoverBedrockModels(params: {
 }
 
 export async function resolveImplicitBedrockProvider(params: {
-  config?: { models?: { bedrockDiscovery?: BedrockDiscoveryConfig } };
   pluginConfig?: { discovery?: BedrockDiscoveryConfig };
   env?: NodeJS.ProcessEnv;
   clientFactory?: (region: string) => BedrockClient;
 }): Promise<ModelProviderConfig | null> {
   const env = params.env ?? process.env;
-  const discoveryConfig = {
-    ...params.config?.models?.bedrockDiscovery,
-    ...params.pluginConfig?.discovery,
-  };
+  const discoveryConfig = params.pluginConfig?.discovery;
   const enabled = discoveryConfig?.enabled;
-  const hasAwsCreds = resolveAwsSdkEnvVarName(env) !== undefined;
+  const hasAwsCreds = resolveBedrockConfigApiKey(env) !== undefined;
   if (enabled === false) {
     return null;
   }
@@ -579,23 +641,5 @@ export async function resolveImplicitBedrockProvider(params: {
     api: "bedrock-converse-stream",
     auth: "aws-sdk",
     models,
-  };
-}
-
-export function mergeImplicitBedrockProvider(params: {
-  existing: ModelProviderConfig | undefined;
-  implicit: ModelProviderConfig;
-}): ModelProviderConfig {
-  const { existing, implicit } = params;
-  if (!existing) {
-    return implicit;
-  }
-  return {
-    ...implicit,
-    ...existing,
-    models:
-      Array.isArray(existing.models) && existing.models.length > 0
-        ? existing.models
-        : implicit.models,
   };
 }

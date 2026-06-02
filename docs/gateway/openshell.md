@@ -1,13 +1,11 @@
 ---
-title: OpenShell
 summary: "Use OpenShell as a managed sandbox backend for OpenClaw agents"
+title: OpenShell
 read_when:
   - You want cloud-managed sandboxes instead of local Docker
   - You are setting up the OpenShell plugin
   - You need to choose between mirror and remote workspace modes
 ---
-
-# OpenShell
 
 OpenShell is a managed sandbox backend for OpenClaw. Instead of running Docker
 containers locally, OpenClaw delegates sandbox lifecycle to the `openshell` CLI,
@@ -20,6 +18,7 @@ and an optional `mirror` workspace mode.
 
 ## Prerequisites
 
+- OpenShell plugin installed (`openclaw plugins install @openclaw/openshell-sandbox`)
 - The `openshell` CLI installed and on `PATH` (or set a custom path via
   `plugins.entries.openshell.config.command`)
 - An OpenShell account with sandbox access
@@ -27,7 +26,11 @@ and an optional `mirror` workspace mode.
 
 ## Quick start
 
-1. Enable the plugin and set the sandbox backend:
+1. Install and enable the plugin, then set the sandbox backend:
+
+```bash
+openclaw plugins install @openclaw/openshell-sandbox
+```
 
 ```json5
 {
@@ -112,9 +115,9 @@ Best for:
 - You want lower per-turn sync overhead.
 - You do not want host-local edits to silently overwrite remote sandbox state.
 
-Important: if you edit files on the host outside OpenClaw after the initial seed,
-the remote sandbox does **not** see those changes. Use
-`openclaw sandbox recreate` to re-seed.
+<Warning>
+If you edit files on the host outside OpenClaw after the initial seed, the remote sandbox does **not** see those changes. Use `openclaw sandbox recreate` to re-seed.
+</Warning>
 
 ### Choosing a mode
 
@@ -282,18 +285,9 @@ openclaw sandbox recreate --all
 
 ## Security hardening
 
-OpenShell sandbox helpers that read remote workspace files use a pinned file
-descriptor for the workspace root and walk ancestors from that pinned fd
-instead of re-resolving the path for each read. Combined with an identity
-recheck on every operation, this prevents a mid-turn symlink swap or a
-hot-swapped workspace mount from redirecting reads outside the intended
-remote workspace.
-
-- Workspace root is opened once and pinned; later reads reuse that fd.
-- Ancestor walks traverse relative entries from the pinned fd so they cannot
-  be redirected by a replacement directory higher in the path.
-- The sandbox identity is rechecked before each read, so a recreated or
-  reassigned sandbox cannot silently serve files from a different workspace.
+OpenShell pins the workspace root fd and rechecks sandbox identity before each
+read, so symlink swaps or a remounted workspace cannot redirect reads out of
+the intended remote workspace.
 
 ## Current limitations
 
@@ -314,7 +308,7 @@ remote workspace.
 5. In `remote` mode: seed once on create, then operate directly on the remote
    workspace.
 
-## See also
+## Related
 
 - [Sandboxing](/gateway/sandboxing) -- modes, scopes, and backend comparison
 - [Sandbox vs Tool Policy vs Elevated](/gateway/sandbox-vs-tool-policy-vs-elevated) -- debugging blocked tools

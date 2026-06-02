@@ -1,18 +1,27 @@
 import { Type } from "typebox";
-import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
-import { loadConfig } from "../../config/config.js";
+import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { textToSpeech } from "../../tts/tts.js";
 import type { GatewayMessageChannel } from "../../utils/message-channel.js";
 import type { AnyAgentTool } from "./common.js";
-import { readStringParam } from "./common.js";
+import { readPositiveIntegerParam, readStringParam } from "./common.js";
 
 const TtsToolSchema = Type.Object({
-  text: Type.String({ description: "Text to convert to speech." }),
-  channel: Type.Optional(
-    Type.String({ description: "Optional channel id to pick output format." }),
+  text: Type.String({ description: "Text to speak." }),
+  channel: Type.Optional(Type.String({ description: "Channel id; output-format hint." })),
+  timeoutMs: Type.Optional(
+    Type.Integer({
+      description: "Provider timeout ms.",
+      minimum: 1,
+    }),
   ),
 });
+
+function readTtsTimeoutMs(args: Record<string, unknown>): number | undefined {
+  return readPositiveIntegerParam(args, "timeoutMs", {
+    message: "timeoutMs must be a positive integer in milliseconds.",
+  });
+}
 
 /**
  * Defuse reply-directive tokens inside spoken transcripts before they flow
@@ -37,22 +46,29 @@ function sanitizeTranscriptForToolContent(text: string): string {
 export function createTtsTool(opts?: {
   config?: OpenClawConfig;
   agentChannel?: GatewayMessageChannel;
+  agentId?: string;
+  agentAccountId?: string;
 }): AnyAgentTool {
   return {
     label: "TTS",
     name: "tts",
-    displaySummary: "Convert text to speech and return audio.",
-    description: `Convert text to speech. Audio is delivered automatically from the tool result — reply with ${SILENT_REPLY_TOKEN} after a successful call to avoid duplicate messages.`,
+    displaySummary: "Text to speech audio.",
+    description:
+      "Use only for explicit audio intent (voice/speech/TTS) or active TTS config. Never use for ordinary text replies. Audio auto-delivered from tool result; after success follow reply instructions, no duplicate text/audio.",
     parameters: TtsToolSchema,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
       const text = readStringParam(params, "text", { required: true });
       const channel = readStringParam(params, "channel");
-      const cfg = opts?.config ?? loadConfig();
+      const timeoutMs = readTtsTimeoutMs(params);
+      const cfg = opts?.config ?? getRuntimeConfig();
       const result = await textToSpeech({
         text,
         cfg,
         channel: channel ?? opts?.agentChannel,
+        timeoutMs,
+        agentId: opts?.agentId,
+        accountId: opts?.agentAccountId,
       });
 
       if (result.success && result.audioPath) {
@@ -66,10 +82,11 @@ export function createTtsTool(opts?: {
           details: {
             audioPath: result.audioPath,
             provider: result.provider,
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             media: {
               mediaUrl: result.audioPath,
               trustedLocalMedia: true,
-              ...(result.voiceCompatible ? { audioAsVoice: true } : {}),
+              ...(result.audioAsVoice || result.voiceCompatible ? { audioAsVoice: true } : {}),
             },
           },
         };

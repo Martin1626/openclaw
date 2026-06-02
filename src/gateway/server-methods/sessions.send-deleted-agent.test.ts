@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCodes } from "../protocol/index.js";
+import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import {
   mockDeletedAgentSession,
   resetDeletedAgentSessionMocks,
@@ -21,6 +21,7 @@ describe("sessions.send / sessions.steer deleted-agent guard", () => {
         chatAbortControllers: new Map(),
         broadcastToConnIds: vi.fn(),
         getSessionEventSubscriberConnIds: () => new Set<string>(),
+        getRuntimeConfig: () => ({}),
       } as unknown as GatewayRequestContext;
 
       await sessionsHandlers[method]({

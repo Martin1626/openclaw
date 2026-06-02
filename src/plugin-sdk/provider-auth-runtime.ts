@@ -3,13 +3,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { createServer } from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ensureAuthProfileStoreForLocalUpdate } from "../agents/auth-profiles/store.js";
-import type { OAuthCredential } from "../agents/auth-profiles/types.js";
 import { resolveApiKeyForProvider as resolveModelApiKeyForProvider } from "../agents/model-auth.js";
-import { writePrivateSecretFileAtomic } from "../infra/secret-file.js";
 
 export { resolveEnvApiKey } from "../agents/model-auth-env.js";
 export {
@@ -25,16 +21,42 @@ export {
 export type { ProviderPreparedRuntimeAuth } from "../plugins/types.js";
 export type { ResolvedProviderRuntimeAuth } from "../plugins/runtime/model-auth-types.js";
 
-export const CODEX_AUTH_ENV_CLEAR_KEYS = ["OPENAI_API_KEY"] as const;
-
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-
-export type PreparedCodexAuthBridge = {
-  codexHome: string;
-  clearEnv: string[];
-};
-
 export type OAuthCallbackResult = { code: string; state: string };
+
+// IdP-host allowlist for CORS echo on the loopback OAuth callback. Plugins
+// pass the hosts that may legitimately issue preflights against the redirect
+// URI; everything else gets a 204 with no `Access-Control-Allow-*` headers,
+// which is safe for normal browser navigation but blocks cross-origin script
+// reads. The empty allowlist (default) leaves the legacy permissive SDK
+// behavior in place for existing callers.
+export function buildOAuthCallbackOriginResolver(
+  allowedHosts: readonly string[] | undefined,
+): (originHeader: string | string[] | undefined) => string | undefined {
+  if (!allowedHosts || allowedHosts.length === 0) {
+    return () => undefined;
+  }
+  const normalized = new Set(
+    allowedHosts.map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0),
+  );
+  if (normalized.size === 0) {
+    return () => undefined;
+  }
+  return (originHeader) => {
+    const value = Array.isArray(originHeader) ? originHeader[0] : originHeader;
+    if (!value) {
+      return undefined;
+    }
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== "https:") {
+        return undefined;
+      }
+      return normalized.has(parsed.host.toLowerCase()) ? parsed.origin : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+}
 
 export function generateOAuthState(): string {
   return crypto.randomBytes(32).toString("hex");
@@ -78,20 +100,45 @@ export async function waitForLocalOAuthCallback(params: {
   progressMessage?: string;
   hostname?: string;
   onProgress?: (message: string) => void;
+  // IdP host allowlist for CORS preflight echo. Pass the canonical authority
+  // host(s) (e.g. `["auth.example.com"]`) that may issue an `OPTIONS` against
+  // the redirect URI. When omitted, legacy permissive SDK behavior is
+  // preserved for existing provider login flows.
+  corsOriginAllowlist?: readonly string[];
 }): Promise<OAuthCallbackResult> {
   const hostname = params.hostname ?? "localhost";
   const escapedSuccessTitle = escapeHtmlText(params.successTitle);
+  const resolveOAuthCallbackOrigin = buildOAuthCallbackOriginResolver(params.corsOriginAllowlist);
+  const hasCorsOriginAllowlist =
+    params.corsOriginAllowlist?.some((host) => host.trim().length > 0) ?? false;
 
   return new Promise<OAuthCallbackResult>((resolve, reject) => {
     let settled = false;
     let timeout: NodeJS.Timeout | null = null;
     const server = createServer((req, res) => {
       try {
+        applyOAuthCallbackCorsHeaders(
+          req,
+          res,
+          hasCorsOriginAllowlist ? resolveOAuthCallbackOrigin : undefined,
+        );
         const requestUrl = new URL(req.url ?? "/", `http://${hostname}:${params.port}`);
+        if (req.method === "OPTIONS") {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
         if (requestUrl.pathname !== params.callbackPath) {
           res.statusCode = 404;
           res.setHeader("Content-Type", "text/plain");
           res.end("Not found");
+          return;
+        }
+        if (req.method !== "GET") {
+          res.statusCode = 405;
+          res.setHeader("Allow", "GET, OPTIONS");
+          res.setHeader("Content-Type", "text/plain");
+          res.end("Method not allowed");
           return;
         }
 
@@ -173,6 +220,46 @@ export async function waitForLocalOAuthCallback(params: {
   });
 }
 
+function applyOAuthCallbackCorsHeaders(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+  resolveOrigin?: (originHeader: string | string[] | undefined) => string | undefined,
+): void {
+  const origin =
+    resolveOrigin === undefined
+      ? typeof req.headers.origin === "string" && isHttpOrigin(req.headers.origin)
+        ? req.headers.origin
+        : undefined
+      : resolveOrigin(req.headers.origin);
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+  }
+  if (resolveOrigin !== undefined && !origin) {
+    return;
+  }
+
+  const requestedHeaders = req.headers["access-control-request-headers"];
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    typeof requestedHeaders === "string" && requestedHeaders.trim().length > 0
+      ? requestedHeaders
+      : "content-type",
+  );
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
+  res.setHeader("Access-Control-Max-Age", "600");
+}
+
+function isHttpOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.origin === value;
+  } catch {
+    return false;
+  }
+}
+
 function escapeHtmlText(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -180,233 +267,6 @@ function escapeHtmlText(value: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-export function isCodexBridgeableOAuthCredential(value: unknown): value is OAuthCredential {
-  return Boolean(
-    value &&
-    typeof value === "object" &&
-    value !== null &&
-    "type" in value &&
-    "provider" in value &&
-    "access" in value &&
-    "refresh" in value &&
-    value.type === "oauth" &&
-    value.provider === OPENAI_CODEX_PROVIDER_ID &&
-    typeof value.access === "string" &&
-    value.access.trim().length > 0 &&
-    typeof value.refresh === "string" &&
-    value.refresh.trim().length > 0,
-  );
-}
-
-type CodexAuthBridgeRecord = {
-  auth_mode?: unknown;
-  tokens?: {
-    id_token?: unknown;
-    access_token?: unknown;
-    refresh_token?: unknown;
-    account_id?: unknown;
-  };
-  last_refresh?: unknown;
-  OPENAI_API_KEY?: unknown;
-};
-
-type CodexAuthBridgeMaterial = {
-  accountId?: string;
-  idToken?: string;
-  lastRefresh?: string | number;
-  openaiApiKey?: string;
-};
-
-export function resolveCodexAuthBridgeHome(params: {
-  agentDir: string;
-  bridgeDir: string;
-  profileId: string;
-}): string {
-  const digest = crypto.createHash("sha256").update(params.profileId).digest("hex").slice(0, 16);
-  return path.join(params.agentDir, params.bridgeDir, "codex", digest);
-}
-
-function assertExistingCodexAuthBridgeFileSafe(codexHome: string): void {
-  const authFile = path.join(codexHome, "auth.json");
-  try {
-    const stat = fs.lstatSync(authFile);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`Private secret file ${authFile} must not be a symlink.`);
-    }
-    if (!stat.isFile()) {
-      throw new Error(`Private secret file ${authFile} must be a regular file.`);
-    }
-  } catch (error) {
-    if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-}
-
-export function buildCodexAuthBridgeFile(
-  credential: OAuthCredential,
-  material: Partial<CodexAuthBridgeMaterial> = {},
-): string {
-  const lastRefresh =
-    normalizeCodexAuthLastRefresh(material.lastRefresh) ?? new Date().toISOString();
-  const openaiApiKey = readCodexAuthString(material.openaiApiKey);
-  const idToken = readCodexAuthString(credential.idToken) ?? readCodexAuthString(material.idToken);
-  const accountId =
-    readCodexAuthString(credential.accountId) ?? readCodexAuthString(material.accountId);
-  return `${JSON.stringify(
-    {
-      auth_mode: "chatgpt",
-      ...(openaiApiKey ? { OPENAI_API_KEY: openaiApiKey } : {}),
-      tokens: {
-        ...(idToken ? { id_token: idToken } : {}),
-        access_token: credential.access,
-        refresh_token: credential.refresh,
-        ...(accountId ? { account_id: accountId } : {}),
-      },
-      last_refresh: lastRefresh,
-    },
-    null,
-    2,
-  )}\n`;
-}
-
-export async function prepareCodexAuthBridge(params: {
-  agentDir: string;
-  bridgeDir: string;
-  profileId: string;
-  sourceCodexHome?: string;
-  env?: NodeJS.ProcessEnv;
-}): Promise<PreparedCodexAuthBridge | undefined> {
-  const store = ensureAuthProfileStoreForLocalUpdate(params.agentDir);
-  const credential = store.profiles[params.profileId];
-  if (!isCodexBridgeableOAuthCredential(credential)) {
-    return undefined;
-  }
-
-  const codexHome = resolveCodexAuthBridgeHome(params);
-  assertExistingCodexAuthBridgeFileSafe(codexHome);
-  const material = resolveCodexAuthBridgeMaterial({
-    credential,
-    sourceCodexHome: params.sourceCodexHome,
-    env: { ...process.env, ...params.env },
-  });
-  if (!readCodexAuthString(credential.idToken) && !readCodexAuthString(material.idToken)) {
-    return undefined;
-  }
-  await writePrivateSecretFileAtomic({
-    rootDir: params.agentDir,
-    filePath: path.join(codexHome, "auth.json"),
-    content: buildCodexAuthBridgeFile(credential, material),
-  });
-
-  return {
-    codexHome,
-    clearEnv: [...CODEX_AUTH_ENV_CLEAR_KEYS],
-  };
-}
-
-function resolveCodexAuthBridgeMaterial(params: {
-  credential: OAuthCredential;
-  sourceCodexHome?: string;
-  env?: NodeJS.ProcessEnv;
-}): Partial<CodexAuthBridgeMaterial> {
-  const source = readCodexAuthBridgeSourceFile({
-    codexHome: params.sourceCodexHome,
-    env: params.env,
-  });
-  if (!source || source.auth_mode !== "chatgpt") {
-    return {};
-  }
-
-  const tokens = source.tokens;
-  if (!tokens || typeof tokens !== "object") {
-    return {};
-  }
-  const access = readCodexAuthString(tokens.access_token);
-  const refresh = readCodexAuthString(tokens.refresh_token);
-  if (!access || !refresh) {
-    return {};
-  }
-
-  const accountId = readCodexAuthString(tokens.account_id);
-  if (!codexAuthSourceMatchesCredential(params.credential, { access, refresh, accountId })) {
-    return {};
-  }
-  const idToken = readCodexAuthString(tokens.id_token);
-  const lastRefresh = normalizeCodexAuthLastRefresh(source.last_refresh);
-  const openaiApiKey = readCodexAuthString(source.OPENAI_API_KEY);
-
-  return {
-    ...(accountId ? { accountId } : {}),
-    ...(idToken ? { idToken } : {}),
-    ...(lastRefresh ? { lastRefresh } : {}),
-    ...(openaiApiKey ? { openaiApiKey } : {}),
-  };
-}
-
-function codexAuthSourceMatchesCredential(
-  credential: OAuthCredential,
-  source: { access: string; refresh: string; accountId?: string },
-): boolean {
-  if (credential.access === source.access && credential.refresh === source.refresh) {
-    return true;
-  }
-  const credentialAccountId = credential.accountId?.trim();
-  const sourceAccountId = source.accountId?.trim();
-  return Boolean(credentialAccountId && sourceAccountId && credentialAccountId === sourceAccountId);
-}
-
-function readCodexAuthBridgeSourceFile(params: {
-  codexHome?: string;
-  env?: NodeJS.ProcessEnv;
-}): CodexAuthBridgeRecord | undefined {
-  const codexHome = resolveSourceCodexHome(params);
-  if (!codexHome) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as CodexAuthBridgeRecord)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function resolveSourceCodexHome(params: {
-  codexHome?: string;
-  env?: NodeJS.ProcessEnv;
-}): string | undefined {
-  const configured = params.codexHome?.trim() || params.env?.CODEX_HOME?.trim();
-  if (configured) {
-    return resolveTildePath(configured);
-  }
-  const home = os.homedir();
-  return home ? path.join(home, ".codex") : undefined;
-}
-
-function resolveTildePath(value: string): string {
-  if (value === "~") {
-    return os.homedir();
-  }
-  if (value.startsWith("~/")) {
-    return path.join(os.homedir(), value.slice(2));
-  }
-  return path.resolve(value);
-}
-
-function readCodexAuthString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function normalizeCodexAuthLastRefresh(value: unknown): string | number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  return readCodexAuthString(value);
 }
 
 type ResolveApiKeyForProvider = typeof import("../agents/model-auth.js").resolveApiKeyForProvider;
