@@ -10,6 +10,10 @@ on:
         description: Git ref to build
         default: main
         required: false
+      repository:
+        description: Source repository (openclaw/openclaw for upstream stepping-stone releases)
+        default: Martin1626/openclaw
+        required: false
 
 permissions:
   contents: read
@@ -28,6 +32,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
 
       - name: Build openclaw:local
