@@ -1059,6 +1059,15 @@ async def proxy_openai(request: Request, path: str):
 
     body = await request.json()
 
+    # ChatGPT Codex backend tyto dva parametry nezna a kvuli nim odmitne CELY
+    # request: 400 {"detail":"Unsupported parameter: max_output_tokens"} resp.
+    # prompt_cache_retention. OpenClaw je posila, protoze endpoint class urcuje
+    # z hostname baseUrl - "pii-proxy" nerozpozna jako Codex a radi request do
+    # tridy "custom", takze Codex-specificky strip se neuplatni.
+    # Overeno 2026-07-29: bez nich backend vraci 200, prompt_cache_key je OK.
+    for _unsupported_param in ("max_output_tokens", "prompt_cache_retention"):
+        body.pop(_unsupported_param, None)
+
     skip_pii = raw_hdrs.get("x-pii-skip", "").lower() in ("true", "1", "yes")
     if not skip_pii and _check_and_strip_noanon(body):
         skip_pii = True

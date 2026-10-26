@@ -22,6 +22,7 @@ services:
       context: .
       args:
         OPENCLAW_INSTALL_BROWSER: "1"
+        OPENCLAW_EXTENSIONS: "codex,whatsapp"
     entrypoint: ["/home/deploy/openclaw/docker-entrypoint-wrapper.sh"]
     command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
     ports:
