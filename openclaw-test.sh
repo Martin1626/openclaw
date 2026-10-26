@@ -157,13 +157,13 @@ console.log('enabled, freq=' + d.frequency);
 
 test_telegram_bots() {
     local output
-    output=$($COMPOSE exec -T openclaw-gateway node dist/index.js doctor 2>&1 | grep -i "telegram:")
-    if echo "$output" | grep -q "ok"; then
-        echo "$output" | head -1
-    else
-        echo "$output" | head -1
-        return 1
-    fi
+    # v2026.10+: doctor už nevypisuje "telegram: ok" → stav z channels status
+    output=$($COMPOSE exec -T openclaw-gateway node openclaw.mjs channels status 2>&1 | grep -i "^- Telegram")
+    local total connected
+    total=$(echo "$output" | grep -c "Telegram")
+    connected=$(echo "$output" | grep -c "running, connected")
+    echo "$connected/$total telegram bots connected"
+    [ "$total" -gt 0 ] && [ "$connected" -eq "$total" ]
 }
 
 test_pii_roundtrip() {
@@ -357,7 +357,8 @@ test_vault_indexed() {
     $COMPOSE exec -T openclaw-gateway node -e "
 const fs = require('fs');
 const config = JSON.parse(fs.readFileSync('/home/node/.openclaw/openclaw.json'));
-const extra = config.agents?.defaults?.memorySearch?.extraPaths || [];
+// v2026.10+: agents.defaults.memorySearch → memory.search (migrace doctorem)
+const extra = config.memory?.search?.extraPaths || config.agents?.defaults?.memorySearch?.extraPaths || [];
 if (!extra.includes('vault')) { console.error('vault not in extraPaths'); process.exit(1); }
 const vaultDir = '/home/node/.openclaw/workspace/vault';
 if (!fs.existsSync(vaultDir)) { console.error('vault dir missing'); process.exit(1); }
