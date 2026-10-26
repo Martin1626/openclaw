@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
+import zstandard
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1038,6 +1039,22 @@ async def _stream_proxy_openai(
         await client.aclose()
 
 
+def _decode_request_body(raw: bytes, content_encoding: str) -> dict:
+    """Rozbali telo requestu do JSON.
+
+    OpenClaw v2026.10+ posila ChatGPT requesty komprimovane zstd
+    (content-encoding: zstd). Upstream dostava telo znovu serializovane jako
+    JSON bez komprese - content-encoding neni v OPENAI_FORWARD_HEADERS.
+    """
+    encoding = content_encoding.strip().lower()
+    if encoding == "zstd":
+        # decompressobj zvladne i frame bez content size (Node zstdCompressSync)
+        raw = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    elif encoding not in ("", "identity"):
+        raise ValueError(f"Unsupported request content-encoding: {content_encoding}")
+    return json.loads(raw)
+
+
 @app.api_route("/openai/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_openai(request: Request, path: str):
     """Proxy OpenAI/Codex API with PII anonymization."""
@@ -1057,7 +1074,7 @@ async def proxy_openai(request: Request, path: str):
             return Response(content=resp.content, status_code=resp.status_code,
                           media_type=resp.headers.get("content-type"))
 
-    body = await request.json()
+    body = _decode_request_body(await request.body(), raw_hdrs.get("content-encoding", ""))
 
     # ChatGPT Codex backend tyto dva parametry nezna a kvuli nim odmitne CELY
     # request: 400 {"detail":"Unsupported parameter: max_output_tokens"} resp.
