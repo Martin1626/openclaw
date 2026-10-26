@@ -1,65 +1,25 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import type { ChannelHealthMonitor } from "./channel-health-monitor.js";
 import { startChannelHealthMonitor } from "./channel-health-monitor.js";
-
-type GatewayRuntimeServiceLogger = {
-  child: (name: string) => {
-    info: (message: string) => void;
-    warn: (message: string) => void;
-    error: (message: string) => void;
-  };
-  error: (message: string) => void;
-};
+import { isChannelStartupSuppressedByEnvironment } from "./server-sidecar-startup-mode.js";
 
 export type GatewayChannelManager = Parameters<
   typeof startChannelHealthMonitor
 >[0]["channelManager"];
 
-function createNoopHeartbeatRunner() {
-  return {
-    stop: () => {},
-    updateConfig: (_cfg: OpenClawConfig) => {},
-  };
-}
-
+/** Starts channel health monitoring unless process configuration suppresses channels. */
 export function startGatewayChannelHealthMonitor(params: {
-  cfg: OpenClawConfig;
   channelManager: GatewayChannelManager;
+  scheduler: GatewayScheduler;
+  env?: NodeJS.ProcessEnv;
 }): ChannelHealthMonitor | null {
-  const healthCheckMinutes = params.cfg.gateway?.channelHealthCheckMinutes;
-  if (healthCheckMinutes === 0) {
+  // Process-level channel suppression also owns recovery: otherwise the health
+  // monitor restarts configured transports after the startup grace period.
+  if (isChannelStartupSuppressedByEnvironment(params.env)) {
     return null;
   }
-  const staleEventThresholdMinutes = params.cfg.gateway?.channelStaleEventThresholdMinutes;
-  const maxRestartsPerHour = params.cfg.gateway?.channelMaxRestartsPerHour;
   return startChannelHealthMonitor({
-    channelManager: params.channelManager,
-    checkIntervalMs: (healthCheckMinutes ?? 5) * 60_000,
-    ...(staleEventThresholdMinutes != null && {
-      staleEventThresholdMs: staleEventThresholdMinutes * 60_000,
-    }),
-    ...(maxRestartsPerHour != null && { maxRestartsPerHour }),
-  });
-}
-
-export function startGatewayRuntimeServices(params: {
-  minimalTestGateway: boolean;
-  cfgAtStart: OpenClawConfig;
-  channelManager: GatewayChannelManager;
-  log: GatewayRuntimeServiceLogger;
-}): {
-  heartbeatRunner: ReturnType<typeof createNoopHeartbeatRunner>;
-  channelHealthMonitor: ChannelHealthMonitor | null;
-  stopModelPricingRefresh: () => void;
-} {
-  const channelHealthMonitor = startGatewayChannelHealthMonitor({
-    cfg: params.cfgAtStart,
+    scheduler: params.scheduler,
     channelManager: params.channelManager,
   });
-
-  return {
-    heartbeatRunner: createNoopHeartbeatRunner(),
-    channelHealthMonitor,
-    stopModelPricingRefresh: () => {},
-  };
 }

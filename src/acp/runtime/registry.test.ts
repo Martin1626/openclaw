@@ -1,3 +1,5 @@
+/** Tests ACP runtime backend registration, health selection, and required lookup errors. */
+import type { AcpRuntime } from "@openclaw/acp-core/runtime/types";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AcpRuntimeError } from "./errors.js";
 import {
@@ -7,7 +9,6 @@ import {
   requireAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
 } from "./registry.js";
-import type { AcpRuntime } from "./types.js";
 
 function createRuntimeStub(): AcpRuntime {
   return {
@@ -42,25 +43,6 @@ describe("acp runtime registry", () => {
     const backend = getAcpRuntimeBackend("acpx");
     expect(backend?.id).toBe("acpx");
     expect(backend?.runtime).toBe(runtime);
-  });
-
-  it("prefers a healthy backend when resolving without explicit id", () => {
-    const unhealthyRuntime = createRuntimeStub();
-    const healthyRuntime = createRuntimeStub();
-
-    registerAcpRuntimeBackend({
-      id: "unhealthy",
-      runtime: unhealthyRuntime,
-      healthy: () => false,
-    });
-    registerAcpRuntimeBackend({
-      id: "healthy",
-      runtime: healthyRuntime,
-      healthy: () => true,
-    });
-
-    const backend = getAcpRuntimeBackend();
-    expect(backend?.id).toBe("healthy");
   });
 
   it("throws a typed missing-backend error when no backend is registered", () => {

@@ -1,20 +1,16 @@
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+/**
+ * Converts embedded run failures into provider failover signals.
+ */
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { isExecLikeToolName, type ToolErrorSummary } from "../tool-error-summary.js";
 import type { EmbeddedRunFailureSignal } from "./types.js";
 
-const FAILURE_SIGNAL_CODES = ["SYSTEM_RUN_DENIED", "INVALID_REQUEST"] as const;
-
-function resolveFailureSignalCode(
-  value: string | undefined,
-): EmbeddedRunFailureSignal["code"] | undefined {
-  for (const code of FAILURE_SIGNAL_CODES) {
-    if (value === code) {
-      return code;
-    }
-  }
-  return undefined;
-}
-
+/**
+ * Converts terminal tool errors from unattended embedded runs into failure signals.
+ *
+ * Cron runs need fatal execution-denied signals so schedulers do not treat blocked shell access as
+ * a normal silent completion.
+ */
 export function resolveEmbeddedRunFailureSignal(params: {
   trigger?: string | undefined;
   lastToolError?: ToolErrorSummary | undefined;
@@ -26,8 +22,8 @@ export function resolveEmbeddedRunFailureSignal(params: {
   if (!lastToolError || !isExecLikeToolName(lastToolError.toolName)) {
     return undefined;
   }
-  const code = resolveFailureSignalCode(normalizeOptionalString(lastToolError.errorCode));
-  if (!code) {
+  const code = normalizeOptionalString(lastToolError.errorCode);
+  if (code !== "SYSTEM_RUN_DENIED" && code !== "INVALID_REQUEST") {
     return undefined;
   }
   const message = normalizeOptionalString(lastToolError.error) ?? code;

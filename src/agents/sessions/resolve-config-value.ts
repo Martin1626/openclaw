@@ -4,7 +4,11 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { getShellConfig } from "../utils/shell.js";
+import {
+  buildShellCommandInvocation,
+  getBashShellConfig,
+  getBashShellEnv,
+} from "../shell-utils.js";
 
 // Cache for shell command results (persists for process lifetime)
 const commandResultCache = new Map<string, string | undefined>();
@@ -15,11 +19,13 @@ const commandResultCache = new Map<string, string | undefined>();
  * - Otherwise checks environment variable first, then treats as literal (not cached)
  */
 export function resolveConfigValue(config: string): string | undefined {
-  if (config.startsWith("!")) {
-    return executeCommand(config);
+  if (!config.startsWith("!")) {
+    return resolveConfigValueUncached(config);
   }
-  const envValue = process.env[config];
-  return envValue || config;
+  if (!commandResultCache.has(config)) {
+    commandResultCache.set(config, executeCommandUncached(config));
+  }
+  return commandResultCache.get(config);
 }
 
 function executeWithConfiguredShell(command: string): {
@@ -27,25 +33,22 @@ function executeWithConfiguredShell(command: string): {
   value: string | undefined;
 } {
   try {
-    const { shell, args } = getShellConfig();
-    const result = spawnSync(shell, [...args, command], {
+    const shellConfig = getBashShellConfig();
+    const invocation = buildShellCommandInvocation(command, shellConfig);
+    const [shell, ...args] = invocation.argv;
+    const result = spawnSync(shell, args, {
       encoding: "utf-8",
+      ...(invocation.input === undefined ? {} : { input: invocation.input }),
       timeout: 10000,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: [invocation.stdin, "pipe", "ignore"],
       shell: false,
       windowsHide: true,
+      env: getBashShellEnv(shellConfig.shell),
     });
 
-    if (result.error) {
-      const error = result.error as NodeJS.ErrnoException;
-      if (error.code === "ENOENT") {
-        return { executed: false, value: undefined };
-      }
-      return { executed: true, value: undefined };
-    }
-
-    if (result.status !== 0) {
-      return { executed: true, value: undefined };
+    if (result.error || result.status !== 0) {
+      const error = result.error as NodeJS.ErrnoException | undefined;
+      return { executed: error?.code !== "ENOENT", value: undefined };
     }
 
     const value = (result.stdout ?? "").trim();
@@ -70,35 +73,23 @@ function executeWithDefaultShell(command: string): string | undefined {
 
 function executeCommandUncached(commandConfig: string): string | undefined {
   const command = commandConfig.slice(1);
-  return process.platform === "win32"
-    ? (() => {
-        const configuredResult = executeWithConfiguredShell(command);
-        return configuredResult.executed
-          ? configuredResult.value
-          : executeWithDefaultShell(command);
-      })()
-    : executeWithDefaultShell(command);
-}
-
-function executeCommand(commandConfig: string): string | undefined {
-  if (commandResultCache.has(commandConfig)) {
-    return commandResultCache.get(commandConfig);
+  if (process.platform === "win32") {
+    const configuredResult = executeWithConfiguredShell(command);
+    if (configuredResult.executed) {
+      return configuredResult.value;
+    }
   }
-
-  const result = executeCommandUncached(commandConfig);
-  commandResultCache.set(commandConfig, result);
-  return result;
+  return executeWithDefaultShell(command);
 }
 
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
 export function resolveConfigValueUncached(config: string): string | undefined {
   if (config.startsWith("!")) {
     return executeCommandUncached(config);
   }
-  const envValue = process.env[config];
-  return envValue || config;
+  if (Object.hasOwn(process.env, config)) {
+    return process.env[config] || undefined;
+  }
+  return config;
 }
 
 export function resolveConfigValueOrThrow(config: string, description: string): string {
@@ -114,25 +105,6 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
   throw new Error(`Failed to resolve ${description}`);
 }
 
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
-export function resolveHeaders(
-  headers: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  if (!headers) {
-    return undefined;
-  }
-  const resolved: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers)) {
-    const resolvedValue = resolveConfigValue(value);
-    if (resolvedValue) {
-      resolved[key] = resolvedValue;
-    }
-  }
-  return Object.keys(resolved).length > 0 ? resolved : undefined;
-}
-
 export function resolveHeadersOrThrow(
   headers: Record<string, string> | undefined,
   description: string,
@@ -145,9 +117,4 @@ export function resolveHeadersOrThrow(
     resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`);
   }
   return Object.keys(resolved).length > 0 ? resolved : undefined;
-}
-
-/** Clear the config value command cache. Exported for testing. */
-export function clearConfigValueCache(): void {
-  commandResultCache.clear();
 }

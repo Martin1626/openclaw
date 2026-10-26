@@ -4,7 +4,7 @@ import type {
   ChannelMessageReceiveAdapterShape,
 } from "./types.js";
 
-const defaultManualReceiveAdapter = {
+export const defaultManualReceiveAdapter = {
   defaultAckPolicy: "manual",
   supportedAckPolicies: ["manual"],
 } as const satisfies ChannelMessageReceiveAdapterShape;
@@ -16,6 +16,7 @@ type ChannelMessageAdapterWithDefaultReceive<TAdapter extends ChannelMessageAdap
       : NonNullable<TAdapter["receive"]>;
   };
 
+/** Defines a message adapter while defaulting receive acknowledgement to manual. */
 export function defineChannelMessageAdapter<const TAdapter extends ChannelMessageAdapterShape>(
   adapter: TAdapter,
 ): ChannelMessageAdapter<ChannelMessageAdapterWithDefaultReceive<TAdapter>> {

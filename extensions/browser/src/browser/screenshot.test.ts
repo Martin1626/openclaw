@@ -1,3 +1,4 @@
+// Browser tests cover screenshot plugin behavior.
 import fs from "node:fs/promises";
 import { getImageMetadata } from "openclaw/plugin-sdk/media-runtime";
 import { createSolidPngBuffer } from "openclaw/plugin-sdk/test-fixtures";
@@ -22,7 +23,7 @@ describe("browser screenshot normalization", () => {
   }, 120_000);
 
   it("keeps already-small screenshots unchanged", async () => {
-    const jpeg = await fs.readFile("docs/assets/showcase/roof-camera-sky.jpg");
+    const jpeg = await fs.readFile("test/fixtures/media/roof-camera-sky.jpg");
 
     const normalized = await normalizeBrowserScreenshot(jpeg, {
       maxSide: 2000,

@@ -1,29 +1,18 @@
-import { resolveIntegerOption } from "../../../shared/number-coercion.js";
-
-export type HandshakeAuthLogDecision = {
-  shouldLog: boolean;
-  suppressedSinceLastLog: number;
-};
+import { pruneMapToMaxSize } from "../../../infra/map-size.js";
 
 type HandshakeAuthLogState = {
   lastLoggedAtMs: number;
   suppressedSinceLastLog: number;
 };
 
+/** Per-key log limiter that reports suppressed auth attempts on the next emitted log. */
 export class HandshakeAuthLogLimiter {
-  private readonly intervalMs: number;
-  private readonly maxEntries: number;
   private readonly entries = new Map<string, HandshakeAuthLogState>();
 
-  constructor(options?: { intervalMs?: number; maxEntries?: number }) {
-    this.intervalMs = resolveIntegerOption(options?.intervalMs, 30_000, { min: 1 });
-    this.maxEntries = resolveIntegerOption(options?.maxEntries, 256, { min: 1 });
-  }
-
-  register(key: string, nowMs = Date.now()): HandshakeAuthLogDecision {
+  register(key: string, nowMs = Date.now()) {
     const entry = this.entries.get(key);
     if (!entry) {
-      this.pruneIfNeeded();
+      pruneMapToMaxSize(this.entries, 255);
       this.entries.set(key, {
         lastLoggedAtMs: nowMs,
         suppressedSinceLastLog: 0,
@@ -31,7 +20,7 @@ export class HandshakeAuthLogLimiter {
       return { shouldLog: true, suppressedSinceLastLog: 0 };
     }
 
-    if (nowMs - entry.lastLoggedAtMs < this.intervalMs) {
+    if (nowMs - entry.lastLoggedAtMs < 30_000) {
       entry.suppressedSinceLastLog += 1;
       return { shouldLog: false, suppressedSinceLastLog: 0 };
     }
@@ -40,16 +29,6 @@ export class HandshakeAuthLogLimiter {
     entry.lastLoggedAtMs = nowMs;
     entry.suppressedSinceLastLog = 0;
     return { shouldLog: true, suppressedSinceLastLog };
-  }
-
-  private pruneIfNeeded(): void {
-    if (this.entries.size < this.maxEntries) {
-      return;
-    }
-    const oldestKey = this.entries.keys().next().value;
-    if (oldestKey !== undefined) {
-      this.entries.delete(oldestKey);
-    }
   }
 }
 

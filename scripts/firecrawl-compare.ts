@@ -1,7 +1,9 @@
 import { pathToFileURL } from "node:url";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { fetchFirecrawlContent } from "../extensions/firecrawl/api.ts";
-import { extractReadableContent } from "../src/agents/tools/web-tools.js";
 import { formatErrorMessage } from "../src/infra/errors.ts";
+import { extractReadableContent } from "../src/web-fetch/content-extractors.runtime.js";
+import { readBoundedResponseText } from "./lib/bounded-response.mjs";
 
 const DEFAULT_URLS = [
   "https://en.wikipedia.org/wiki/Web_scraping",
@@ -21,108 +23,16 @@ const userAgent =
 const timeoutMs = 30_000;
 const FETCH_HTML_MAX_BYTES = 5 * 1024 * 1024;
 
-type FetchHtmlOptions = {
-  fetchImpl?: typeof fetch;
-  maxBytes?: number;
-};
-
 function truncate(value: string, max = 180): string {
   if (!value) {
     return "";
   }
-  return value.length > max ? `${value.slice(0, max)}…` : value;
-}
-
-function responseBodyTooLargeError(label: string, maxBytes: number): Error {
-  return new Error(`${label} response body exceeded ${maxBytes} bytes`);
-}
-
-async function readBoundedResponseText(
-  response: Response,
-  label: string,
-  signal: AbortSignal,
-  maxBytes = FETCH_HTML_MAX_BYTES,
-): Promise<string> {
-  const contentLength = Number(response.headers.get("content-length") ?? "");
-  if (Number.isSafeInteger(contentLength) && contentLength > maxBytes) {
-    await response.body?.cancel().catch(() => undefined);
-    throw responseBodyTooLargeError(label, maxBytes);
-  }
-  if (!response.body) {
-    return "";
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  let totalBytes = 0;
-  let canceled = false;
-
-  try {
-    for (;;) {
-      const { done, value } = await readResponseChunk(reader, label, signal, () => {
-        canceled = true;
-      });
-      if (done) {
-        const tail = decoder.decode();
-        if (tail) {
-          chunks.push(tail);
-        }
-        break;
-      }
-
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        canceled = true;
-        await reader.cancel().catch(() => undefined);
-        throw responseBodyTooLargeError(label, maxBytes);
-      }
-      chunks.push(decoder.decode(value, { stream: true }));
-    }
-  } finally {
-    if (!canceled) {
-      reader.releaseLock();
-    }
-  }
-
-  return chunks.join("");
-}
-
-async function readResponseChunk(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  label: string,
-  signal: AbortSignal,
-  markCanceled: () => void,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-  if (signal.aborted) {
-    markCanceled();
-    await reader.cancel().catch(() => undefined);
-    throw signal.reason instanceof Error ? signal.reason : new Error(`${label} request aborted`);
-  }
-
-  let removeAbortListener: (() => void) | undefined;
-  const abortPromise = new Promise<ReadableStreamReadResult<Uint8Array>>((_resolve, reject) => {
-    const onAbort = () => {
-      markCanceled();
-      void reader.cancel().catch(() => undefined);
-      reject(
-        signal.reason instanceof Error ? signal.reason : new Error(`${label} request aborted`),
-      );
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-  });
-
-  try {
-    return await Promise.race([reader.read(), abortPromise]);
-  } finally {
-    removeAbortListener?.();
-  }
+  return value.length > max ? `${truncateUtf16Safe(value, max)}…` : value;
 }
 
 async function fetchHtml(
   url: string,
-  options: FetchHtmlOptions = {},
+  fetchImpl: typeof fetch = fetch,
 ): Promise<{
   ok: boolean;
   status: number;
@@ -132,7 +42,6 @@ async function fetchHtml(
 }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const fetchImpl = options.fetchImpl ?? fetch;
   try {
     const res = await fetchImpl(url, {
       method: "GET",
@@ -140,12 +49,9 @@ async function fetchHtml(
       signal: controller.signal,
     });
     const contentType = res.headers.get("content-type") ?? "application/octet-stream";
-    const body = await readBoundedResponseText(
-      res,
-      "local HTML fetch",
-      controller.signal,
-      options.maxBytes ?? FETCH_HTML_MAX_BYTES,
-    );
+    const body = await readBoundedResponseText(res, "local HTML fetch", FETCH_HTML_MAX_BYTES, {
+      signal: controller.signal,
+    });
     return {
       ok: res.ok,
       status: res.status,
@@ -165,7 +71,7 @@ async function run() {
 
   for (const url of targets) {
     console.log(`\n=== ${url}`);
-    let localStatus = "skipped";
+    let localStatus;
     let localTitle = "";
     let localText = "";
     let localError: string | undefined;
@@ -239,14 +145,13 @@ async function run() {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  run().catch((error) => {
+  run().catch((error: unknown) => {
     console.error(error);
     process.exit(1);
   });
 }
 
 export const testing = {
-  FETCH_HTML_MAX_BYTES,
   fetchHtml,
-  readBoundedResponseText,
+  truncate,
 };

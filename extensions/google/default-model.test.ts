@@ -1,6 +1,7 @@
+// Google tests cover default model plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/provider-onboard";
 import { describe, expect, it } from "vitest";
-import { applyGoogleGeminiModelDefault, GOOGLE_GEMINI_DEFAULT_MODEL } from "./api.js";
+import { applyGoogleGeminiModelDefault, GOOGLE_GEMINI_DEFAULT_MODEL } from "./onboard.js";
 
 describe("google default model", () => {
   it("sets defaults when model is unset", () => {
@@ -35,7 +36,7 @@ describe("google default model", () => {
 
     expect(applied.changed).toBe(true);
     expect(applied.next.agents?.defaults?.model).toEqual({
-      primary: "google/gemini-3.1-pro-preview",
+      primary: GOOGLE_GEMINI_DEFAULT_MODEL,
       fallbacks: ["google/gemini-3.1-pro-preview"],
     });
     expect(applied.next.agents?.defaults?.models).toEqual({
@@ -61,10 +62,10 @@ describe("google default model", () => {
     expect(applied.changed).toBe(true);
     expect(applied.next.agents?.defaults?.model).toEqual({
       primary: GOOGLE_GEMINI_DEFAULT_MODEL,
-      fallbacks: [GOOGLE_GEMINI_DEFAULT_MODEL],
+      fallbacks: ["google/gemini-3.1-pro-preview"],
     });
     expect(applied.next.agents?.defaults?.models).toEqual({
-      [GOOGLE_GEMINI_DEFAULT_MODEL]: { alias: "gemini" },
+      "google/gemini-3.1-pro-preview": { alias: "gemini" },
     });
   });
 
@@ -100,8 +101,17 @@ describe("google default model", () => {
 
     expect(applied.changed).toBe(true);
     expect(applied.next.models?.providers?.google?.models?.map((model) => model.id)).toEqual([
-      GOOGLE_GEMINI_DEFAULT_MODEL,
+      "google/gemini-3.1-pro-preview",
     ]);
+  });
+
+  it("moves an existing Google primary to Gemini 4 Argon on setup re-run", () => {
+    const applied = applyGoogleGeminiModelDefault({
+      agents: { defaults: { model: { primary: "google/gemini-3.1-pro-preview" } } },
+    });
+
+    expect(applied.changed).toBe(true);
+    expect(applied.next.agents?.defaults?.model).toEqual({ primary: "google/gemini-4-argon" });
   });
 
   it("no-ops when already on the target default", () => {

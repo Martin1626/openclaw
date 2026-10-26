@@ -20,6 +20,10 @@ describe("resolveTokenExpiryState", () => {
     expect(resolveTokenExpiryState(Number.POSITIVE_INFINITY, now)).toBe("invalid_expires");
   });
 
+  it("treats Date-invalid future timestamps as invalid_expires", () => {
+    expect(resolveTokenExpiryState(8_700_000_000_000_000, now)).toBe("invalid_expires");
+  });
+
   it("returns expired when expires is in the past", () => {
     expect(resolveTokenExpiryState(now - 1, now)).toBe("expired");
   });
@@ -45,7 +49,7 @@ describe("hasUsableOAuthCredential", () => {
       hasUsableOAuthCredential(
         {
           type: "oauth",
-          provider: "openai-codex",
+          provider: "openai",
           access: "access-token",
           refresh: "refresh-token",
           expires: now + DEFAULT_OAUTH_REFRESH_MARGIN_MS - 1,
@@ -73,6 +77,21 @@ describe("evaluateStoredCredentialEligibility", () => {
       now,
     });
     expect(result).toEqual({ eligible: true, reasonCode: "ok" });
+  });
+
+  it.each([
+    "openclaw onboard --auth-choice zai-coding-global",
+    "openclaw onboard --non-interactive --auth-choice=zai-coding-global --zai-api-key $ZAI_API_KEY",
+  ])("marks pasted OpenClaw onboarding command %p as a malformed api key", (key) => {
+    const result = evaluateStoredCredentialEligibility({
+      credential: {
+        type: "api_key",
+        provider: "zai",
+        key,
+      },
+      now,
+    });
+    expect(result).toEqual({ eligible: false, reasonCode: "malformed_api_key" });
   });
 
   it("marks tokenRef with missing expires as eligible", () => {
@@ -108,7 +127,7 @@ describe("evaluateStoredCredentialEligibility", () => {
     const result = evaluateStoredCredentialEligibility({
       credential: {
         type: "oauth",
-        provider: "openai-codex",
+        provider: "openai",
         access: "",
         refresh: "",
         expires: now + 60_000,

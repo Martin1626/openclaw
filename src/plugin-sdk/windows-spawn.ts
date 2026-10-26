@@ -1,25 +1,36 @@
+// Windows spawn helpers resolve Windows command execution details for plugin runtimes.
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
+} from "../../packages/normalization-core/src/string-coerce.js";
+import { normalizeStringEntries } from "../../packages/normalization-core/src/string-normalization.js";
+import { resolveEnvironmentValue } from "../infra/process-env.js";
 
+/** Final execution strategy chosen for a Windows spawn command. */
 export type WindowsSpawnResolution =
   | "direct"
   | "node-entrypoint"
   | "exe-entrypoint"
   | "shell-fallback";
 
+/** Direct-spawn resolution before shell fallback is considered. */
 export type WindowsSpawnCandidateResolution = Exclude<WindowsSpawnResolution, "shell-fallback">;
+
+/** Direct-spawn candidate before shell fallback policy is applied. */
 export type WindowsSpawnProgramCandidate = {
+  /** Executable passed to child_process after wrapper resolution. */
   command: string;
+  /** Arguments prepended before call-site argv, usually a resolved JS entrypoint. */
   leadingArgv: string[];
+  /** Candidate resolution path, or unresolved-wrapper when shell policy must decide. */
   resolution: WindowsSpawnCandidateResolution | "unresolved-wrapper";
+  /** Hide the transient Windows console for Node/exe entrypoint launches. */
   windowsHide?: boolean;
 };
 
+/** Spawn program after Windows wrapper resolution and fallback policy. */
 export type WindowsSpawnProgram = {
   command: string;
   leadingArgv: string[];
@@ -28,6 +39,7 @@ export type WindowsSpawnProgram = {
   windowsHide?: boolean;
 };
 
+/** Fully materialized child_process invocation for a resolved Windows spawn program. */
 export type WindowsSpawnInvocation = {
   command: string;
   argv: string[];
@@ -36,6 +48,7 @@ export type WindowsSpawnInvocation = {
   windowsHide?: boolean;
 };
 
+/** Inputs used to resolve a command into a Windows-safe direct spawn program. */
 export type ResolveWindowsSpawnProgramParams = {
   command: string;
   platform?: NodeJS.Platform;
@@ -45,10 +58,12 @@ export type ResolveWindowsSpawnProgramParams = {
   /** Trusted compatibility escape hatch for callers that intentionally accept shell-mediated wrapper execution. */
   allowShellFallback?: boolean;
 };
+/** Inputs for candidate resolution that intentionally excludes shell fallback policy. */
 export type ResolveWindowsSpawnProgramCandidateParams = Omit<
   ResolveWindowsSpawnProgramParams,
   "allowShellFallback"
 >;
+/** Parsed executable plus inline arguments from a command string. */
 export type WindowsSpawnCommandInlineArgs = {
   executable: string;
   arguments: string;
@@ -104,6 +119,7 @@ function readCommandToken(command: string): { token: string; rest: string } | nu
   };
 }
 
+/** Detect command strings like `node script.js` that should be split before spawn. */
 export function detectWindowsSpawnCommandInlineArgs(
   command: string,
 ): WindowsSpawnCommandInlineArgs | null {
@@ -113,7 +129,8 @@ export function detectWindowsSpawnCommandInlineArgs(
   }
   const normalizedToken = parsed.token.replace(/\\/g, "/");
   const executable = normalizeLowercaseStringOrEmpty(path.posix.basename(normalizedToken));
-  if (!INLINE_ARGUMENT_EXECUTABLES.has(executable)) {
+  // Existing paths can contain spaces after a directory named node or pnpm.
+  if (!INLINE_ARGUMENT_EXECUTABLES.has(executable) || isFilePath(command)) {
     return null;
   }
   return {
@@ -122,20 +139,25 @@ export function detectWindowsSpawnCommandInlineArgs(
   };
 }
 
-/** Resolve a Windows command name through PATH and PATHEXT so wrapper inspection sees the real file. */
-export function resolveWindowsExecutablePath(command: string, env: NodeJS.ProcessEnv): string {
+/** Resolve PATH/PATHEXT before inspecting wrappers; relative paths use the supplied child cwd. */
+export function resolveWindowsExecutablePath(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  cwd?: string,
+): string {
   if (command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
-    return command;
+    return cwd && !path.isAbsolute(command) ? path.resolve(cwd, command) : command;
   }
 
-  const pathValue = env.PATH ?? env.Path ?? process.env.PATH ?? process.env.Path ?? "";
+  const pathValue =
+    resolveEnvironmentValue(env, "PATH", "win32") ??
+    resolveEnvironmentValue(process.env, "PATH", "win32") ??
+    "";
   const pathEntries = normalizeStringEntries(pathValue.split(";"));
   const hasExtension = path.extname(command).length > 0;
   const pathExtRaw =
-    env.PATHEXT ??
-    env.Pathext ??
-    process.env.PATHEXT ??
-    process.env.Pathext ??
+    resolveEnvironmentValue(env, "PATHEXT", "win32") ??
+    resolveEnvironmentValue(process.env, "PATHEXT", "win32") ??
     ".EXE;.CMD;.BAT;.COM";
   const pathExt = hasExtension
     ? [""]
@@ -144,11 +166,12 @@ export function resolveWindowsExecutablePath(command: string, env: NodeJS.Proces
       );
 
   for (const dir of pathEntries) {
+    const directory = cwd ? path.resolve(cwd, dir) : dir;
     for (const ext of pathExt) {
       const normalizedExt = normalizeLowercaseStringOrEmpty(ext);
       const uppercaseExt = ext.toUpperCase();
       for (const candidateExt of [ext, normalizedExt, uppercaseExt]) {
-        const candidate = path.join(dir, `${command}${candidateExt}`);
+        const candidate = path.join(directory, `${command}${candidateExt}`);
         if (isFilePath(candidate)) {
           return candidate;
         }
@@ -166,6 +189,25 @@ function resolveEntrypointFromCmdShim(wrapperPath: string): string | null {
 
   try {
     const content = readFileSync(wrapperPath, "utf8");
+    const normalizedContent = content.replaceAll("\r\n", "\n").toLowerCase();
+    const significantLines = content
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const isNpmCmdShim =
+      normalizedContent.includes("\ngoto start\n") &&
+      normalizedContent.includes("\n:find_dp0\n") &&
+      normalizedContent.includes("set dp0=%~dp0") &&
+      normalizedContent.includes("call :find_dp0");
+    const isDirectForwarder =
+      significantLines.length === 2 &&
+      /^@echo off$/iu.test(significantLines[0] ?? "") &&
+      /^"%~?dp0%?[\\/][^"\r\n]+"\s+%\*$/iu.test(significantLines[1] ?? "");
+    // Only known direct-forwarder shapes are safe to bypass; arbitrary batch
+    // wrappers can depend on setup commands before dispatching their target.
+    if (!isNpmCmdShim && !isDirectForwarder) {
+      return null;
+    }
     const candidates: string[] = [];
     for (const match of content.matchAll(/"([^"\r\n]*)"/g)) {
       const token = match[1] ?? "";
@@ -184,6 +226,12 @@ function resolveEntrypointFromCmdShim(wrapperPath: string): string | null {
       const base = normalizeLowercaseStringOrEmpty(path.basename(candidate));
       return base !== "node.exe" && base !== "node";
     });
+    if (isDirectForwarder && nonNode) {
+      const ext = normalizeLowercaseStringOrEmpty(path.extname(nonNode));
+      if (ext !== ".exe" && ext !== ".js" && ext !== ".cjs" && ext !== ".mjs") {
+        return null;
+      }
+    }
     return nonNode ?? null;
   } catch {
     return null;
@@ -195,24 +243,21 @@ function resolveBinEntry(
   binField: string | Record<string, string> | undefined,
 ): string | null {
   if (typeof binField === "string") {
-    const trimmed = normalizeOptionalString(binField);
-    return trimmed || null;
+    return normalizeOptionalString(binField) ?? null;
   }
   if (!binField || typeof binField !== "object") {
     return null;
   }
 
   if (packageName) {
-    const preferred = binField[packageName];
-    const normalizedPreferred =
-      typeof preferred === "string" ? normalizeOptionalString(preferred) : undefined;
+    const normalizedPreferred = normalizeOptionalString(binField[packageName]);
     if (normalizedPreferred) {
       return normalizedPreferred;
     }
   }
 
   for (const value of Object.values(binField)) {
-    const normalizedValue = typeof value === "string" ? normalizeOptionalString(value) : undefined;
+    const normalizedValue = normalizeOptionalString(value);
     if (normalizedValue) {
       return normalizedValue;
     }
@@ -283,48 +328,28 @@ export function resolveWindowsSpawnProgramCandidate(
 
   const resolvedCommand = resolveWindowsExecutablePath(params.command, env);
   const ext = normalizeLowercaseStringOrEmpty(path.extname(resolvedCommand));
-  if (ext === ".js" || ext === ".cjs" || ext === ".mjs") {
+  const isWrapper = ext === ".cmd" || ext === ".bat";
+  const entrypoint = isWrapper
+    ? (resolveEntrypointFromCmdShim(resolvedCommand) ??
+      resolveEntrypointFromPackageJson(resolvedCommand, params.packageName))
+    : ext === ".js" || ext === ".cjs" || ext === ".mjs"
+      ? resolvedCommand
+      : undefined;
+  if (entrypoint) {
+    const isExe = normalizeLowercaseStringOrEmpty(path.extname(entrypoint)) === ".exe";
     return {
-      command: execPath,
-      leadingArgv: [resolvedCommand],
-      resolution: "node-entrypoint",
+      command: isExe ? entrypoint : execPath,
+      leadingArgv: isExe ? [] : [entrypoint],
+      resolution: isExe ? "exe-entrypoint" : "node-entrypoint",
       windowsHide: true,
     };
   }
 
-  if (ext === ".cmd" || ext === ".bat") {
-    const entrypoint =
-      resolveEntrypointFromCmdShim(resolvedCommand) ??
-      resolveEntrypointFromPackageJson(resolvedCommand, params.packageName);
-    if (entrypoint) {
-      const entryExt = normalizeLowercaseStringOrEmpty(path.extname(entrypoint));
-      if (entryExt === ".exe") {
-        return {
-          command: entrypoint,
-          leadingArgv: [],
-          resolution: "exe-entrypoint",
-          windowsHide: true,
-        };
-      }
-      return {
-        command: execPath,
-        leadingArgv: [entrypoint],
-        resolution: "node-entrypoint",
-        windowsHide: true,
-      };
-    }
-
-    return {
-      command: resolvedCommand,
-      leadingArgv: [],
-      resolution: "unresolved-wrapper",
-    };
-  }
-
+  // Unresolved wrappers need the caller's explicit shell-fallback policy.
   return {
     command: resolvedCommand,
     leadingArgv: [],
-    resolution: "direct",
+    resolution: isWrapper ? "unresolved-wrapper" : "direct",
   };
 }
 

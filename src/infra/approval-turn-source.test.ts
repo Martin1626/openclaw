@@ -1,3 +1,4 @@
+// Covers approval turn-source route checks.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const loadConfigMock = vi.hoisted(() => vi.fn());
@@ -40,12 +41,23 @@ describe("hasApprovalTurnSourceRoute", () => {
 
   it("passes plugin approval kind to the initiating surface check", () => {
     resolveApprovalInitiatingSurfaceStateMock.mockReturnValue({ kind: "disabled" });
+    const request = {
+      id: "plugin:calendar",
+      request: {
+        title: "Review",
+        description: "Calendar tool",
+        policySubject: { pluginKey: "calendar" },
+      },
+      createdAtMs: 0,
+      expiresAtMs: 1,
+    };
 
     expect(
       hasApprovalTurnSourceRoute({
         turnSourceChannel: "whatsapp",
         turnSourceAccountId: "default",
         approvalKind: "plugin",
+        request,
       }),
     ).toBe(false);
     expect(resolveApprovalInitiatingSurfaceStateMock).toHaveBeenCalledWith({
@@ -53,6 +65,7 @@ describe("hasApprovalTurnSourceRoute", () => {
       accountId: "default",
       cfg: { loaded: true },
       approvalKind: "plugin",
+      request,
     });
   });
 
@@ -68,4 +81,13 @@ describe("hasApprovalTurnSourceRoute", () => {
     expect(hasApprovalTurnSourceRoute({ turnSourceChannel: undefined })).toBe(false);
     expect(resolveApprovalInitiatingSurfaceStateMock).not.toHaveBeenCalled();
   });
+
+  it.each(["webchat", "tui"])(
+    "requires a live approval client for the %s turn source",
+    (turnSourceChannel) => {
+      expect(hasApprovalTurnSourceRoute({ turnSourceChannel })).toBe(false);
+      expect(resolveApprovalInitiatingSurfaceStateMock).not.toHaveBeenCalled();
+      expect(loadConfigMock).not.toHaveBeenCalled();
+    },
+  );
 });

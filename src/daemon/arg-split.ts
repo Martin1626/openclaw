@@ -1,7 +1,9 @@
+/** Shared argument splitter for service command lines rendered by platform adapters. */
 type ArgSplitEscapeMode = "none" | "backslash" | "backslash-quote-only";
 type ArgSplitQuoteChar = '"' | "'";
 type ArgSplitQuoteStart = "anywhere" | "item-start";
 
+/** Splits service command strings while preserving quoted arguments across platform parsers. */
 export function splitArgsPreservingQuotes(
   value: string,
   options?: {
@@ -18,22 +20,17 @@ export function splitArgsPreservingQuotes(
   const quoteStart = options?.quoteStart ?? "anywhere";
 
   for (let i = 0; i < value.length; i++) {
-    const char = value[i];
-    if (escapeMode === "backslash" && char === "\\") {
+    const char = value.charAt(i);
+    if (
+      char === "\\" &&
+      (escapeMode === "backslash" ||
+        (escapeMode === "backslash-quote-only" && value[i + 1] === '"'))
+    ) {
+      // POSIX consumes every escape; Windows only consumes inserted quotes, keeping path slashes.
       if (i + 1 < value.length) {
         current += value[i + 1];
         i++;
       }
-      continue;
-    }
-    if (
-      escapeMode === "backslash-quote-only" &&
-      char === "\\" &&
-      i + 1 < value.length &&
-      value[i + 1] === '"'
-    ) {
-      current += '"';
-      i++;
       continue;
     }
     if (quoteChars.has(char as ArgSplitQuoteChar)) {

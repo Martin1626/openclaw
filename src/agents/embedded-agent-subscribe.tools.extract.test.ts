@@ -1,186 +1,281 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resolveMessagingToolPayloadDedupe } from "../auto-reply/reply/reply-payloads-dedupe.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
-import { extractMessagingToolSend } from "./embedded-agent-subscribe.tools.js";
+import {
+  extractMessagingToolSend,
+  extractMessagingToolSendResult,
+} from "./embedded-agent-messaging-extraction.js";
 
-function normalizeTelegramMessagingTargetForTest(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  return trimmed ? `telegram:${trimmed}` : undefined;
-}
+type ExtractionPlugin = Omit<ChannelPlugin, "actions"> & {
+  actions?: Pick<
+    NonNullable<ChannelPlugin["actions"]>,
+    "extractToolSend" | "extractToolSendResult" | "messageActionTargetAliases"
+  >;
+};
+
+const plugins: ExtractionPlugin[] = [
+  {
+    ...createChannelTestPluginBase({ id: "partialthreadprovider" }),
+    actions: {
+      extractToolSend: ({ args }) =>
+        args.action === "send" && typeof args.to === "string"
+          ? { to: args.to, threadImplicit: true }
+          : null,
+      extractToolSendResult: ({ result }) => {
+        const send = (result as { details?: { toolSend?: Record<string, unknown> } })?.details
+          ?.toolSend;
+        if (typeof send?.to !== "string" || !send.to) {
+          return null;
+        }
+        const threadId = typeof send.threadId === "string" ? send.threadId : undefined;
+        return {
+          to: send.to,
+          ...(threadId ? { threadId } : {}),
+          ...(send.threadImplicit === true ? { threadImplicit: true } : {}),
+          ...(send.threadSuppressed === true ? { threadSuppressed: true } : {}),
+        };
+      },
+    },
+    threading: { resolveAutoThreadId: ({ toolContext }) => toolContext?.currentThreadTs },
+  },
+  {
+    ...createChannelTestPluginBase({ id: "telegram" }),
+    messaging: { normalizeTarget: (raw) => (raw.trim() ? "telegram:" + raw.trim() : undefined) },
+    actions: {
+      extractToolSend: ({ args }) =>
+        args.action === "sendMessage" && typeof args.to === "string" ? { to: args.to } : null,
+    },
+    threading: {
+      resolveAutoThreadId: ({ to, toolContext }) =>
+        to.includes(":topic:") ? undefined : toolContext?.currentThreadTs,
+    },
+  },
+  {
+    ...createChannelTestPluginBase({ id: "slack" }),
+    messaging: { normalizeTarget: (raw) => raw.trim().toLowerCase() },
+    actions: {
+      messageActionTargetAliases: {
+        reply: { aliases: ["chatGuid", "messageId"], deliveryTargetAliases: ["chatGuid"] },
+      },
+      extractToolSend: ({ args }) => {
+        if (
+          (args.action !== "sendMessage" &&
+            args.action !== "uploadFile" &&
+            args.action !== "send" &&
+            args.action !== "upload-file") ||
+          typeof args.to !== "string"
+        ) {
+          return null;
+        }
+        const nativeThreadId =
+          typeof args.threadTs === "string"
+            ? args.threadTs
+            : typeof args.threadId === "string"
+              ? args.threadId
+              : undefined;
+        const replyTo = typeof args.replyTo === "string" ? args.replyTo : undefined;
+        const threadId =
+          args.action === "send"
+            ? (replyTo ?? nativeThreadId)
+            : args.action === "upload-file"
+              ? (nativeThreadId ?? replyTo)
+              : nativeThreadId;
+        const threadSuppressed =
+          args.topLevel === true || args.threadTs === null || args.threadId === null;
+        return {
+          to: args.to,
+          accountId: typeof args.accountId === "string" ? args.accountId : undefined,
+          threadId,
+          threadSuppressed,
+          threadImplicit: !threadId && !threadSuppressed,
+        };
+      },
+    },
+    threading: {
+      resolveAutoThreadId: ({ to, toolContext, replyToId }) => {
+        if (
+          replyToId ||
+          (to !== toolContext?.currentMessagingTarget && to !== toolContext?.currentChannelId) ||
+          toolContext.replyToMode === "off" ||
+          ((toolContext.replyToMode === "first" || toolContext.replyToMode === "batched") &&
+            toolContext.hasRepliedRef?.value)
+        ) {
+          return undefined;
+        }
+        return toolContext.currentThreadTs;
+      },
+      resolveReplyTransport: ({ replyToId }) => ({ replyToId, threadId: null }),
+    },
+  },
+];
+
+beforeEach(() => {
+  setActivePluginRegistry(
+    createTestRegistry(plugins.map((plugin) => ({ pluginId: plugin.id, plugin, source: "test" }))),
+  );
+});
+afterEach(() => setActivePluginRegistry(createTestRegistry()));
 
 describe("extractMessagingToolSend", () => {
-  beforeEach(() => {
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "telegram",
-          plugin: {
-            ...createChannelTestPluginBase({ id: "telegram" }),
-            messaging: { normalizeTarget: normalizeTelegramMessagingTargetForTest },
-            threading: { resolveAutoThreadId: () => "456" },
-          },
-          source: "test",
-        },
-        {
-          pluginId: "slack",
-          plugin: {
-            ...createChannelTestPluginBase({ id: "slack" }),
-            messaging: { normalizeTarget: (raw: string) => raw.trim().toLowerCase() },
-            actions: {
-              extractToolSend: (params: { args: Record<string, unknown> }) => {
-                const { args } = params;
-                return args.action === "sendMessage" && typeof args.to === "string"
-                  ? {
-                      to: args.to,
-                      accountId: typeof args.accountId === "string" ? args.accountId : undefined,
-                      threadId: typeof args.threadId === "string" ? args.threadId : undefined,
-                    }
-                  : null;
-              },
-            },
-          },
-          source: "test",
-        },
-        {
-          pluginId: "discord",
-          plugin: createChannelTestPluginBase({ id: "discord" }),
-          source: "test",
-        },
-      ]),
-    );
-  });
-
-  it("uses channel as provider for message tool", () => {
-    const result = extractMessagingToolSend("message", {
-      action: "send",
-      channel: "telegram",
-      to: "123",
+  it("records opaque conversation targets", () => {
+    expect(
+      extractMessagingToolSend("conversations_send", {
+        conversationRef: "conv_0123456789abcdef0123456789abcdef",
+        message: "hello",
+      }),
+    ).toEqual({
+      tool: "conversations_send",
+      provider: "conversation",
+      to: "conv_0123456789abcdef0123456789abcdef",
     });
-
-    expect(result?.tool).toBe("message");
-    expect(result?.provider).toBe("telegram");
-    expect(result?.to).toBe("telegram:123");
   });
 
-  it("prefers provider when both provider and channel are set", () => {
+  it("extracts provider-declared delivery aliases", () => {
+    expect(
+      extractMessagingToolSend("message", {
+        action: "reply",
+        provider: "slack",
+        chatGuid: "Channel:C1",
+      }),
+    ).toMatchObject({ tool: "message", provider: "slack", to: "channel:c1" });
+  });
+
+  it("does not treat message-id aliases as delivery targets", () => {
+    const args = { action: "reply", provider: "slack", messageId: "message-1" };
+    expect(
+      extractMessagingToolSend("message", args, { currentMessagingTarget: "user:u123" }),
+    ).toMatchObject({ tool: "message", provider: "slack", to: "user:u123" });
+    expect(extractMessagingToolSend("message", args)).toBeUndefined();
+  });
+
+  it("keeps explicit thread evidence with an implicit provider", () => {
+    expect(
+      extractMessagingToolSend("message", {
+        action: "send",
+        to: "channel:123",
+        threadId: "456",
+      }),
+    ).toMatchObject({ provider: "message", threadId: "456" });
+  });
+
+  it("uses send transport thread precedence", () => {
     const result = extractMessagingToolSend("message", {
       action: "send",
       provider: "slack",
-      channel: "telegram",
-      to: "channel:C1",
+      target: "channel:C1",
+      threadId: "111.000",
+      replyTo: "999.000",
     });
-
-    expect(result?.tool).toBe("message");
-    expect(result?.provider).toBe("slack");
     expect(result?.to).toBe("channel:c1");
+    expect(result?.threadImplicit).toBeUndefined();
+    expect(result?.threadId).toBe("999.000");
   });
 
-  it("accepts target alias when to is omitted", () => {
-    const result = extractMessagingToolSend("message", {
-      action: "send",
-      channel: "telegram",
-      target: "123",
-    });
-
-    expect(result?.tool).toBe("message");
-    expect(result?.provider).toBe("telegram");
-    expect(result?.to).toBe("telegram:123");
+  it("does not infer native threads without a reply mode", () => {
+    const result = extractMessagingToolSend(
+      "slack",
+      { action: "sendMessage", to: "Channel:C1" },
+      {
+        currentChannelId: "channel:c1",
+        currentThreadId: "171.222",
+      },
+    );
+    expect(result?.threadImplicit).toBeUndefined();
+    expect(result?.threadId).toBeUndefined();
   });
 
-  it("recognizes attachment-style message tool sends", () => {
-    const upload = extractMessagingToolSend("message", {
-      action: "upload-file",
-      channel: "discord",
-      to: "channel:123",
-      path: "/tmp/song.mp3",
-    });
-    const attachment = extractMessagingToolSend("message", {
-      action: "sendAttachment",
-      provider: "discord",
-      to: "channel:123",
-      filePath: "/tmp/song.mp3",
-    });
-    const effect = extractMessagingToolSend("message", {
-      action: "sendWithEffect",
-      provider: "discord",
-      to: "channel:123",
-      content: "done",
-    });
-
-    expect(upload?.tool).toBe("message");
-    expect(upload?.provider).toBe("discord");
-    expect(upload?.to).toBe("channel:123");
-    expect(attachment?.tool).toBe("message");
-    expect(attachment?.provider).toBe("discord");
-    expect(attachment?.to).toBe("channel:123");
-    expect(effect?.tool).toBe("message");
-    expect(effect?.provider).toBe("discord");
-    expect(effect?.to).toBe("channel:123");
-  });
-
-  it("keeps thread id evidence for thread replies", () => {
-    const result = extractMessagingToolSend("message", {
-      action: "thread-reply",
-      provider: "discord",
-      to: "channel:123",
-      threadId: "456",
-      content: "done",
-    });
-
-    expect(result?.tool).toBe("message");
-    expect(result?.provider).toBe("discord");
-    expect(result?.to).toBe("channel:123");
-    expect(result?.threadId).toBe("456");
-  });
-
-  it("records when message sends can inherit the current thread", () => {
-    const result = extractMessagingToolSend("message", {
-      action: "send",
-      provider: "telegram",
-      to: "123",
-      content: "done",
-    });
-
+  it("infers a native first-mode thread without consuming reply state", () => {
+    const hasRepliedRef = { value: false };
+    const result = extractMessagingToolSend(
+      "slack",
+      { action: "sendMessage", to: "Channel:C1" },
+      {
+        currentChannelId: "channel:c1",
+        currentThreadId: "171.222",
+        replyToMode: "first",
+        hasRepliedRef,
+      },
+    );
     expect(result?.threadImplicit).toBe(true);
+    expect(result?.threadId).toBe("171.222");
+    expect(hasRepliedRef.value).toBe(false);
   });
 
-  it("keeps provider-tool extracted thread id evidence", () => {
-    const result = extractMessagingToolSend("slack", {
-      action: "sendMessage",
-      to: " Channel:C1 ",
-      threadId: "171.222",
-      accountId: "bot-a",
-      content: "done",
-    });
-
-    expect(result).toMatchObject({
-      tool: "slack",
-      provider: "slack",
-      accountId: "bot-a",
-      to: "channel:c1",
-      threadId: "171.222",
-    });
-  });
-
-  it("records when message sends explicitly suppress implicit thread delivery", () => {
+  it("records explicit suppression of implicit message threading", () => {
     const topLevel = extractMessagingToolSend("message", {
       action: "send",
       provider: "telegram",
       to: "123",
       topLevel: true,
-      content: "done",
     });
     const nullThread = extractMessagingToolSend("message", {
       action: "send",
       provider: "telegram",
       to: "123",
       threadId: null,
-      content: "done",
     });
-
     expect(topLevel?.threadSuppressed).toBe(true);
     expect(topLevel?.threadImplicit).toBeUndefined();
     expect(nullThread?.threadSuppressed).toBe(true);
     expect(nullThread?.threadImplicit).toBeUndefined();
+  });
+});
+
+describe("extractMessagingToolSendResult thread evidence", () => {
+  it("preserves implicit thread evidence and reply dedupe when the result omits it", () => {
+    const pending = extractMessagingToolSend(
+      "message",
+      {
+        action: "send",
+        provider: "partialthreadprovider",
+        to: "channel:abc",
+        message: "answer",
+      },
+      {
+        currentChannelId: "channel:abc",
+        currentMessagingTarget: "channel:abc",
+        currentThreadId: "root-1",
+        replyToMode: "all",
+      },
+    );
+    expect(pending?.threadImplicit).toBe(true);
+    expect(pending?.threadId).toBe("root-1");
+    const confirmed = extractMessagingToolSendResult(pending!, {
+      details: { toolSend: { to: "channel:abc" } },
+    });
+    expect(confirmed.threadImplicit).toBe(true);
+    expect(confirmed.threadId).toBe("root-1");
+    expect(
+      resolveMessagingToolPayloadDedupe({
+        messageProvider: "partialthreadprovider",
+        originatingTo: "channel:abc",
+        originatingThreadId: "root-1",
+        messagingToolSentTargets: [confirmed],
+      }).matchingRoute,
+    ).toBe(true);
+  });
+
+  it("provider suppression replaces pending implicit evidence", () => {
+    const confirmed = extractMessagingToolSendResult(
+      {
+        tool: "message",
+        provider: "partialthreadprovider",
+        to: "channel:abc",
+        threadId: "root-1",
+        threadImplicit: true,
+      },
+      { details: { toolSend: { to: "channel:abc", threadSuppressed: true } } },
+    );
+    expect({
+      threadId: confirmed.threadId,
+      threadImplicit: confirmed.threadImplicit,
+      threadSuppressed: confirmed.threadSuppressed,
+    }).toEqual({
+      threadId: undefined,
+      threadImplicit: undefined,
+      threadSuppressed: true,
+    });
   });
 });

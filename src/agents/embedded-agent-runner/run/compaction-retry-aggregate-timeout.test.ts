@@ -1,11 +1,16 @@
+// Coverage for aggregate timeout handling while waiting on compaction retry.
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it, vi } from "vitest";
-import { waitForCompactionRetryWithAggregateTimeout } from "./compaction-retry-aggregate-timeout.js";
+import {
+  hasActiveCompactionRetryWork,
+  waitForCompactionRetryWithAggregateTimeout,
+} from "./compaction-retry-aggregate-timeout.js";
 
 type AggregateTimeoutParams = Parameters<typeof waitForCompactionRetryWithAggregateTimeout>[0];
-type TimeoutCallback = NonNullable<AggregateTimeoutParams["onTimeout"]>;
-type TimeoutCallbackMock = ReturnType<typeof vi.fn<TimeoutCallback>>;
 
 async function withFakeTimers(run: () => Promise<void>) {
+  // Ensure timer state is fully drained between cases because aggregate timeout
+  // races can otherwise leak scheduled callbacks.
   vi.useFakeTimers();
   vi.clearAllTimers();
   try {
@@ -17,32 +22,22 @@ async function withFakeTimers(run: () => Promise<void>) {
   }
 }
 
-function expectClearedTimeoutState(onTimeout: TimeoutCallbackMock, timedOut: boolean) {
-  if (timedOut) {
-    expect(onTimeout).toHaveBeenCalledTimes(1);
-  } else {
-    expect(onTimeout).not.toHaveBeenCalled();
-  }
-  expect(vi.getTimerCount()).toBe(0);
-}
-
 function buildAggregateTimeoutParams(
   overrides: Partial<AggregateTimeoutParams> &
     Pick<AggregateTimeoutParams, "waitForCompactionRetry">,
-): AggregateTimeoutParams & { onTimeout: TimeoutCallbackMock } {
-  const onTimeout =
-    (overrides.onTimeout as TimeoutCallbackMock | undefined) ?? vi.fn<TimeoutCallback>();
+): AggregateTimeoutParams {
+  // Defaults model the normal wait path; tests override only the timeout or
+  // in-flight signal under review.
   return {
     waitForCompactionRetry: overrides.waitForCompactionRetry,
     abortable: overrides.abortable ?? (async (promise) => await promise),
     aggregateTimeoutMs: overrides.aggregateTimeoutMs ?? 60_000,
-    isCompactionStillInFlight: overrides.isCompactionStillInFlight,
-    onTimeout,
+    isCompactionRetryStillActive: overrides.isCompactionRetryStillActive,
   };
 }
 
 describe("waitForCompactionRetryWithAggregateTimeout", () => {
-  it("times out and fires callback when compaction retry never resolves", async () => {
+  it("times out when compaction retry never resolves", async () => {
     await withFakeTimers(async () => {
       const waitForCompactionRetry = vi.fn(async () => await new Promise<void>(() => {}));
       const params = buildAggregateTimeoutParams({ waitForCompactionRetry });
@@ -53,25 +48,27 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       const result = await resultPromise;
 
       expect(result.timedOut).toBe(true);
-      expectClearedTimeoutState(params.onTimeout, true);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
-  it("keeps waiting while compaction remains in flight", async () => {
+  it("keeps waiting while compaction retry work remains active", async () => {
+    // The aggregate timer should not cut off either the compaction call or its
+    // retry model run; timeout starts once both phases are idle.
     await withFakeTimers(async () => {
-      let compactionInFlight = true;
+      let retryWorkActive = true;
       const waitForCompactionRetry = vi.fn(
         async () =>
           await new Promise<void>((resolve) => {
             setTimeout(() => {
-              compactionInFlight = false;
+              retryWorkActive = false;
               resolve();
             }, 170_000);
           }),
       );
       const params = buildAggregateTimeoutParams({
         waitForCompactionRetry,
-        isCompactionStillInFlight: () => compactionInFlight,
+        isCompactionRetryStillActive: () => retryWorkActive,
       });
 
       const resultPromise = waitForCompactionRetryWithAggregateTimeout(params);
@@ -80,7 +77,7 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       const result = await resultPromise;
 
       expect(result.timedOut).toBe(false);
-      expectClearedTimeoutState(params.onTimeout, false);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
@@ -93,7 +90,7 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       }, 90_000);
       const params = buildAggregateTimeoutParams({
         waitForCompactionRetry,
-        isCompactionStillInFlight: () => compactionInFlight,
+        isCompactionRetryStillActive: () => compactionInFlight,
       });
 
       const resultPromise = waitForCompactionRetryWithAggregateTimeout(params);
@@ -102,7 +99,7 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       const result = await resultPromise;
 
       expect(result.timedOut).toBe(true);
-      expectClearedTimeoutState(params.onTimeout, true);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
@@ -114,7 +111,25 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       const result = await waitForCompactionRetryWithAggregateTimeout(params);
 
       expect(result.timedOut).toBe(false);
-      expectClearedTimeoutState(params.onTimeout, false);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
+
+  it("caps aggregate timeout before scheduling", async () => {
+    await withFakeTimers(async () => {
+      const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+      const waitForCompactionRetry = vi.fn(async () => {});
+      const params = buildAggregateTimeoutParams({
+        waitForCompactionRetry,
+        aggregateTimeoutMs: Number.MAX_SAFE_INTEGER,
+      });
+
+      const result = await waitForCompactionRetryWithAggregateTimeout(params);
+
+      expect(result.timedOut).toBe(false);
+      expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+      expect(vi.getTimerCount()).toBe(0);
+      timeoutSpy.mockRestore();
     });
   });
 
@@ -130,7 +145,7 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
         "compaction wait failed",
       );
 
-      expectClearedTimeoutState(params.onTimeout, false);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
@@ -154,7 +169,7 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
       await Promise.resolve();
 
       expect(result.timedOut).toBe(true);
-      expectClearedTimeoutState(params.onTimeout, true);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
@@ -172,7 +187,25 @@ describe("waitForCompactionRetryWithAggregateTimeout", () => {
 
       await expect(waitForCompactionRetryWithAggregateTimeout(params)).rejects.toThrow("aborted");
 
-      expectClearedTimeoutState(params.onTimeout, false);
+      expect(vi.getTimerCount()).toBe(0);
     });
+  });
+});
+
+describe("hasActiveCompactionRetryWork", () => {
+  it.each([
+    { isCompactionInFlight: true, isSessionStreaming: false },
+    { isCompactionInFlight: false, isSessionStreaming: true },
+  ])("returns true while either retry phase is active", (params) => {
+    expect(hasActiveCompactionRetryWork(params)).toBe(true);
+  });
+
+  it("returns false once compaction and the retry model run are idle", () => {
+    expect(
+      hasActiveCompactionRetryWork({
+        isCompactionInFlight: false,
+        isSessionStreaming: false,
+      }),
+    ).toBe(false);
   });
 });

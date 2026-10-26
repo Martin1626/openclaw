@@ -1,3 +1,4 @@
+// Openshell tests cover config plugin behavior.
 import fsSync from "node:fs";
 import { describe, expect, it } from "vitest";
 import { createOpenShellPluginConfigSchema, resolveOpenShellPluginConfig } from "./config.js";
@@ -9,6 +10,7 @@ describe("openshell plugin config", () => {
       command: "openshell",
       gateway: undefined,
       gatewayEndpoint: undefined,
+      workspace: undefined,
       from: "openclaw",
       policy: undefined,
       providers: [],
@@ -20,11 +22,12 @@ describe("openshell plugin config", () => {
     });
   });
 
-  it("accepts remote mode", () => {
-    expect(resolveOpenShellPluginConfig({ mode: "remote" }).mode).toBe("remote");
-  });
-
   it("rejects relative remote paths", () => {
+    expect(
+      createOpenShellPluginConfigSchema().safeParse?.({
+        remoteWorkspaceDir: "sandbox",
+      }).success,
+    ).toBe(false);
     expect(() =>
       resolveOpenShellPluginConfig({
         remoteWorkspaceDir: "sandbox",
@@ -33,11 +36,33 @@ describe("openshell plugin config", () => {
   });
 
   it("rejects remote paths outside managed sandbox roots", () => {
+    expect(
+      createOpenShellPluginConfigSchema().safeParse?.({
+        remoteWorkspaceDir: "/tmp/victim",
+      }).success,
+    ).toBe(false);
     expect(() =>
       resolveOpenShellPluginConfig({
         remoteWorkspaceDir: "/tmp/victim",
       }),
     ).toThrow("OpenShell remoteWorkspaceDir must stay under /sandbox or /agent");
+  });
+
+  it("rejects normalized paths that escape managed sandbox roots during config validation", () => {
+    expect(
+      createOpenShellPluginConfigSchema().safeParse?.({
+        remoteAgentWorkspaceDir: "/agent/../../etc",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("preserves shipped equal workspace roots", () => {
+    const config = {
+      remoteWorkspaceDir: "/sandbox/project",
+      remoteAgentWorkspaceDir: "/sandbox/project",
+    };
+    expect(createOpenShellPluginConfigSchema().safeParse?.(config).success).toBe(true);
+    expect(resolveOpenShellPluginConfig(config)).toMatchObject(config);
   });
 
   it("normalizes managed sandbox subpaths", () => {
@@ -51,6 +76,7 @@ describe("openshell plugin config", () => {
       command: "openshell",
       gateway: undefined,
       gatewayEndpoint: undefined,
+      workspace: undefined,
       from: "openclaw",
       policy: undefined,
       providers: [],
@@ -69,6 +95,13 @@ describe("openshell plugin config", () => {
       }),
     ).toThrow("mode must be one of mirror, remote");
   });
+
+  it.each(["Team", "-team", "team-", "team--one", "abcdefghijklmnopqrst"])(
+    "rejects invalid OpenShell workspace name %s",
+    (workspace) => {
+      expect(() => resolveOpenShellPluginConfig({ workspace })).toThrow(/workspace must/);
+    },
+  );
 
   it("rejects timeouts beyond Node's safe timer range", () => {
     expect(() =>

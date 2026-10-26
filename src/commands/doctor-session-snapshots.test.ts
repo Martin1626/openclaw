@@ -1,20 +1,36 @@
+// Doctor session snapshot tests cover advisory metadata inspection and retained-source preservation.
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { saveSessionStore } from "../config/sessions/store.js";
+import {
+  loadExactSessionEntry,
+  upsertSessionEntryCore,
+} from "../config/sessions/session-accessor.sqlite-entry.js";
+import { assertSessionStoreMigrationComplete } from "../config/sessions/startup-migration.js";
+import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { runSessionSnapshotsHealth } from "../flows/doctor-health-contribution-runners.state.js";
+import * as packageRoots from "../infra/openclaw-root.js";
+import { readMigrationArtifactIdentity } from "../infra/session-sqlite-migration-artifact.js";
+import { saveLegacySessionStore as saveSessionStore } from "../infra/state-migrations.legacy-session-store.js";
+import * as bundledSkills from "../skills/loading/bundled-dir.js";
+import type { Skill } from "../skills/loading/skill-contract.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { seedDeferredPluginSessionSource } from "./doctor-session-sqlite.deferred-plugin.test-support.js";
+import { runDoctorSessionSqlite } from "./doctor-session-sqlite.js";
 
 const note = vi.hoisted(() => vi.fn());
-
-vi.mock("../terminal/note.js", () => ({
+vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note,
 }));
 
 import {
+  detectSessionSnapshotHealthIssues,
   noteSessionSnapshotHealth,
-  scanSessionStoreForStaleRuntimeSnapshotPaths,
+  sessionSnapshotIssueToHealthFinding,
 } from "./doctor-session-snapshots.js";
 
 function sessionEntry(patch: Partial<SessionEntry>): SessionEntry {
@@ -37,6 +53,25 @@ function skillPrompt(location: string): string {
   ].join("\n");
 }
 
+function resolvedSkill(skillPath: string): Skill {
+  const baseDir = path.dirname(skillPath);
+  return {
+    name: "doctor",
+    description: "Doctor skill",
+    filePath: skillPath,
+    baseDir,
+    source: "bundled",
+    sourceInfo: {
+      path: skillPath,
+      source: "bundled",
+      scope: "user",
+      origin: "top-level",
+      baseDir,
+    },
+    disableModelInvocation: false,
+  };
+}
+
 async function writeSessionStore(
   storePath: string,
   store: Record<string, SessionEntry>,
@@ -53,15 +88,48 @@ describe("doctor session snapshot stale runtime metadata", () => {
     note.mockClear();
     root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-doctor-session-snapshots-"));
     bundledSkillsDir = path.join(root, "current", "skills");
+    vi.stubEnv("OPENCLAW_STATE_DIR", path.join(root, "state"));
+    vi.stubEnv("OPENCLAW_BUNDLED_SKILLS_DIR", bundledSkillsDir);
     await fs.mkdir(path.join(bundledSkillsDir, "doctor"), { recursive: true });
     await fs.writeFile(path.join(bundledSkillsDir, "doctor", "SKILL.md"), "# Doctor\n");
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    clearSessionStoreCacheForTest();
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  it("flags cached bundled skill locations from inactive and temp-backed runtime roots", () => {
+  async function scanSessionStoreForStaleRuntimeSnapshotPaths(params: {
+    store: Record<string, SessionEntry>;
+    bundledSkillsDir: string;
+    pathExists?: (filePath: string) => boolean;
+    env?: NodeJS.ProcessEnv;
+  }) {
+    const storePath = path.join(root, "snapshot-scan.json");
+    await writeSessionStore(storePath, params.store);
+    vi.stubEnv("OPENCLAW_BUNDLED_SKILLS_DIR", params.bundledSkillsDir);
+    const pathExists = params.pathExists;
+    const exists = pathExists
+      ? vi
+          .spyOn(fsSync, "existsSync")
+          .mockImplementation(
+            (filePath) => String(filePath) === storePath || pathExists(String(filePath)),
+          )
+      : undefined;
+    try {
+      const findings = await detectSessionSnapshotHealthIssues({
+        cfg: { session: { store: storePath } },
+        env: params.env,
+      });
+      return findings.map(({ storePath: _storePath, ...finding }) => finding);
+    } finally {
+      exists?.mockRestore();
+    }
+  }
+
+  it("flags cached bundled skill locations from inactive and temp-backed runtime roots", async () => {
     const stalePath = path.join(
       root,
       "old-runtime",
@@ -80,7 +148,7 @@ describe("doctor session snapshot stale runtime metadata", () => {
       "doctor",
       "SKILL.md",
     );
-    const findings = scanSessionStoreForStaleRuntimeSnapshotPaths({
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
       bundledSkillsDir,
       store: {
         "agent:main": sessionEntry({
@@ -114,18 +182,104 @@ describe("doctor session snapshot stale runtime metadata", () => {
     ]);
   });
 
-  it("expands home-relative cached bundled skill locations before classifying them", () => {
-    const homeDir = path.join(root, "home");
-    const stalePath = "~/old-runtime/node_modules/openclaw/skills/doctor/SKILL.md";
+  it("maps stale snapshot paths to advisory findings without repair guidance", async () => {
+    const stalePath = path.join(
+      root,
+      "old-runtime",
+      "node_modules",
+      "openclaw",
+      "skills",
+      "doctor",
+      "SKILL.md",
+    );
+    const storePath = path.join(root, "state", "agents", "main", "sessions", "sessions.json");
+    await writeSessionStore(storePath, {
+      "agent:main": sessionEntry({
+        skillsSnapshot: {
+          prompt: skillPrompt(stalePath),
+          skills: [{ name: "doctor" }],
+        },
+      }),
+    });
 
-    const findings = scanSessionStoreForStaleRuntimeSnapshotPaths({
-      bundledSkillsDir,
-      env: { HOME: homeDir },
+    const [issue] = await detectSessionSnapshotHealthIssues({
+      cfg: { session: { store: storePath } },
+    });
+
+    if (!issue) {
+      throw new Error("expected session snapshot health issue");
+    }
+    expect(issue).toMatchObject({
+      storePath,
+      sessionKey: "agent:main",
+      field: "skillsSnapshot.prompt",
+      cachedPath: stalePath,
+      expectedPath: path.join(bundledSkillsDir, "doctor", "SKILL.md"),
+    });
+    expect(sessionSnapshotIssueToHealthFinding(issue)).toMatchObject({
+      checkId: "core/doctor/session-snapshots",
+      severity: "info",
+      path: storePath,
+      target: stalePath,
+      requirement: expect.stringContaining(bundledSkillsDir),
+      fixHint: expect.stringContaining("No repair is needed"),
+    });
+  });
+
+  it("uses the OS home for cached OCM paths when OPENCLAW_HOME differs", async () => {
+    const homeDir = path.join(root, "home");
+    const currentBundledSkillsDir = path.join(homeDir, ".ocm/current/node_modules/openclaw/skills");
+    const expectedPath = path.join(currentBundledSkillsDir, "doctor", "SKILL.md");
+    const currentPath = "~/.ocm/current/node_modules/openclaw/skills/doctor/SKILL.md";
+    const stalePath = "~/.ocm/old/node_modules/openclaw/skills/doctor/SKILL.md";
+
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
+      bundledSkillsDir: currentBundledSkillsDir,
+      env: { HOME: homeDir, OPENCLAW_HOME: path.join(root, "ocm-profile") },
       store: {
-        "agent:home": sessionEntry({
+        "agent:current": sessionEntry({
+          skillsSnapshot: { prompt: skillPrompt(currentPath), skills: [{ name: "doctor" }] },
+        }),
+        "agent:stale": sessionEntry({
+          skillsSnapshot: { prompt: skillPrompt(stalePath), skills: [{ name: "doctor" }] },
+        }),
+      },
+      pathExists: (filePath) => filePath === expectedPath,
+    });
+
+    expect(findings).toEqual([
+      {
+        sessionKey: "agent:stale",
+        field: "skillsSnapshot.prompt",
+        cachedPath: stalePath,
+        expectedPath,
+      },
+    ]);
+  });
+
+  it("identifies stale imsg bundled paths to the generated plugin skill path", async () => {
+    const stalePath = path.join(
+      root,
+      "old-runtime",
+      "node_modules",
+      "openclaw",
+      "skills",
+      "imsg",
+      "SKILL.md",
+    );
+    const stateDir = path.join(root, "state");
+    const pluginSkillPath = path.join(stateDir, "plugin-skills", "imsg", "SKILL.md");
+    await fs.mkdir(path.dirname(pluginSkillPath), { recursive: true });
+    await fs.writeFile(pluginSkillPath, "# imsg\n");
+
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
+      bundledSkillsDir,
+      env: { OPENCLAW_STATE_DIR: stateDir },
+      store: {
+        "agent:imsg": sessionEntry({
           skillsSnapshot: {
             prompt: skillPrompt(stalePath),
-            skills: [{ name: "doctor" }],
+            skills: [{ name: "imsg" }],
           },
         }),
       },
@@ -133,15 +287,74 @@ describe("doctor session snapshot stale runtime metadata", () => {
 
     expect(findings).toEqual([
       {
-        sessionKey: "agent:home",
+        sessionKey: "agent:imsg",
         field: "skillsSnapshot.prompt",
         cachedPath: stalePath,
-        expectedPath: path.join(bundledSkillsDir, "doctor", "SKILL.md"),
+        expectedPath: pluginSkillPath,
       },
     ]);
   });
 
-  it("ignores current bundled locations and unrelated workspace skill locations", () => {
+  it("identifies retired imsg paths even when cached under the current package skills root", async () => {
+    const packageSkillsDir = path.join(root, "node_modules", "openclaw", "skills");
+    const stalePath = path.join(packageSkillsDir, "imsg", "SKILL.md");
+    const stateDir = path.join(root, "state");
+    const pluginSkillPath = path.join(stateDir, "plugin-skills", "imsg", "SKILL.md");
+    await fs.mkdir(path.dirname(pluginSkillPath), { recursive: true });
+    await fs.writeFile(pluginSkillPath, "# imsg\n");
+
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
+      bundledSkillsDir: packageSkillsDir,
+      env: { OPENCLAW_STATE_DIR: stateDir },
+      store: {
+        "agent:imsg": sessionEntry({
+          skillsSnapshot: {
+            prompt: skillPrompt(stalePath),
+            skills: [{ name: "imsg" }],
+          },
+        }),
+      },
+    });
+
+    expect(findings).toEqual([
+      {
+        sessionKey: "agent:imsg",
+        field: "skillsSnapshot.prompt",
+        cachedPath: stalePath,
+        expectedPath: pluginSkillPath,
+      },
+    ]);
+  });
+
+  it("resolves the retired package skills root for moved-skill snapshot inspection", async () => {
+    const packageRoot = path.join(root, "package");
+    const stateDir = path.join(root, "state");
+    const expectedPath = path.join(stateDir, "plugin-skills", "imsg", "SKILL.md");
+    await fs.mkdir(path.dirname(expectedPath), { recursive: true });
+    await fs.writeFile(expectedPath, "# imsg\n");
+    const storePath = path.join(root, "snapshot-scan.json");
+    await writeSessionStore(storePath, {
+      "agent:main": sessionEntry({
+        skillsSnapshot: {
+          prompt: skillPrompt(
+            path.join(root, "node_modules", "openclaw", "skills", "imsg", "SKILL.md"),
+          ),
+          skills: [{ name: "imsg" }],
+        },
+      }),
+    });
+    vi.spyOn(bundledSkills, "resolveBundledSkillsDir").mockReturnValue(undefined);
+    vi.spyOn(packageRoots, "resolveOpenClawPackageRootSync").mockReturnValue(packageRoot);
+
+    expect(
+      await detectSessionSnapshotHealthIssues({
+        cfg: { session: { store: storePath } },
+        env: { OPENCLAW_STATE_DIR: stateDir },
+      }),
+    ).toEqual([expect.objectContaining({ expectedPath })]);
+  });
+
+  it("ignores current bundled locations and unrelated workspace skill locations", async () => {
     const currentPath = path.join(bundledSkillsDir, "doctor", "SKILL.md");
     const workspacePath = path.join(root, "workspace", "skills", "doctor", "SKILL.md");
     const openClawWorkspacePath = path.join(
@@ -152,7 +365,7 @@ describe("doctor session snapshot stale runtime metadata", () => {
       "doctor",
       "SKILL.md",
     );
-    const findings = scanSessionStoreForStaleRuntimeSnapshotPaths({
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
       bundledSkillsDir,
       store: {
         "agent:current": sessionEntry({
@@ -174,7 +387,7 @@ describe("doctor session snapshot stale runtime metadata", () => {
     expect(findings).toEqual([]);
   });
 
-  it("handles Windows current and stale bundled skill paths without false positives", () => {
+  it("handles Windows current and stale bundled skill paths without false positives", async () => {
     const windowsBundledSkillsDir = path.win32.join(
       "C:\\",
       "Users",
@@ -196,7 +409,7 @@ describe("doctor session snapshot stale runtime metadata", () => {
       "SKILL.md",
     );
 
-    const findings = scanSessionStoreForStaleRuntimeSnapshotPaths({
+    const findings = await scanSessionStoreForStaleRuntimeSnapshotPaths({
       bundledSkillsDir: windowsBundledSkillsDir,
       store: {
         "agent:current": sessionEntry({
@@ -239,7 +452,7 @@ describe("doctor session snapshot stale runtime metadata", () => {
       }),
     });
 
-    await noteSessionSnapshotHealth({ storePaths: [storePath], bundledSkillsDir });
+    await noteSessionSnapshotHealth({ cfg: { session: { store: storePath } } });
 
     expect(note).toHaveBeenCalledTimes(1);
     const [message, title] = note.mock.calls[0] as [string, string];
@@ -251,51 +464,43 @@ describe("doctor session snapshot stale runtime metadata", () => {
     expect(message).toContain(path.join(bundledSkillsDir, "doctor", "SKILL.md"));
   });
 
-  it("scans resolvedSkills before session store normalization strips them", async () => {
-    const stalePath = path.join(
-      root,
-      "old-runtime",
-      "node_modules",
-      "openclaw",
-      "skills",
-      "doctor",
-      "SKILL.md",
-    );
-    const storePath = path.join(root, "state", "agents", "main", "sessions", "sessions.json");
-    await writeSessionStore(storePath, {
-      "agent:main": sessionEntry({
-        skillsSnapshot: {
-          prompt: "",
-          skills: [{ name: "doctor" }],
-          resolvedSkills: [
-            {
-              name: "doctor",
-              description: "Doctor skill",
-              source: "bundled",
-              filePath: stalePath,
-              baseDir: path.dirname(stalePath),
-              sourceInfo: {
-                path: stalePath,
-                source: "bundled",
-                scope: "user",
-                origin: "top-level",
-                baseDir: path.dirname(stalePath),
-              },
-              disableModelInvocation: false,
-            },
-          ],
-        },
-      }),
-    });
+  it.each(["path", "sourceInfo"] as const)(
+    "scans resolvedSkills %s before normalization strips them",
+    async (field) => {
+      const stalePath = path.join(
+        root,
+        "old-runtime",
+        "node_modules",
+        "openclaw",
+        "skills",
+        "doctor",
+        "SKILL.md",
+      );
+      const storePath = path.join(root, "state", "agents", "main", "sessions", "sessions.json");
+      const skill = resolvedSkill(
+        field === "path" ? stalePath : path.join(bundledSkillsDir, "doctor", "SKILL.md"),
+      );
+      skill.sourceInfo.path = stalePath;
+      skill.sourceInfo.baseDir = path.dirname(stalePath);
+      await writeSessionStore(storePath, {
+        "agent:main": sessionEntry({
+          skillsSnapshot: {
+            prompt: "",
+            skills: [{ name: "doctor" }],
+            resolvedSkills: [skill],
+          },
+        }),
+      });
 
-    await noteSessionSnapshotHealth({ storePaths: [storePath], bundledSkillsDir });
+      await noteSessionSnapshotHealth({ cfg: { session: { store: storePath } } });
 
-    expect(note).toHaveBeenCalledTimes(1);
-    const [message] = note.mock.calls[0] as [string, string];
-    expect(message).toContain("agent:main");
-    expect(message).toContain("skillsSnapshot.resolvedSkills");
-    expect(message).toContain(stalePath);
-  });
+      expect(note).toHaveBeenCalledTimes(1);
+      const [message] = note.mock.calls[0] as [string, string];
+      expect(message).toContain("agent:main");
+      expect(message).toContain("skillsSnapshot.resolvedSkills");
+      expect(message).toContain(stalePath);
+    },
+  );
 
   it("hydrates blobbed skills prompts before scanning raw session stores", async () => {
     const stalePath = path.join(
@@ -309,23 +514,19 @@ describe("doctor session snapshot stale runtime metadata", () => {
     );
     const storePath = path.join(root, "state", "agents", "main", "sessions", "sessions.json");
     const prompt = `${skillPrompt(stalePath)}\n${"padding\n".repeat(200)}`;
-    await saveSessionStore(
-      storePath,
-      {
-        "agent:main": sessionEntry({
-          skillsSnapshot: {
-            prompt,
-            skills: [{ name: "doctor" }],
-          },
-        }),
-      },
-      { skipMaintenance: true },
-    );
+    await saveSessionStore(storePath, {
+      "agent:main": sessionEntry({
+        skillsSnapshot: {
+          prompt,
+          skills: [{ name: "doctor" }],
+        },
+      }),
+    });
     const raw = await fs.readFile(storePath, "utf-8");
     expect(raw).not.toContain(stalePath);
     expect(raw).toContain("promptRef");
 
-    await noteSessionSnapshotHealth({ storePaths: [storePath], bundledSkillsDir });
+    await noteSessionSnapshotHealth({ cfg: { session: { store: storePath } } });
 
     expect(note).toHaveBeenCalledTimes(1);
     const [message] = note.mock.calls[0] as [string, string];
@@ -359,7 +560,6 @@ describe("doctor session snapshot stale runtime metadata", () => {
 
     await noteSessionSnapshotHealth({
       cfg: { session: { store: configuredStorePath } } as OpenClawConfig,
-      bundledSkillsDir,
       env: { OPENCLAW_STATE_DIR: stateDir },
     });
 
@@ -394,9 +594,8 @@ describe("doctor session snapshot stale runtime metadata", () => {
     await noteSessionSnapshotHealth({
       cfg: {
         session: { store: templatedStore },
-        agents: { list: [{ id: "main" }, { id: "ops" }] },
+        agents: { entries: { main: {}, ops: {} } },
       } as OpenClawConfig,
-      bundledSkillsDir,
       env: { OPENCLAW_STATE_DIR: path.join(root, "state") },
     });
 
@@ -405,5 +604,101 @@ describe("doctor session snapshot stale runtime metadata", () => {
     expect(message).toContain(opsStorePath);
     expect(message).toContain("agent:ops");
     expect(message).toContain(stalePath);
+  });
+
+  it("preserves a missing prompt blob without reporting false findings", async () => {
+    const storePath = path.join(root, "sessions", "sessions.json");
+    await writeSessionStore(storePath, {
+      "agent:main": sessionEntry({
+        skillsSnapshot: {
+          prompt: "",
+          promptRef: { version: 1, algorithm: "sha256", hash: "a".repeat(64), bytes: 100 },
+          skills: [{ name: "doctor" }],
+        },
+      }),
+    });
+    const original = await fs.readFile(storePath);
+
+    await noteSessionSnapshotHealth({ cfg: { session: { store: storePath } } });
+
+    expect(note).not.toHaveBeenCalled();
+    expect(await fs.readFile(storePath)).toEqual(original);
+  });
+
+  it("preserves imported plugin source bytes and canonical sessions during Doctor repair", async () => {
+    await withOpenClawTestState(
+      { label: "retained-snapshot-source", env: { OPENCLAW_BUNDLED_SKILLS_DIR: bundledSkillsDir } },
+      async (state) => {
+        const { cfg, storePath, scope } = await seedDeferredPluginSessionSource(state, "default");
+        const store = JSON.parse(await fs.readFile(storePath, "utf8"));
+        const prompt = skillPrompt(
+          path.join(root, "old", "node_modules", "openclaw", "skills", "doctor", "SKILL.md"),
+        );
+        store["agent:main:kept"].skillsSnapshot = {
+          prompt,
+          skills: [{ name: "doctor" }],
+        };
+        await fs.writeFile(storePath, JSON.stringify(store));
+        const imported = await runDoctorSessionSqlite({
+          cfg,
+          env: state.env,
+          allAgents: true,
+          mode: "import",
+        });
+        expect(imported.totals.importedEntries).toBe(2);
+        await upsertSessionEntryCore(
+          { ...scope, sessionKey: "agent:main:kept" },
+          { label: "current" },
+        );
+        const original = await fs.readFile(storePath);
+        const identity = readMigrationArtifactIdentity(storePath);
+        note.mockClear();
+
+        await runSessionSnapshotsHealth({
+          cfg,
+          cfgForPersistence: cfg,
+          configResult: { cfg },
+          configPath: state.configPath,
+          sourceConfigValid: true,
+          env: state.env,
+          options: { repair: true, nonInteractive: true },
+          runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+          prompter: {
+            confirm: async () => true,
+            confirmAutoFix: async () => true,
+            confirmAggressiveAutoFix: async () => true,
+            confirmRuntimeRepair: async () => true,
+            select: async (_params, fallback) => fallback,
+            shouldRepair: true,
+            shouldForce: false,
+            repairMode: {
+              shouldRepair: true,
+              shouldForce: false,
+              nonInteractive: true,
+              canPrompt: false,
+              updateInProgress: false,
+            },
+          },
+        });
+
+        expect(await fs.readFile(storePath)).toEqual(original);
+        expect(readMigrationArtifactIdentity(storePath)).toEqual(identity);
+        expect(
+          (await fs.readdir(path.dirname(storePath))).some((file) =>
+            file.startsWith("sessions.json.bak."),
+          ),
+        ).toBe(false);
+        expect(
+          loadExactSessionEntry({ ...scope, sessionKey: "agent:main:kept" })?.entry,
+        ).toMatchObject({
+          sessionId: "legacy-kept",
+          label: "current",
+          skillsSnapshot: { prompt },
+        });
+        expect(note).toHaveBeenCalledTimes(1);
+        expect(note.mock.calls[0]?.[0]).toContain("No cleanup or session reset is needed");
+        expect(() => assertSessionStoreMigrationComplete({ cfg, env: state.env })).not.toThrow();
+      },
+    );
   });
 });

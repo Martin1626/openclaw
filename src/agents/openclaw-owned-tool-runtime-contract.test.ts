@@ -1,3 +1,4 @@
+// Verifies OpenClaw-owned tool hooks preserve adjusted params and telemetry.
 import type { AgentTool } from "openclaw/plugin-sdk/agent-core";
 import {
   installOpenClawOwnedToolHooks,
@@ -9,15 +10,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { toToolDefinitions } from "./agent-tool-definition-adapter.js";
 import { createBaseToolHandlerState } from "./agent-tool-handler-state.test-helpers.js";
 import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
-import type { MessagingToolSend } from "./embedded-agent-messaging.types.js";
-import {
-  handleToolExecutionEnd,
-  handleToolExecutionStart,
-} from "./embedded-agent-subscribe.handlers.tools.js";
-import type {
-  ToolCallSummary,
-  ToolHandlerContext,
-} from "./embedded-agent-subscribe.handlers.types.js";
+import { handleToolExecutionEnd } from "./embedded-agent-subscribe.handlers.tools.completion.js";
+import { handleToolExecutionStart } from "./embedded-agent-subscribe.handlers.tools.start.js";
+import type { ToolHandlerContext } from "./embedded-agent-subscribe.handlers.types.js";
+import { prepareToolResult } from "./embedded-agent-tool-results.js";
 
 function createContractTool(name: string, execute: AgentTool["execute"]): AgentTool {
   return {
@@ -33,6 +29,7 @@ type ToolExecutionStartEvent = Parameters<typeof handleToolExecutionStart>[1];
 type ToolExecutionEndEvent = Parameters<typeof handleToolExecutionEnd>[1];
 
 function createToolHandlerCtx(): ToolHandlerContext {
+  // Minimal embedded-agent tool handler context used to drive start/end events.
   return {
     params: {
       runId: "run-contract",
@@ -40,13 +37,7 @@ function createToolHandlerCtx(): ToolHandlerContext {
       sessionId: "session-1",
       sessionKey: "agent:agent-1:session-1",
     },
-    state: {
-      ...createBaseToolHandlerState(),
-      toolMetaById: new Map<string, ToolCallSummary>(),
-      pendingMessagingTargets: new Map<string, MessagingToolSend>(),
-      messagingToolSentTargets: [] as MessagingToolSend[],
-      successfulCronAdds: 0,
-    },
+    state: createBaseToolHandlerState(),
     log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
     flushBlockReplyBuffer: vi.fn(),
     shouldEmitToolResult: () => false,
@@ -92,6 +83,7 @@ function createToolExtensionContext(): ExtensionContext {
 async function waitForAfterToolCall(hooks: {
   afterToolCall: { mock: { calls: unknown[][] } };
 }): Promise<[Record<string, unknown>, Record<string, unknown>]> {
+  // after_tool_call fires asynchronously after the execution-end event is processed.
   await vi.waitFor(() => {
     expect(hooks.afterToolCall).toHaveBeenCalledTimes(1);
   });
@@ -149,6 +141,7 @@ describe("OpenClaw-owned tool runtime contract - embedded agent adapter", () => 
         isError: false,
         result,
       }),
+      prepareToolResult(result),
     );
 
     expect(hooks.beforeToolCall).toHaveBeenCalledTimes(1);
@@ -216,6 +209,7 @@ describe("OpenClaw-owned tool runtime contract - embedded agent adapter", () => 
         isError: true,
         result,
       }),
+      prepareToolResult(result),
     );
 
     expect(hooks.beforeToolCall).toHaveBeenCalledTimes(1);
@@ -231,7 +225,7 @@ describe("OpenClaw-owned tool runtime contract - embedded agent adapter", () => 
 
   it("commits successful embedded agent messaging text, media, and target telemetry", async () => {
     const hooks = installOpenClawOwnedToolHooks();
-    const execute = vi.fn(async () => textToolResult("sent"));
+    const execute = vi.fn(async () => textToolResult("sent", { deliveryStatus: "sent" }));
     const tool = wrapToolWithBeforeToolCallHook(createContractTool("message", execute), {
       agentId: "agent-1",
       sessionId: "session-1",
@@ -276,6 +270,7 @@ describe("OpenClaw-owned tool runtime contract - embedded agent adapter", () => 
         isError: false,
         result,
       }),
+      prepareToolResult(result),
     );
 
     expect(ctx.state.messagingToolSentTexts).toEqual(["hello from embedded agent"]);
@@ -358,6 +353,7 @@ describe("OpenClaw-owned tool runtime contract - embedded agent adapter", () => 
         isError: true,
         result,
       }),
+      prepareToolResult(result),
     );
 
     expect(hooks.beforeToolCall).toHaveBeenCalledTimes(1);

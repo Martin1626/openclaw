@@ -2,11 +2,21 @@ export function isBlockedLivenessState(livenessState: unknown): boolean {
   return typeof livenessState === "string" && livenessState.trim().toLowerCase() === "blocked";
 }
 
+export function isAbandonedLivenessState(livenessState: unknown): boolean {
+  return typeof livenessState === "string" && livenessState.trim().toLowerCase() === "abandoned";
+}
+
 export function formatBlockedLivenessError(error: unknown): string {
   const message = typeof error === "string" ? error.trim() : "";
   return message || "Agent run blocked before producing a usable result.";
 }
 
+export function formatAbandonedLivenessError(error: unknown): string {
+  const message = typeof error === "string" ? error.trim() : "";
+  return message || "Agent run ended before producing a complete result.";
+}
+
+/** Coerce any blocked liveness state into an error status while preserving other statuses. */
 export function normalizeBlockedLivenessWaitStatus<
   TStatus extends "ok" | "error" | "timeout" | "pending",
 >(params: {

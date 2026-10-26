@@ -1,62 +1,95 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText as readBoundedResponseTextWithLimit,
+} from "../../../lib/bounded-response.mjs";
 import {
   assertAgentReplyContainsMarker,
   assertOpenAiRequestLogUsed,
 } from "../agent-turn-output.mjs";
-import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "../bounded-response-text.mjs";
-import { applyMockOpenAiModelConfig } from "../fixtures/mock-openai-config.mjs";
+import { assert } from "../fixtures/common.mjs";
+import {
+  applyMockOpenAiModelConfig,
+  parseMockOpenAiPort,
+} from "../fixtures/mock-openai-config.mjs";
+import { readPluginInstallRecords } from "../plugin-index-sqlite.mjs";
+import { hasExpectedPluginUninstallConfigState } from "../plugin-uninstall-assertions.mjs";
+import { assertFileContainsText, readJson } from "../release-assertion-files.mjs";
 
-const command = process.argv[2];
-const CLICKCLACK_HTTP_TIMEOUT_MS = readPositiveInt(
-  process.env.OPENCLAW_RELEASE_USER_JOURNEY_HTTP_TIMEOUT_MS,
-  5000,
-);
-const CLICKCLACK_HTTP_BODY_MAX_BYTES = readPositiveInt(
-  process.env.OPENCLAW_RELEASE_USER_JOURNEY_HTTP_BODY_MAX_BYTES,
-  1024 * 1024,
-);
-
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+function clickClackHttpTimeoutMs() {
+  return readPositiveInt(
+    process.env.OPENCLAW_RELEASE_USER_JOURNEY_HTTP_TIMEOUT_MS,
+    5000,
+    "OPENCLAW_RELEASE_USER_JOURNEY_HTTP_TIMEOUT_MS",
+  );
 }
 
-function readPositiveInt(raw, fallback) {
+function clickClackHttpBodyMaxBytes() {
+  return readPositiveInt(
+    process.env.OPENCLAW_RELEASE_USER_JOURNEY_HTTP_BODY_MAX_BYTES,
+    1024 * 1024,
+    "OPENCLAW_RELEASE_USER_JOURNEY_HTTP_BODY_MAX_BYTES",
+  );
+}
+
+function readPositiveInt(raw, fallback, label) {
   const text = String(raw ?? "").trim();
-  if (!/^\d+$/u.test(text)) {
+  if (!text) {
     return fallback;
   }
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`${label} must be a positive integer. Got: ${JSON.stringify(text)}`);
+  }
   const parsed = Number(text);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer. Got: ${JSON.stringify(text)}`);
+  }
+  return parsed;
 }
 
 async function withClickClackFixtureResponse(url, init, consume, options = {}) {
-  const timeoutMs = options.timeoutMs ?? CLICKCLACK_HTTP_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? clickClackHttpTimeoutMs();
   const controller = new AbortController();
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
+  const timeoutError = new Error(`${url} timed out after ${timeoutMs}ms`);
+  let timer;
+  let response;
+  const timeoutPromise = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
   try {
-    const response = await fetch(url, {
-      ...init,
-      signal: controller.signal,
-    });
-    return await consume(response);
+    response = await Promise.race([
+      fetch(url, {
+        ...init,
+        signal: controller.signal,
+      }),
+      timeoutPromise,
+    ]);
+    return await consume(response, { timeoutPromise });
   } finally {
     clearTimeout(timer);
+    await response?.body?.cancel?.().catch(() => undefined);
   }
 }
 
 async function readBoundedResponseText(
   response,
   label,
-  byteLimit = CLICKCLACK_HTTP_BODY_MAX_BYTES,
+  byteLimit = clickClackHttpBodyMaxBytes(),
+  options = {},
 ) {
-  return await readBoundedResponseTextWithLimit(response, label, byteLimit);
+  return await readBoundedResponseTextWithLimit(response, label, byteLimit, {
+    createTooLargeError: createBoundedResponseTooLargeError,
+    timeoutPromise: options.timeoutPromise,
+  });
 }
 
-async function readBoundedResponseJson(response, label) {
-  return JSON.parse(await readBoundedResponseText(response, label));
+async function readBoundedResponseJson(response, label, options = {}) {
+  return JSON.parse(await readBoundedResponseText(response, label, undefined, options));
 }
 
 function resolveHomePath(value) {
@@ -89,20 +122,12 @@ function configPath() {
   );
 }
 
-function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message);
-  }
-}
-
 function writeConfig(cfg) {
   fs.writeFileSync(configPath(), `${JSON.stringify(cfg, null, 2)}\n`);
 }
 
 function installRecords() {
-  const recordsPath = path.join(process.env.HOME ?? "", ".openclaw", "plugins", "installs.json");
-  const records = fs.existsSync(recordsPath) ? readJson(recordsPath) : {};
-  return records.installRecords ?? records.records ?? {};
+  return readPluginInstallRecords({ configPath: configPath() });
 }
 
 function assertOnboard() {
@@ -120,7 +145,7 @@ function assertOnboard() {
 }
 
 function configureMockModel() {
-  const mockPort = Number(process.argv[3]);
+  const mockPort = parseMockOpenAiPort(process.argv[3]);
   const cfg = readJson(configPath());
   applyMockOpenAiModelConfig(cfg, { mockPort });
   writeConfig(cfg);
@@ -137,8 +162,7 @@ function assertAgentTurn() {
 function assertFileContains() {
   const file = process.argv[3];
   const needle = process.argv[4];
-  const raw = fs.readFileSync(file, "utf8");
-  assert(raw.includes(needle), `${file} did not contain ${needle}. Output: ${raw}`);
+  assertFileContainsText(file, needle, assert);
 }
 
 function rememberPluginInstallPath() {
@@ -179,7 +203,10 @@ function assertPluginUninstalled() {
   const cfg = readJson(configPath());
   const records = installRecords();
   assert(!records[pluginId], `install record still present for ${pluginId}`);
-  assert(!cfg.plugins?.entries?.[pluginId], `plugin config entry still present for ${pluginId}`);
+  assert(
+    hasExpectedPluginUninstallConfigState(cfg, pluginId),
+    `exact disabled uninstall marker missing for ${pluginId}`,
+  );
   assert(!(cfg.plugins?.allow ?? []).includes(pluginId), `allowlist still contains ${pluginId}`);
   assert(!(cfg.plugins?.deny ?? []).includes(pluginId), `denylist still contains ${pluginId}`);
   if (!installPathFile) {
@@ -218,7 +245,7 @@ function configureClickClack() {
           ...cfg.plugins?.entries?.clickclack?.llm,
           allowAgentIdOverride: true,
           allowModelOverride: true,
-          allowedModels: ["openai/gpt-5.5"],
+          allowedModels: ["openai/gpt-5.6-luna"],
         },
       },
     },
@@ -233,23 +260,36 @@ function configureClickClack() {
       workspace: "release",
       defaultTo: "channel:general",
       replyMode: "model",
-      model: "openai/gpt-5.5",
+      model: "openai/gpt-5.6-luna",
       reconnectMs: 250,
     },
   };
   writeConfig(cfg);
 }
 
-function assertChannelStatus() {
+function readChannelStatus() {
   const channel = process.argv[3];
   const statusPath = process.argv[4];
   const status = readJson(statusPath);
+  return { channel, status };
+}
+
+function assertChannelConfigured() {
+  const { channel, status } = readChannelStatus();
   const configured = Array.isArray(status.configuredChannels) ? status.configuredChannels : [];
-  const liveStatus = status.channels?.[channel];
   assert(
-    configured.includes(channel) || liveStatus?.ok === true,
-    `${channel} missing from channels status: ${JSON.stringify(status)}`,
+    configured.includes(channel),
+    `${channel} missing from configured channels: ${JSON.stringify(status)}`,
   );
+}
+
+function assertChannelRunning() {
+  const { channel, status } = readChannelStatus();
+  const accounts = status.channelAccounts?.[channel];
+  const defaultAccount = Array.isArray(accounts)
+    ? accounts.find((account) => account?.accountId === "default")
+    : undefined;
+  assert(defaultAccount?.running === true, `${channel} is not running: ${JSON.stringify(status)}`);
 }
 
 async function postClickClackInbound() {
@@ -262,8 +302,10 @@ async function postClickClackInbound() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ body }),
     },
-    async (response) => {
-      const text = response.ok ? "" : await readBoundedResponseText(response, "ClickClack inbound");
+    async (response, options) => {
+      const text = response.ok
+        ? ""
+        : await readBoundedResponseText(response, "ClickClack inbound", undefined, options);
       assert(response.ok, `fixture inbound failed: ${response.status} ${text}`);
     },
   );
@@ -271,29 +313,53 @@ async function postClickClackInbound() {
 
 async function waitClickClackSocket() {
   const baseUrl = process.argv[3];
-  const timeoutSeconds = Number(process.argv[4] ?? 30);
-  const deadline = Date.now() + timeoutSeconds * 1000;
+  const timeoutSeconds = readPositiveInt(
+    process.argv[4],
+    30,
+    "ClickClack websocket timeout seconds",
+  );
+  const minimumSocketGeneration = readPositiveInt(
+    process.argv[5],
+    1,
+    "ClickClack minimum websocket generation",
+  );
+  await waitForClickClackSocket({
+    baseUrl,
+    timeoutMs: timeoutSeconds * 1000,
+    minimumSocketGeneration,
+  });
+}
+
+export async function waitForClickClackSocket({
+  baseUrl,
+  timeoutMs,
+  minimumSocketGeneration = 1,
+  pollIntervalMs = 250,
+}) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     const state = await withClickClackFixtureResponse(
       `${baseUrl}/fixture/state`,
       {},
-      async (response) =>
+      async (response, options) =>
         response.ok
-          ? await readBoundedResponseJson(response, "ClickClack fixture state")
+          ? await readBoundedResponseJson(response, "ClickClack fixture state", options)
           : undefined,
       {
-        timeoutMs: Math.min(CLICKCLACK_HTTP_TIMEOUT_MS, remainingMs),
+        timeoutMs: Math.min(clickClackHttpTimeoutMs(), remainingMs),
       },
     ).catch(() => undefined);
-    if (state) {
-      if (Number(state.socketCount ?? 0) > 0) {
-        return;
-      }
+    if (state && Number(state.socketGeneration ?? 0) >= minimumSocketGeneration) {
+      return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => {
+      setTimeout(resolve, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    });
   }
-  throw new Error(`Timed out waiting for ClickClack websocket connection at ${baseUrl}`);
+  throw new Error(
+    `Timed out waiting for ClickClack websocket generation ${minimumSocketGeneration} at ${baseUrl}`,
+  );
 }
 
 function assertClickClackState() {
@@ -308,7 +374,7 @@ function assertClickClackState() {
 async function waitClickClackReply() {
   const statePath = process.argv[3];
   const marker = process.argv[4];
-  const timeoutSeconds = Number(process.argv[5] ?? 30);
+  const timeoutSeconds = readPositiveInt(process.argv[5], 30, "ClickClack reply timeout seconds");
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
     if (fs.existsSync(statePath)) {
@@ -317,7 +383,9 @@ async function waitClickClackReply() {
         return;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 250);
+    });
   }
   const state = fs.existsSync(statePath) ? fs.readFileSync(statePath, "utf8") : "<missing>";
   throw new Error(`Timed out waiting for ClickClack reply marker ${marker}. State: ${state}`);
@@ -331,15 +399,28 @@ const commands = {
   "assert-file-contains": assertFileContains,
   "assert-plugin-uninstalled": assertPluginUninstalled,
   "configure-clickclack": configureClickClack,
-  "assert-channel-status": assertChannelStatus,
+  "assert-channel-configured": assertChannelConfigured,
+  "assert-channel-running": assertChannelRunning,
   "post-clickclack-inbound": postClickClackInbound,
   "wait-clickclack-socket": waitClickClackSocket,
   "assert-clickclack-state": assertClickClackState,
   "wait-clickclack-reply": waitClickClackReply,
 };
 
-const fn = commands[command];
-if (!fn) {
-  throw new Error(`unknown release-user-journey assertion command: ${command ?? "<missing>"}`);
+export async function runReleaseUserJourneyAssertion(command, args = []) {
+  const fn = commands[command];
+  if (!fn) {
+    throw new Error(`unknown release-user-journey assertion command: ${command ?? "<missing>"}`);
+  }
+  const previousArgv = process.argv;
+  process.argv = [previousArgv[0] ?? "node", fileURLToPath(import.meta.url), command, ...args];
+  try {
+    await fn();
+  } finally {
+    process.argv = previousArgv;
+  }
 }
-await fn();
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await runReleaseUserJourneyAssertion(process.argv[2], process.argv.slice(3));
+}

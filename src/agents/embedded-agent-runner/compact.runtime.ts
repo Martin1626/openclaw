@@ -1,15 +1,12 @@
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
-import type { CompactEmbeddedAgentSessionDirect } from "./compact.runtime.types.js";
+import type { CompactEmbeddedAgentSessionRuntimeParams } from "./compact.types.js";
+import type { EmbeddedAgentCompactResult } from "./types.js";
 
 const compactRuntimeLoader = createLazyImportLoader(() => import("./compact.js"));
 
-function loadCompactRuntime() {
-  return compactRuntimeLoader.load();
-}
-
-export async function compactEmbeddedAgentSessionDirect(
-  ...args: Parameters<CompactEmbeddedAgentSessionDirect>
-): ReturnType<CompactEmbeddedAgentSessionDirect> {
-  const { compactEmbeddedAgentSessionDirect } = await loadCompactRuntime();
-  return compactEmbeddedAgentSessionDirect(...args);
+export async function compactEmbeddedAgentSessionOnDemand(
+  params: CompactEmbeddedAgentSessionRuntimeParams,
+): Promise<EmbeddedAgentCompactResult> {
+  const { compactEmbeddedAgentSessionDirect } = await compactRuntimeLoader.load();
+  return compactEmbeddedAgentSessionDirect(params);
 }

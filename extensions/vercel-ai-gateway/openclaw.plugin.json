@@ -1,10 +1,22 @@
 {
   "id": "vercel-ai-gateway",
+  "categories": ["models"],
   "activation": {
     "onStartup": false
   },
   "enabledByDefault": true,
   "providers": ["vercel-ai-gateway"],
+  "providerEndpoints": [
+    {
+      "endpointClass": "vercel-ai-gateway",
+      "hosts": ["ai-gateway.vercel.sh"]
+    }
+  ],
+  "modelCatalog": {
+    "discovery": {
+      "vercel-ai-gateway": "refreshable"
+    }
+  },
   "modelIdNormalization": {
     "providers": {
       "vercel-ai-gateway": {
@@ -24,6 +36,10 @@
   "modelPricing": {
     "providers": {
       "vercel-ai-gateway": {
+        "modelsDev": {
+          "provider": "vercel",
+          "passthroughProviderModel": true
+        },
         "openRouter": {
           "passthroughProviderModel": true
         },
@@ -46,6 +62,7 @@
       "provider": "vercel-ai-gateway",
       "method": "api-key",
       "choiceId": "ai-gateway-api-key",
+      "appGuidedSecret": true,
       "choiceLabel": "Vercel AI Gateway API key",
       "groupId": "ai-gateway",
       "groupLabel": "Vercel AI Gateway",

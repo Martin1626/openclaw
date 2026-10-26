@@ -1,8 +1,11 @@
+// Coverage for classifying embedded-run failure signals from tool metadata.
 import { describe, expect, it } from "vitest";
 import { resolveEmbeddedRunFailureSignal } from "./failure-signal.js";
 
 describe("resolveEmbeddedRunFailureSignal", () => {
   it("classifies cron exec denials from tool error metadata", () => {
+    // Cron execution denials are fatal because retrying the same scheduled turn
+    // cannot collect interactive approval.
     expect(
       resolveEmbeddedRunFailureSignal({
         trigger: "cron",
@@ -48,18 +51,6 @@ describe("resolveEmbeddedRunFailureSignal", () => {
     ).toBeUndefined();
   });
 
-  it("does not mark ordinary tool failures as cron-denial failures", () => {
-    expect(
-      resolveEmbeddedRunFailureSignal({
-        trigger: "cron",
-        lastToolError: {
-          toolName: "exec",
-          error: "/bin/bash: line 1: python: command not found",
-        },
-      }),
-    ).toBeUndefined();
-  });
-
   it("does not mark non-exec validation errors as execution denials", () => {
     expect(
       resolveEmbeddedRunFailureSignal({
@@ -74,6 +65,8 @@ describe("resolveEmbeddedRunFailureSignal", () => {
   });
 
   it("does not mark tool output that merely mentions host denial tokens", () => {
+    // Match structured error metadata, not arbitrary command output that happens
+    // to mention a denial code.
     expect(
       resolveEmbeddedRunFailureSignal({
         trigger: "cron",

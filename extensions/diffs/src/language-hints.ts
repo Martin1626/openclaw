@@ -7,12 +7,11 @@ import {
 } from "./shiki-curated-languages.js";
 import type { DiffViewerPayload } from "./types.js";
 
-export const BASE_DIFF_VIEWER_LANGUAGE_HINTS = [
+const BASE_DIFF_VIEWER_LANGUAGE_HINTS = [
   ...Object.keys(bundledLanguagesBase),
   "text",
   "ansi",
 ] as const satisfies readonly SupportedLanguages[];
-export type DiffViewerBaseLanguage = (typeof BASE_DIFF_VIEWER_LANGUAGE_HINTS)[number];
 
 const BASE_LANGUAGE_HINTS = new Set<SupportedLanguages>(BASE_DIFF_VIEWER_LANGUAGE_HINTS);
 const BASE_LANGUAGE_ALIASES = new Map<string, SupportedLanguages>(
@@ -22,19 +21,20 @@ const BASE_LANGUAGE_ALIASES = new Map<string, SupportedLanguages>(
 );
 type DiffPayloadFile = FileContents | FileDiffMetadata;
 
-function normalizeOptionalString(value: unknown): string | undefined {
+// The curated viewer bundles this module outside Plugin SDK package resolution.
+function normalizeLanguageHint(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
+  const normalized = value.trim().toLowerCase();
+  return normalized || undefined;
 }
 
 export async function normalizeSupportedLanguageHint(
   value?: string,
   options: { languagePackAvailable?: boolean } = {},
 ): Promise<SupportedLanguages | undefined> {
-  const normalized = normalizeOptionalString(value);
+  const normalized = normalizeLanguageHint(value);
   if (!normalized) {
     return undefined;
   }
@@ -56,16 +56,9 @@ export async function normalizeSupportedLanguageHint(
   }
 }
 
-export async function filterSupportedLanguageHints(
-  values: Iterable<string>,
-  options: { languagePackAvailable?: boolean } = {},
-): Promise<SupportedLanguages[]> {
-  return normalizeSupportedLanguageHints(values, { fallbackToText: true, ...options });
-}
-
 async function normalizeSupportedLanguageHints(
   values: Iterable<string>,
-  options: { fallbackToText: boolean; languagePackAvailable?: boolean },
+  options: { languagePackAvailable?: boolean },
 ): Promise<SupportedLanguages[]> {
   const supported = new Set<SupportedLanguages>();
   for (const value of values) {
@@ -74,9 +67,6 @@ async function normalizeSupportedLanguageHints(
       continue;
     }
     supported.add(normalized);
-  }
-  if (options.fallbackToText && supported.size === 0) {
-    supported.add("text");
   }
   return [...supported];
 }
@@ -99,6 +89,14 @@ export function collectDiffPayloadLanguageHints(payload: {
   return [...langs];
 }
 
+function normalizeDiffPayloadFileLanguage(
+  file: FileDiffMetadata | undefined,
+  options: { languagePackAvailable?: boolean },
+): Promise<FileDiffMetadata | undefined>;
+function normalizeDiffPayloadFileLanguage(
+  file: FileContents | undefined,
+  options: { languagePackAvailable?: boolean },
+): Promise<FileContents | undefined>;
 async function normalizeDiffPayloadFileLanguage(
   file: DiffPayloadFile | undefined,
   options: { languagePackAvailable?: boolean },
@@ -113,15 +111,9 @@ async function normalizeDiffPayloadFileLanguage(
   if (file.lang === normalized) {
     return file;
   }
-  if (!normalized) {
-    return {
-      ...file,
-      lang: "text",
-    };
-  }
   return {
     ...file,
-    lang: normalized,
+    lang: normalized ?? "text",
   };
 }
 
@@ -130,12 +122,10 @@ export async function normalizeDiffViewerPayloadLanguages(
   options: { languagePackAvailable?: boolean } = {},
 ): Promise<DiffViewerPayload> {
   const [fileDiff, oldFile, newFile, payloadLangs] = await Promise.all([
-    normalizeDiffPayloadFileLanguage(payload.fileDiff, options) as Promise<
-      FileDiffMetadata | undefined
-    >,
-    normalizeDiffPayloadFileLanguage(payload.oldFile, options) as Promise<FileContents | undefined>,
-    normalizeDiffPayloadFileLanguage(payload.newFile, options) as Promise<FileContents | undefined>,
-    normalizeSupportedLanguageHints(payload.langs, { fallbackToText: false, ...options }),
+    normalizeDiffPayloadFileLanguage(payload.fileDiff, options),
+    normalizeDiffPayloadFileLanguage(payload.oldFile, options),
+    normalizeDiffPayloadFileLanguage(payload.newFile, options),
+    normalizeSupportedLanguageHints(payload.langs, options),
   ]);
   const langs = new Set<SupportedLanguages>(payloadLangs);
   for (const lang of collectDiffPayloadLanguageHints({ fileDiff, oldFile, newFile })) {

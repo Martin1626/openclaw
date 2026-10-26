@@ -1,17 +1,14 @@
+// Codex tests cover attempt timeouts plugin behavior.
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS,
-  CODEX_TURN_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS,
-  CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS,
-  CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS,
-  resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs,
+  isCodexAppServerStartupError,
+  resolveCodexGatewayTimeoutWithGraceMs,
   resolveCodexStartupTimeoutMs,
-  resolveCodexTurnAssistantCompletionIdleTimeoutMs,
-  resolveCodexTurnCompletionIdleTimeoutMs,
-  resolveCodexTurnTerminalIdleTimeoutMs,
   withCodexStartupTimeout,
 } from "./attempt-timeouts.js";
+
+const CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS = 100;
 
 describe("Codex app-server attempt timeouts", () => {
   afterEach(() => {
@@ -45,49 +42,23 @@ describe("Codex app-server attempt timeouts", () => {
     ).toBe(CODEX_APP_SERVER_STARTUP_TIMEOUT_FLOOR_MS);
   });
 
-  it("normalizes turn idle timeout overrides", () => {
-    expect(resolveCodexTurnCompletionIdleTimeoutMs(undefined)).toBe(
-      CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS,
+  it("bounds startup by request timeouts when the turn budget is longer", () => {
+    const interactiveTurnMs = 48 * 60 * 60 * 1000;
+    expect(
+      resolveCodexStartupTimeoutMs({ timeoutMs: interactiveTurnMs, requestTimeoutMs: 60_000 }),
+    ).toBe(600_000);
+    expect(resolveCodexStartupTimeoutMs({ timeoutMs: 120_000, requestTimeoutMs: 60_000 })).toBe(
+      120_000,
     );
-    expect(resolveCodexTurnCompletionIdleTimeoutMs(Number.POSITIVE_INFINITY)).toBe(
-      CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS,
-    );
-    expect(resolveCodexTurnCompletionIdleTimeoutMs(2.9)).toBe(2);
-    expect(resolveCodexTurnCompletionIdleTimeoutMs(0)).toBe(1);
-    expect(resolveCodexTurnCompletionIdleTimeoutMs(Number.MAX_SAFE_INTEGER)).toBe(
+  });
+
+  it("caps gateway timeout grace", () => {
+    expect(resolveCodexGatewayTimeoutWithGraceMs(120_000)).toBe(130_000);
+    expect(resolveCodexGatewayTimeoutWithGraceMs(120_000, 500)).toBe(120_500);
+    expect(resolveCodexGatewayTimeoutWithGraceMs(Number.MAX_SAFE_INTEGER)).toBe(
       MAX_TIMER_TIMEOUT_MS,
     );
-
-    expect(resolveCodexTurnAssistantCompletionIdleTimeoutMs(undefined)).toBe(
-      CODEX_TURN_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS,
-    );
-    expect(resolveCodexTurnAssistantCompletionIdleTimeoutMs(Number.NaN)).toBe(
-      CODEX_TURN_ASSISTANT_COMPLETION_IDLE_TIMEOUT_MS,
-    );
-    expect(resolveCodexTurnAssistantCompletionIdleTimeoutMs(9.8)).toBe(9);
-    expect(resolveCodexTurnAssistantCompletionIdleTimeoutMs(-10)).toBe(1);
-
-    expect(resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(undefined, 123)).toBe(123);
-    expect(resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(Number.NaN, 123)).toBe(123);
-    expect(resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(undefined, Number.NaN)).toBe(1);
-    expect(resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(7.9, 123)).toBe(7);
-    expect(resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(0, 123)).toBe(1);
-    expect(
-      resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(
-        Number.MAX_SAFE_INTEGER,
-        Number.MAX_SAFE_INTEGER,
-      ),
-    ).toBe(MAX_TIMER_TIMEOUT_MS);
-
-    expect(resolveCodexTurnTerminalIdleTimeoutMs(undefined)).toBe(
-      CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS,
-    );
-    expect(resolveCodexTurnTerminalIdleTimeoutMs(Number.NEGATIVE_INFINITY)).toBe(
-      CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS,
-    );
-    expect(resolveCodexTurnTerminalIdleTimeoutMs(3.7)).toBe(3);
-    expect(resolveCodexTurnTerminalIdleTimeoutMs(-1)).toBe(1);
-    expect(resolveCodexTurnTerminalIdleTimeoutMs(Number.MAX_SAFE_INTEGER)).toBe(
+    expect(resolveCodexGatewayTimeoutWithGraceMs(MAX_TIMER_TIMEOUT_MS - 100, 500)).toBe(
       MAX_TIMER_TIMEOUT_MS,
     );
   });
@@ -117,14 +88,16 @@ describe("Codex app-server attempt timeouts", () => {
           }, 5);
         });
       },
-      operation: async () => new Promise<never>(() => undefined),
+      operation: async () => new Promise<never>(() => {}),
     });
-    const rejected = expect(run).rejects.toThrow("codex app-server startup timed out");
+    const errorResult = run.catch((error: unknown) => error);
 
     await vi.advanceTimersByTimeAsync(10);
     expect(events).toEqual(["cleanup-start"]);
     await vi.advanceTimersByTimeAsync(5);
-    await rejected;
+    const error = await errorResult;
+    expect(isCodexAppServerStartupError(error, "timed_out")).toBe(true);
+    expect((error as Error).message).toBe("codex app-server startup timed out");
     expect(events).toEqual(["cleanup-start", "cleanup-done"]);
   });
 
@@ -134,12 +107,14 @@ describe("Codex app-server attempt timeouts", () => {
     const run = withCodexStartupTimeout({
       timeoutMs: 1_000,
       signal: controller.signal,
-      operation: async () => new Promise<never>(() => undefined),
+      operation: async () => new Promise<never>(() => {}),
     });
-    const rejected = expect(run).rejects.toThrow("codex app-server startup aborted");
+    const errorResult = run.catch((error: unknown) => error);
 
     controller.abort();
 
-    await rejected;
+    const error = await errorResult;
+    expect(isCodexAppServerStartupError(error, "aborted")).toBe(true);
+    expect((error as Error).message).toBe("codex app-server startup aborted");
   });
 });

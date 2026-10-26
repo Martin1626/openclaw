@@ -1,18 +1,9 @@
-export type EmbeddedRunStageTiming = {
-  name: string;
-  durationMs: number;
-  elapsedMs: number;
-};
-
-export type EmbeddedRunStageSummary = {
-  totalMs: number;
-  stages: EmbeddedRunStageTiming[];
-};
-
-export type EmbeddedRunStageTracker = {
-  mark: (name: string) => void;
-  snapshot: () => EmbeddedRunStageSummary;
-};
+import { isMainThread, threadId } from "node:worker_threads";
+import {
+  type createStageTimingTracker,
+  formatStageTimings,
+  type StageTimingSummary,
+} from "../../../shared/stage-timing.js";
 
 export const EMBEDDED_RUN_ATTEMPT_DISPATCH_STAGE = {
   workspace: "attempt-workspace",
@@ -24,37 +15,8 @@ export const EMBEDDED_RUN_ATTEMPT_DISPATCH_STAGE = {
 const EMBEDDED_RUN_STAGE_WARN_TOTAL_MS = 10_000;
 const EMBEDDED_RUN_STAGE_WARN_STAGE_MS = 5_000;
 
-export function createEmbeddedRunStageTracker(options?: {
-  now?: () => number;
-}): EmbeddedRunStageTracker {
-  const now = options?.now ?? Date.now;
-  const startedAt = now();
-  let previousAt = startedAt;
-  const stages: EmbeddedRunStageTiming[] = [];
-
-  const toMs = (value: number) => Math.max(0, Math.round(value));
-
-  return {
-    mark(name) {
-      const currentAt = now();
-      stages.push({
-        name,
-        durationMs: toMs(currentAt - previousAt),
-        elapsedMs: toMs(currentAt - startedAt),
-      });
-      previousAt = currentAt;
-    },
-    snapshot() {
-      return {
-        totalMs: toMs(now() - startedAt),
-        stages: stages.slice(),
-      };
-    },
-  };
-}
-
 export function shouldWarnEmbeddedRunStageSummary(
-  summary: EmbeddedRunStageSummary,
+  summary: StageTimingSummary,
   options?: {
     totalThresholdMs?: number;
     stageThresholdMs?: number;
@@ -68,15 +30,40 @@ export function shouldWarnEmbeddedRunStageSummary(
   );
 }
 
-export function formatEmbeddedRunStageSummary(
-  prefix: string,
-  summary: EmbeddedRunStageSummary,
-): string {
-  const stages =
-    summary.stages.length > 0
-      ? summary.stages
-          .map((stage) => `${stage.name}:${stage.durationMs}ms@${stage.elapsedMs}ms`)
-          .join(",")
-      : "none";
-  return `${prefix} totalMs=${summary.totalMs} stages=${stages}`;
+export function createEmbeddedRunStageSummaryEmitter(options: {
+  label: string;
+  log: {
+    isEnabled: (level: "trace") => boolean;
+    warn: (message: string) => void;
+    trace: (message: string) => void;
+  };
+  runId: string;
+  sessionId?: string;
+  tracker: ReturnType<typeof createStageTimingTracker>;
+}): (phase: string) => void {
+  return (phase) =>
+    logEmbeddedRunStageSummary(
+      options.tracker.snapshot(),
+      options.log,
+      () =>
+        `[trace:embedded-run] ${options.label}: runId=${options.runId} sessionId=${options.sessionId} phase=${phase}`,
+    );
+}
+
+export function logEmbeddedRunStageSummary(
+  summary: StageTimingSummary,
+  log: Parameters<typeof createEmbeddedRunStageSummaryEmitter>[0]["log"],
+  prefix: () => string,
+  thresholds?: Parameters<typeof shouldWarnEmbeddedRunStageSummary>[1],
+): void {
+  const shouldWarn = shouldWarnEmbeddedRunStageSummary(summary, thresholds);
+  if (shouldWarn || log.isEnabled("trace")) {
+    const message = formatEmbeddedRunStageSummary(prefix(), summary);
+    log[shouldWarn ? "warn" : "trace"](message);
+  }
+}
+
+export function formatEmbeddedRunStageSummary(prefix: string, summary: StageTimingSummary): string {
+  const stages = formatStageTimings(summary.stages);
+  return `${prefix} pid=${process.pid} threadId=${threadId} isMainThread=${isMainThread} totalMs=${summary.totalMs} stages=${stages}`;
 }

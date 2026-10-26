@@ -10,7 +10,6 @@ import {
   resolveCodeExecutionEnabled,
 } from "./src/code-execution-config.js";
 import {
-  buildXaiCodeExecutionPayload,
   requestXaiCodeExecution,
   resolveXaiCodeExecutionMaxTurns,
   resolveXaiCodeExecutionModel,
@@ -65,17 +64,13 @@ export function createCodeExecutionTool(options?: {
         maxTurns,
         task,
       });
-      return jsonResult(
-        buildXaiCodeExecutionPayload({
-          task,
-          model,
-          tookMs: Date.now() - startedAt,
-          content: result.content,
-          citations: result.citations,
-          usedCodeExecution: result.usedCodeExecution,
-          outputTypes: result.outputTypes,
-        }),
-      );
+      return jsonResult({
+        task,
+        provider: "xai",
+        model,
+        tookMs: Date.now() - startedAt,
+        ...result,
+      });
     },
   );
 }

@@ -1,20 +1,21 @@
 import { existsSync } from "node:fs";
-import path from "node:path";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { listAgentIds, resolveAgentDir } from "../agents/agent-scope-config.js";
+import { copyCanonicalAuthProfileCredentialObservations } from "../agents/auth-profiles/credential-observation.js";
+import { resolveSharedAuthStorePath } from "../agents/auth-profiles/path-resolve.js";
 import {
-  listAgentIds,
-  resolveAgentDir,
-  resolveDefaultAgentDir,
-} from "../agents/agent-scope-config.js";
-import {
-  AUTH_PROFILE_FILENAME,
-  AUTH_STATE_FILENAME,
-  LEGACY_AUTH_FILENAME,
-} from "../agents/auth-profiles/path-constants.js";
+  getRuntimeAuthProfileStoreCredentialsRevision,
+  getRuntimeAuthProfileStoreSnapshotsRevision,
+  prepareRuntimeAuthProfileStoreSnapshots,
+} from "../agents/auth-profiles/runtime-snapshots.js";
+import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
-import { resolveOAuthPath } from "../config/paths.js";
+import { resolveLegacyInheritedAuthAgentDir } from "../agents/legacy-inherited-auth-dir.js";
+import { cloneConfigWithResolutionFacts } from "../config/resolution-facts.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import type { PluginOrigin } from "../plugins/plugin-origin.types.js";
-import { uniqueStrings } from "../shared/string-normalization.js";
 import { resolveUserPath } from "../utils.js";
 import { hasCredentialBearingObjectValue, hasSecretRefCandidate } from "./runtime-secret-scan.js";
 import type { SecretDefaults } from "./runtime-shared.js";
@@ -33,9 +34,11 @@ const RUNTIME_PATH_ENV_KEYS = [
   "OPENCLAW_STATE_DIR",
   "OPENCLAW_CONFIG_PATH",
   "OPENCLAW_AGENT_DIR",
-  "OPENCLAW_TEST_FAST",
 ] as const;
 
+/**
+ * Merges caller env with process path env needed for config and agent-dir resolution.
+ */
 export function mergeSecretsRuntimeEnv(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> | undefined,
 ): Record<string, string | undefined> {
@@ -44,6 +47,7 @@ export function mergeSecretsRuntimeEnv(
     if (merged[key] !== undefined) {
       continue;
     }
+    // Tests often pass narrow env objects; path resolution still needs host path variables.
     const processValue = process.env[key];
     if (processValue !== undefined) {
       merged[key] = processValue;
@@ -57,7 +61,8 @@ export function collectCandidateAgentDirs(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
 ): string[] {
   const dirs = new Set<string>();
-  dirs.add(resolveUserPath(resolveDefaultAgentDir(config, env), env));
+  dirs.add(resolveUserPath(resolveAgentDir(config, "main", env), env));
+  dirs.add(resolveUserPath(resolveLegacyInheritedAuthAgentDir(config, env), env));
   for (const agentId of listAgentIds(config)) {
     dirs.add(resolveUserPath(resolveAgentDir(config, agentId, env), env));
   }
@@ -73,38 +78,6 @@ export function resolveRefreshAgentDirs(
     return configDerived;
   }
   return uniqueStrings([...context.explicitAgentDirs, ...configDerived]);
-}
-
-function resolveCandidateAgentDirs(params: {
-  config: OpenClawConfig;
-  env: NodeJS.ProcessEnv | Record<string, string | undefined>;
-  agentDirs?: string[];
-}): string[] {
-  return params.agentDirs?.length
-    ? uniqueStrings(params.agentDirs.map((entry) => resolveUserPath(entry, params.env)))
-    : collectCandidateAgentDirs(params.config, params.env);
-}
-
-function hasCandidateAuthProfileStoreSource(agentDir: string): boolean {
-  return (
-    existsSync(path.join(agentDir, AUTH_PROFILE_FILENAME)) ||
-    existsSync(path.join(agentDir, AUTH_STATE_FILENAME)) ||
-    existsSync(path.join(agentDir, LEGACY_AUTH_FILENAME))
-  );
-}
-
-export function hasCandidateAuthProfileStoreSources(params: {
-  config: OpenClawConfig;
-  env: NodeJS.ProcessEnv | Record<string, string | undefined>;
-  agentDirs?: string[];
-}): boolean {
-  const candidateDirs = resolveCandidateAgentDirs(params);
-  const mainAgentDir = resolveUserPath(resolveDefaultAgentDir({}, params.env), params.env);
-  return (
-    candidateDirs.some((agentDir) => hasCandidateAuthProfileStoreSource(agentDir)) ||
-    hasCandidateAuthProfileStoreSource(mainAgentDir) ||
-    existsSync(resolveOAuthPath(params.env as NodeJS.ProcessEnv))
-  );
 }
 
 export function createEmptyRuntimeWebToolsMetadata(): RuntimeWebToolsMetadata {
@@ -125,53 +98,42 @@ function hasActiveRuntimeWebFetchProviderSurface(
   fetch: unknown,
   defaults: SecretDefaults | undefined,
 ): boolean {
-  if (!fetch || typeof fetch !== "object" || Array.isArray(fetch)) {
+  if (!isRecord(fetch)) {
     return false;
   }
-  const fetchConfig = fetch as Record<string, unknown>;
-  if (fetchConfig.enabled === false) {
+  if (fetch.enabled === false) {
     return false;
   }
-  if (typeof fetchConfig.provider === "string" && fetchConfig.provider.trim()) {
+  if (typeof fetch.provider === "string" && fetch.provider.trim()) {
     return true;
   }
-  return hasCredentialBearingObjectValue(fetchConfig, defaults);
+  return hasCredentialBearingObjectValue(fetch, defaults);
 }
 
 function hasRuntimeWebToolConfigSurface(config: OpenClawConfig): boolean {
   const web = config.tools?.web;
   const defaults = config.secrets?.defaults;
   const fetchExplicitlyDisabled =
-    web &&
-    typeof web === "object" &&
-    !Array.isArray(web) &&
-    typeof (web as Record<string, unknown>).fetch === "object" &&
-    (web as { fetch?: { enabled?: unknown } }).fetch?.enabled === false;
-  if (web && typeof web === "object" && !Array.isArray(web)) {
-    const webRecord = web as Record<string, unknown>;
-    if ("search" in webRecord || "x_search" in webRecord) {
+    isRecord(web) && typeof web.fetch === "object" && web.fetch?.enabled === false;
+  if (isRecord(web)) {
+    if ("search" in web) {
       return true;
     }
-    if (
-      "fetch" in webRecord &&
-      hasActiveRuntimeWebFetchProviderSurface(webRecord.fetch, defaults)
-    ) {
+    if ("fetch" in web && hasActiveRuntimeWebFetchProviderSurface(web.fetch, defaults)) {
       return true;
     }
   }
   const entries = config.plugins?.entries;
-  if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+  if (!isRecord(entries)) {
     return false;
   }
   return Object.values(entries).some((entry) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    if (!isRecord(entry)) {
       return false;
     }
-    const pluginConfig = (entry as { config?: unknown }).config;
+    const pluginConfig = entry.config;
     return (
-      !!pluginConfig &&
-      typeof pluginConfig === "object" &&
-      !Array.isArray(pluginConfig) &&
+      isRecord(pluginConfig) &&
       ("webSearch" in pluginConfig || (!fetchExplicitlyDisabled && "webFetch" in pluginConfig))
     );
   });
@@ -191,6 +153,9 @@ export function canUseSecretsRuntimeFastPath(params: {
   return !params.authStores.some((entry) => hasSecretRefCandidate(entry.store, defaults));
 }
 
+/**
+ * Prepares a runtime snapshot without resolving refs when config and auth stores contain none.
+ */
 export function prepareSecretsRuntimeFastPathSnapshot(params: {
   config: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -198,29 +163,29 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
   includeAuthStoreRefs?: boolean;
   loadAuthStore?: (agentDir?: string) => AuthProfileStore;
   loadablePluginOrigins?: ReadonlyMap<string, PluginOrigin>;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
 }): {
   snapshot: PreparedSecretsRuntimeSnapshot;
   refreshContext: SecretsRuntimeRefreshContext;
   usesAuthStoreFallback: boolean;
 } | null {
   const runtimeEnv = mergeSecretsRuntimeEnv(params.env);
-  const sourceConfig = structuredClone(params.config);
-  const resolvedConfig = structuredClone(params.config);
+  const authStoreCredentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
+  // Capture before store reads. A live mutation during preparation must advance past
+  // this watermark, or activation could overwrite it with the prepared candidate.
+  const authStoreSnapshotsRevision = getRuntimeAuthProfileStoreSnapshotsRevision();
+  const sourceConfig = cloneConfigWithResolutionFacts(params.config);
+  const resolvedConfig = cloneConfigWithResolutionFacts(params.config);
   const includeAuthStoreRefs = params.includeAuthStoreRefs ?? true;
-  const candidateDirs = resolveCandidateAgentDirs({
-    config: resolvedConfig,
-    env: runtimeEnv,
-    agentDirs: params.agentDirs,
-  });
+  const candidateDirs = params.agentDirs?.length
+    ? uniqueStrings(params.agentDirs.map((entry) => resolveUserPath(entry, runtimeEnv)))
+    : collectCandidateAgentDirs(resolvedConfig, runtimeEnv);
   let authStores: Array<{ agentDir: string; store: AuthProfileStore }> = [];
   if (includeAuthStoreRefs) {
     if (!params.loadAuthStore) {
       if (
-        hasCandidateAuthProfileStoreSources({
-          config: resolvedConfig,
-          env: runtimeEnv,
-          agentDirs: candidateDirs,
-        })
+        candidateDirs.some((agentDir) => existsSync(resolveAuthProfileDatabasePath(agentDir))) ||
+        existsSync(resolveSharedAuthStorePath(runtimeEnv))
       ) {
         return null;
       }
@@ -230,10 +195,12 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
       }));
     } else {
       const loadAuthStore = params.loadAuthStore;
-      authStores = candidateDirs.map((agentDir) => ({
-        agentDir,
-        store: structuredClone(loadAuthStore(agentDir)),
-      }));
+      authStores = candidateDirs.map((agentDir) => {
+        const source = loadAuthStore(agentDir);
+        const store = structuredClone(source);
+        copyCanonicalAuthProfileCredentialObservations(source.profiles, store.profiles);
+        return { agentDir, store };
+      });
     }
   }
   if (!canUseSecretsRuntimeFastPath({ sourceConfig, authStores })) {
@@ -242,8 +209,12 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
   const snapshot = {
     sourceConfig,
     config: resolvedConfig,
-    authStores,
+    authStores: prepareRuntimeAuthProfileStoreSnapshots(authStores, runtimeEnv),
+    authStoreCredentialsRevision,
+    authStoreSnapshotsRevision,
     warnings: [],
+    degradedOwners: [],
+    secretOwners: [],
     webTools: createEmptyRuntimeWebToolsMetadata(),
   };
   return {
@@ -254,6 +225,7 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
       explicitAgentDirs: params.agentDirs?.length ? [...candidateDirs] : null,
       includeAuthStoreRefs,
       loadablePluginOrigins: params.loadablePluginOrigins ?? new Map<string, PluginOrigin>(),
+      ...(params.manifestRegistry ? { manifestRegistry: params.manifestRegistry } : {}),
       ...(params.loadAuthStore ? { loadAuthStore: params.loadAuthStore } : {}),
     },
   };

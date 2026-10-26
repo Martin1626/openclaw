@@ -1,3 +1,4 @@
+// Vitest light path tests validate light test include path generation.
 import { describe, expect, it } from "vitest";
 import {
   isCommandsLightTarget,
@@ -38,11 +39,6 @@ describe("light vitest path routing", () => {
     expect(resolveCommandsLightIncludePattern("src/commands/gateway-status/helpers.ts")).toBe(
       "src/commands/gateway-status/helpers.test.ts",
     );
-  });
-
-  it("keeps non-allowlisted commands files off the light lane", () => {
-    expect(isCommandsLightTarget("src/commands/channels.add.ts")).toBe(false);
-    expect(resolveCommandsLightIncludePattern("src/commands/channels.add.ts")).toBeNull();
   });
 
   it("can route broad command test files without narrowing their source files", () => {

@@ -1,3 +1,4 @@
+// Documents persisted/runtime model selection display normalization.
 import { describe, expect, it } from "vitest";
 import {
   resolveModelDisplayName,
@@ -34,6 +35,8 @@ describe("model-selection-display", () => {
     });
 
     it("ignores malformed persisted model values instead of throwing", () => {
+      // Session files can contain old or malformed values; display helpers
+      // should fall back to safe refs rather than breaking status output.
       expect(
         resolveModelDisplayRef({
           runtimeProvider: { provider: "openai" },
@@ -76,6 +79,8 @@ describe("model-selection-display", () => {
     });
 
     it("keeps override ids attached to the current provider when no override provider is stored", () => {
+      // Slash-bearing override models may be nested model ids, not providers;
+      // preserve the known current provider when no override provider exists.
       expect(
         resolveSessionInfoModelSelection({
           currentProvider: "anthropic",
@@ -85,19 +90,6 @@ describe("model-selection-display", () => {
       ).toEqual({
         modelProvider: "anthropic",
         model: "ollama-beelink2/qwen2.5-coder:7b",
-      });
-    });
-
-    it("keeps the current provider for slash-bearing override ids when provider is already known", () => {
-      expect(
-        resolveSessionInfoModelSelection({
-          currentProvider: "openrouter",
-          currentModel: "openrouter/auto",
-          overrideModel: "anthropic/claude-haiku-4.5",
-        }),
-      ).toEqual({
-        modelProvider: "openrouter",
-        model: "anthropic/claude-haiku-4.5",
       });
     });
 

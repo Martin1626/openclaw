@@ -1,5 +1,11 @@
-import { parseStrictFiniteNumber } from "../shared/number-coercion.js";
+/** Coerces cron schedule time fields with strict Date-range parsing. */
+import {
+  asDateTimestampMs,
+  parseStrictFiniteNumber,
+} from "@openclaw/normalization-core/number-coercion";
 
+/** Coerces temporal schedule fields without accepting partial, non-finite, or invalid-Date values. */
 export function coerceFiniteScheduleNumber(value: unknown): number | undefined {
-  return parseStrictFiniteNumber(value);
+  const parsed = parseStrictFiniteNumber(value);
+  return asDateTimestampMs(parsed);
 }

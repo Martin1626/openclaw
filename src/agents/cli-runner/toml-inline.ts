@@ -1,4 +1,4 @@
-import { isRecord } from "../../shared/record-coerce.js";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 
 function escapeTomlString(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
@@ -22,6 +22,8 @@ export function serializeTomlInlineValue(value: unknown): string {
     return `[${value.map((entry) => serializeTomlInlineValue(entry)).join(", ")}]`;
   }
   if (isRecord(value)) {
+    // Inline table key ordering follows Object.entries input order, which callers
+    // control when deterministic override output matters.
     return `{ ${Object.entries(value)
       .map(([key, entry]) => `${formatTomlKey(key)} = ${serializeTomlInlineValue(entry)}`)
       .join(", ")} }`;

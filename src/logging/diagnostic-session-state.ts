@@ -21,7 +21,12 @@ export type ToolCallRecord = {
   argsHash: string;
   toolCallId?: string;
   runId?: string;
+  outcomeKind?: "tool-loop-veto" | "terminal-exec-failure" | "argument-validation";
   resultHash?: string;
+  // Keep the raw result identity while this bounded identity survives alias
+  // merges and lets the no-progress owner ignore diagnostic drift.
+  failureIdentityHash?: string;
+  noProgress?: true;
   unknownToolName?: string;
   timestamp: number;
 };
@@ -47,27 +52,36 @@ export function pruneDiagnosticSessionStates(now = Date.now(), force = false): v
   }
   lastSessionPruneAt = now;
 
-  for (const [key, state] of diagnosticSessionStates.entries()) {
+  let trackOldest = diagnosticSessionStates.size === SESSION_STATE_MAX_ENTRIES + 1;
+  let oldest: [string, SessionState] | undefined;
+  for (const entry of diagnosticSessionStates.entries()) {
+    const [key, state] = entry;
     const ageMs = now - state.lastActivity;
     const isIdle = state.state === "idle";
     if (isIdle && state.queueDepth <= 0 && ageMs > SESSION_STATE_TTL_MS) {
       diagnosticSessionStates.delete(key);
+      trackOldest = false;
+    } else if (trackOldest && (!oldest || state.lastActivity < oldest[1].lastActivity)) {
+      oldest = entry;
     }
   }
 
   if (diagnosticSessionStates.size <= SESSION_STATE_MAX_ENTRIES) {
     return;
   }
-  const excess = diagnosticSessionStates.size - SESSION_STATE_MAX_ENTRIES;
+  // Insertions normally exceed the cap by one; equal ages keep Map order.
+  if (oldest) {
+    diagnosticSessionStates.delete(oldest[0]);
+    return;
+  }
   const ordered = Array.from(diagnosticSessionStates.entries()).toSorted(
     (a, b) => a[1].lastActivity - b[1].lastActivity,
   );
-  for (let i = 0; i < excess; i += 1) {
-    const key = ordered[i]?.[0];
-    if (!key) {
+  for (const [key] of ordered) {
+    diagnosticSessionStates.delete(key);
+    if (diagnosticSessionStates.size <= SESSION_STATE_MAX_ENTRIES) {
       break;
     }
-    diagnosticSessionStates.delete(key);
   }
 }
 
@@ -109,6 +123,7 @@ function mergeSessionState(target: SessionState, source: SessionState): void {
   }
   target.generation = Math.max(target.generation ?? 0, source.generation ?? 0);
   target.lastActivity = Math.max(target.lastActivity, source.lastActivity);
+  // Queue depth is additive when session id/key aliases collapse into one diagnostic entry.
   target.queueDepth += source.queueDepth;
   target.activeQueuedTurn ||= source.activeQueuedTurn;
   target.lastStuckWarnAgeMs =
@@ -139,14 +154,20 @@ function mergeSessionState(target: SessionState, source: SessionState): void {
   }
 }
 
+/** Gets or creates diagnostic state, merging aliases that share a session id. */
 export function getDiagnosticSessionState(ref: SessionRef): SessionState {
   pruneDiagnosticSessionStates();
   const key = resolveSessionKey(ref);
   const direct = diagnosticSessionStates.get(key);
-  const sessionIdEntry = ref.sessionId ? findStateEntryBySessionId(ref.sessionId) : undefined;
+  // This owner merges id aliases before assigning them; an exact direct hit is already canonical.
+  const sessionIdEntry =
+    ref.sessionId && direct?.sessionId !== ref.sessionId
+      ? findStateEntryBySessionId(ref.sessionId)
+      : undefined;
   const existing = direct ?? sessionIdEntry?.[1];
   if (existing) {
     if (direct && sessionIdEntry && sessionIdEntry[1] !== direct) {
+      // A run may learn its stable session key after an id-only state exists; merge instead of losing counters.
       mergeSessionState(direct, sessionIdEntry[1]);
       diagnosticSessionStates.delete(sessionIdEntry[0]);
     } else if (!direct && ref.sessionKey && sessionIdEntry) {
@@ -174,7 +195,7 @@ export function getDiagnosticSessionState(ref: SessionRef): SessionState {
     queueDepth: 0,
   };
   diagnosticSessionStates.set(key, created);
-  pruneDiagnosticSessionStates(Date.now(), true);
+  pruneDiagnosticSessionStates();
   return created;
 }
 
@@ -186,8 +207,19 @@ export function peekDiagnosticSessionState(ref: SessionRef): SessionState | unde
   );
 }
 
-export function getDiagnosticSessionStateCountForTest(): number {
-  return diagnosticSessionStates.size;
+/** Retires collector observations without resetting independent tool-loop or poll policy. */
+export function retireDiagnosticSessionObservations(): void {
+  for (const state of diagnosticSessionStates.values()) {
+    // Recovery accepts one completion increment. A collector boundary must
+    // advance beyond that exception before this session can collect fresh work.
+    state.generation = (state.generation ?? 0) + 2;
+    state.state = "idle";
+    state.queueDepth = 0;
+    state.activeQueuedTurn = false;
+    state.lastActivity = Date.now();
+    state.lastStuckWarnAgeMs = undefined;
+    state.lastLongRunningWarnAgeMs = undefined;
+  }
 }
 
 export function resetDiagnosticSessionStateForTest(): void {

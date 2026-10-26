@@ -1,9 +1,9 @@
+/** Shared command-handler test harness and config fixtures. */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { configureTaskRegistryRuntime } from "../../tasks/task-registry.store.js";
 import type { MsgContext } from "../templating.js";
 import { buildCommandContext } from "./commands-context.js";
 import type { HandleCommandsParams } from "./commands-types.js";
-import { parseInlineDirectives } from "./directive-handling.parse.js";
+import { parseInlineSessionDirectives } from "./directive-handling.parse.js";
 
 export const baseCommandTestConfig = {
   commands: { text: true },
@@ -40,8 +40,9 @@ export function buildCommandTestParams(
   const params: HandleCommandsParams = {
     ctx,
     cfg,
+    agentId: "main",
     command,
-    directives: parseInlineDirectives(commandBody),
+    directives: parseInlineSessionDirectives(commandBody),
     elevated: { enabled: true, allowed: true, failures: [] },
     sessionKey: "agent:main:main",
     workspaceDir: options?.workspaceDir ?? "/tmp",
@@ -55,25 +56,6 @@ export function buildCommandTestParams(
     isGroup: false,
   };
   return params;
-}
-
-export function configureInMemoryTaskRegistryStoreForTests(): void {
-  configureTaskRegistryRuntime({
-    store: {
-      loadSnapshot: () => ({
-        tasks: new Map(),
-        deliveryStates: new Map(),
-      }),
-      saveSnapshot: () => {},
-      upsertTaskWithDeliveryState: () => {},
-      upsertTask: () => {},
-      deleteTaskWithDeliveryState: () => {},
-      deleteTask: () => {},
-      upsertDeliveryState: () => {},
-      deleteDeliveryState: () => {},
-      close: () => {},
-    },
-  });
 }
 
 export type ConfigSnapshotMock = {
@@ -123,6 +105,7 @@ export function buildPluginsCommandParams(params: {
       to: "test-bot",
     },
     sessionKey: "agent:main:whatsapp:direct:test-user",
+    agentId: "main",
     sessionEntry: {
       sessionId: "session-plugin-command",
       updatedAt: Date.now(),

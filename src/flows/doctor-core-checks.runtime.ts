@@ -1,409 +1,548 @@
-import { TOOL_NAME_SEPARATOR } from "../agents/agent-bundle-mcp-names.js";
-import {
-  type McpToolCatalogDiagnostic,
-  createBundleMcpToolRuntime,
-} from "../agents/agent-bundle-mcp-tools.js";
-import {
-  listAgentEntries,
-  listAgentIds,
-  resolveAgentWorkspaceDir,
-  resolveDefaultAgentId,
-} from "../agents/agent-scope.js";
-import { createOpenClawCodingTools } from "../agents/agent-tools.js";
-import { resolveEffectiveToolPolicy } from "../agents/agent-tools.policy.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
-import { applyFinalEffectiveToolPolicy } from "../agents/embedded-agent-runner/effective-tool-policy.js";
-import { shouldCreateBundleMcpRuntimeForAttempt } from "../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
-import {
-  findModelInCatalog,
-  loadModelCatalog,
-  type ModelCatalogEntry,
-} from "../agents/model-catalog.js";
-import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
-import { supportsModelTools } from "../agents/model-tool-support.js";
-import { normalizeAgentRuntimeTools } from "../agents/runtime-plan/tools.js";
-import { collectExplicitAllowlist, normalizeToolName } from "../agents/tool-policy.js";
-import {
-  inspectRuntimeToolInputSchemas,
-  type RuntimeToolSchemaDiagnostic,
-} from "../agents/tool-schema-projection.js";
-import type { AnyAgentTool } from "../agents/tools/common.js";
+import { formatUnsupportedNodeVersionMessage } from "../../node-version.mjs";
+import { tryResolveSoleAgentId } from "../agents/agent-scope.js";
+import { shouldManageGatewayService } from "../commands/doctor-service-repair-policy.js";
 import { collectUnavailableAgentSkills } from "../commands/doctor-skills-core.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isNodeRuntime } from "../daemon/runtime-binary.js";
+import { resolveNodeRuntimeInfo } from "../daemon/runtime-paths.js";
+import { summarizeGatewayServiceLayout } from "../daemon/service-layout.js";
+import { getSystemdCgroupHygieneSummary } from "../daemon/service-runtime.js";
+import { resolveGatewayService, readGatewayServiceState } from "../daemon/service.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
-import { getPluginToolMeta, setPluginToolMeta } from "../plugins/tools.js";
-import { normalizeAgentId } from "../routing/session-key.js";
-import { buildWorkspaceSkillStatus, type SkillStatusEntry } from "../skills/discovery/status.js";
-import type { HealthFinding } from "./health-checks.js";
+import { formatInstallOwnerMessage, readInstallOwner } from "../infra/install-owner.js";
+import { resolveOpenClawPackageRoot } from "../infra/openclaw-root.js";
+import {
+  formatLocalAudioSelection,
+  inspectLocalAudioSelection,
+} from "../media-understanding/local-audio.js";
+import type { ProviderCatalogOrder, ProviderPlugin } from "../plugins/types.js";
+import { buildWorkspaceSkillStatus } from "../skills/discovery/status.js";
+import type { HealthCheckContext, HealthFinding } from "./health-checks.js";
 
-type BundleMcpToolRuntime = Awaited<ReturnType<typeof createBundleMcpToolRuntime>>;
+const PROVIDER_CATALOG_ORDERS = ["simple", "profile", "paired", "late"] as const;
+const PROVIDER_CATALOG_ORDER_SET = new Set<ProviderCatalogOrder>(PROVIDER_CATALOG_ORDERS);
 
-export function detectUnavailableSkills(cfg: OpenClawConfig): SkillStatusEntry[] {
-  const agentId = resolveDefaultAgentId(cfg);
-  const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+export function detectUnavailableSkills(cfg: OpenClawConfig, workspaceDir: string) {
   const report = buildWorkspaceSkillStatus(workspaceDir, {
     config: cfg,
-    agentId,
+    agentId: tryResolveSoleAgentId(cfg),
   });
   return collectUnavailableAgentSkills(report);
 }
 
-function buildDoctorRuntimeModel(params: {
-  entry?: ModelCatalogEntry;
-  provider: string;
-  modelId: string;
-}): ProviderRuntimeModel {
-  const provider = params.provider || DEFAULT_PROVIDER;
-  const id = params.modelId || DEFAULT_MODEL;
-  const api =
-    provider === "openai-codex"
-      ? "openai-codex-responses"
-      : provider === "openai"
-        ? "openai-responses"
-        : undefined;
-  const baseUrl =
-    provider === "openai-codex"
-      ? "https://chatgpt.com/backend-api"
-      : provider === "openai"
-        ? "https://api.openai.com/v1"
-        : undefined;
-  return {
-    ...params.entry,
-    provider,
-    id,
-    name: params.entry?.name ?? id,
-    ...(api ? { api } : {}),
-    ...(baseUrl ? { baseUrl } : {}),
-  } as ProviderRuntimeModel;
+export async function collectLocalAudioAccelerationFindings(): Promise<readonly HealthFinding[]> {
+  const selection = await inspectLocalAudioSelection();
+  const available = selection.candidates.filter((candidate) => candidate.available);
+  if (available.length === 0) {
+    return [];
+  }
+  const summary = formatLocalAudioSelection(selection);
+  if (summary) {
+    return [
+      {
+        checkId: "core/doctor/local-audio-acceleration",
+        severity: "info",
+        message: `Local STT auto-selection: ${summary}.`,
+        path: "tools.media.models",
+      },
+    ];
+  }
+  const blockers = available
+    .map((candidate) => `${candidate.command}: ${candidate.reason}`)
+    .join("; ");
+  return [
+    {
+      checkId: "core/doctor/local-audio-acceleration",
+      severity: "info",
+      message: `Local STT commands were found but none are ready for auto-selection: ${blockers}.`,
+      path: "tools.media.models",
+      fixHint:
+        "Install the matching local model/runtime, or configure an audio-capable tools.media.models CLI entry.",
+    },
+  ];
 }
 
-function toolSchemaDiagnosticToFinding(params: {
-  agentId: string;
-  tools: readonly AnyAgentTool[];
-  diagnostic: RuntimeToolSchemaDiagnostic;
-}): HealthFinding {
-  const tool = params.tools[params.diagnostic.toolIndex];
-  const pluginId = tool ? getPluginToolMeta(tool)?.pluginId : undefined;
-  const owner = pluginId ? ` from plugin ${pluginId}` : "";
-  const agent = `Agent ${params.agentId} `;
-  const path =
-    pluginId === "bundle-mcp"
-      ? "mcp.servers"
-      : pluginId
-        ? `plugins.entries.${pluginId}`
-        : `tools.${params.diagnostic.toolName}`;
-  const fixHint =
-    pluginId === "bundle-mcp"
-      ? "Disable or update the offending MCP server/tool so its parameters are a JSON object schema, then rerun doctor."
-      : "Disable or update the offending plugin/tool so its parameters are a JSON object schema, then rerun doctor.";
-  return {
-    checkId: "core/doctor/runtime-tool-schemas",
-    severity: "error",
-    message: `${agent}tool ${params.diagnostic.toolName}${owner} has an unsupported input schema for runtime projection.`,
-    path,
-    target: params.diagnostic.toolName,
-    requirement: params.diagnostic.violations.join(", "),
-    fixHint,
-  };
-}
-
-function collectToolSchemaFindings(params: {
-  agentId: string;
-  tools: readonly AnyAgentTool[];
-}): HealthFinding[] {
-  return inspectRuntimeToolInputSchemas(params.tools).map((diagnostic) =>
-    toolSchemaDiagnosticToFinding({
-      agentId: params.agentId,
-      tools: params.tools,
-      diagnostic,
-    }),
+export async function collectGatewayDaemonFindings(
+  ctx: Pick<HealthCheckContext, "cfg">,
+): Promise<readonly HealthFinding[]> {
+  if (ctx.cfg.gateway?.mode === "remote" || !(await shouldManageGatewayService())) {
+    return [];
+  }
+  const service = resolveGatewayService();
+  const state = await readGatewayServiceState(service, { env: process.env });
+  const layout = await summarizeGatewayServiceLayout(state.command);
+  const serviceOwner = await readInstallOwner(
+    layout?.packageRootReal ?? layout?.packageRoot ?? null,
   );
+  const ownerHint = serviceOwner ? formatInstallOwnerMessage(serviceOwner) : undefined;
+  const findings: HealthFinding[] = [];
+  const warn = (message: string, fixHint: string, path = state.command?.sourcePath) => {
+    findings.push({
+      checkId: "core/doctor/gateway-daemon",
+      severity: "warning",
+      message,
+      path,
+      target: service.label,
+      fixHint,
+    });
+  };
+  if (state.loadState.status === "unknown") {
+    warn(
+      `Gateway service status could not be determined: ${state.loadState.detail}`,
+      ownerHint ??
+        service.unsupportedReason ??
+        "Run `openclaw gateway status --deep`, restore service-manager access, and retry.",
+    );
+    return findings;
+  }
+  if (!state.installed) {
+    const owner = await readInstallOwner(
+      await resolveOpenClawPackageRoot({ moduleUrl: import.meta.url, argv1: process.argv[1] }),
+    );
+    if (owner) {
+      return [
+        {
+          checkId: "core/doctor/gateway-daemon",
+          severity: "info",
+          message: formatInstallOwnerMessage(owner),
+          target: owner.displayName,
+        },
+      ];
+    }
+    warn(
+      "Gateway service is not installed.",
+      "Run `openclaw gateway install` to install the service.",
+      "gateway.mode",
+    );
+    return findings;
+  }
+  const nodePath = state.command?.programArguments[0];
+  if (nodePath && isNodeRuntime(nodePath)) {
+    const runtime = await resolveNodeRuntimeInfo(nodePath, state.env);
+    const message =
+      runtime.status === "probe-failed" ? runtime.error.message : runtime.capabilityError;
+    if (message) {
+      findings.push({
+        checkId: "core/doctor/gateway-daemon",
+        severity: runtime.status === "supported" ? "info" : "warning",
+        message,
+        path: state.command?.sourcePath,
+        target: nodePath,
+        ...(runtime.status !== "supported"
+          ? {
+              fixHint:
+                ownerHint ??
+                [
+                  ...(runtime.status === "unsupported"
+                    ? [formatUnsupportedNodeVersionMessage(runtime.version)]
+                    : []),
+                  "Repair the Node runtime, then run `openclaw gateway install`.",
+                ].join("\n"),
+            }
+          : {}),
+      });
+    }
+  }
+  if (state.loadState.status === "not-loaded") {
+    warn(
+      "Gateway service is installed but not loaded.",
+      ownerHint ?? "Start the installed service with `openclaw gateway start`.",
+    );
+  }
+  const runtime = state.runtime;
+  const status = runtime?.status ?? runtime?.state ?? runtime?.subState;
+  if (state.loadState.status === "loaded" && !state.running) {
+    warn(
+      status
+        ? `Gateway service runtime is ${status}, not running.`
+        : "Gateway service is loaded but runtime status could not confirm it is running.",
+      "Run `openclaw gateway status --deep` to inspect the service before choosing a recovery action.",
+    );
+  }
+  if (state.runtime?.missingGuiSession) {
+    warn(
+      "Gateway service cannot attach to the user GUI session.",
+      state.runtime.detail ?? "Log into a GUI session, then rerun doctor.",
+    );
+  }
+  if (state.runtime?.missingUnit) {
+    warn(
+      "Gateway service supervision metadata is missing.",
+      ownerHint ?? state.runtime.detail ?? "Reinstall or reload the Gateway service.",
+    );
+  }
+  const hygiene = getSystemdCgroupHygieneSummary(state.runtime?.systemd);
+  if (hygiene) {
+    warn(
+      `Gateway systemd service has risky ${hygiene}.`,
+      "Repair the systemd unit so stale child processes are cleaned up reliably.",
+    );
+  }
+  return findings;
 }
 
-function collectBundleMcpRuntimeToolSchemaFindings(params: {
-  bundleRuntime: BundleMcpToolRuntime;
-  cfg: OpenClawConfig;
-  agentId: string;
-  workspaceDir: string;
-  modelRef: { provider: string; model: string };
-  model: ProviderRuntimeModel;
-}): readonly HealthFinding[] {
-  const activeBundleTools = applyFinalEffectiveToolPolicy({
-    bundledTools: params.bundleRuntime.tools,
-    config: params.cfg,
-    agentId: params.agentId,
-    modelProvider: params.modelRef.provider,
-    modelId: params.modelRef.model,
-    warn: () => {},
-  });
-  const normalizedTools = normalizeAgentRuntimeTools({
-    tools: activeBundleTools,
-    provider: params.modelRef.provider,
-    config: params.cfg,
-    workspaceDir: params.workspaceDir,
-    env: process.env,
-    modelId: params.modelRef.model,
-    modelApi: params.model.api,
-    model: params.model,
-  });
-  return collectToolSchemaFindings({
-    agentId: params.agentId,
-    tools: normalizedTools,
-  });
-}
-
-function bundleMcpRuntimeLoadFailureFinding(error: unknown): HealthFinding {
+function providerCatalogProjectionFinding(
+  params: { providerId: string; pluginId?: string },
+  message: string,
+  error: unknown,
+): HealthFinding {
+  const path = params.pluginId ? `plugins.entries.${params.pluginId}` : undefined;
   return {
-    checkId: "core/doctor/runtime-tool-schemas",
+    checkId: "core/doctor/provider-catalog-projection",
     severity: "error",
-    message: "Configured MCP tool schema validation could not load the runtime tool set.",
-    path: "mcp.servers",
+    message,
+    ...(path ? { path } : {}),
+    target: params.providerId,
     requirement: formatErrorMessage(error),
     fixHint:
-      "Fix or disable the offending MCP server, then rerun doctor before relying on assistant tool startup.",
+      "Fix the plugin provider catalog hook or disable the plugin, then rerun doctor before relying on model discovery.",
   };
 }
 
-function bundleMcpRuntimeDiagnosticFinding(diagnostic: McpToolCatalogDiagnostic): HealthFinding {
-  return {
-    checkId: "core/doctor/runtime-tool-schemas",
-    severity: "error",
-    message: `Configured MCP server "${diagnostic.serverName}" could not expose runtime tools for schema validation.`,
-    path: `mcp.servers.${diagnostic.serverName}`,
-    requirement: diagnostic.message,
-    fixHint:
-      "Fix or disable the offending MCP server, then rerun doctor before relying on assistant tool startup.",
-  };
+function isReadableRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
 }
 
-function makeBundleMcpDiagnosticSentinel(name: string): AnyAgentTool {
-  const sentinel: AnyAgentTool = {
-    name,
-    label: "Bundle MCP diagnostic",
-    description: "Internal doctor sentinel for bundle MCP schema diagnostics.",
-    parameters: { type: "object", properties: {} },
-    execute: async () => ({ content: [], details: {} }),
-  } as AnyAgentTool;
-  setPluginToolMeta(sentinel, { pluginId: "bundle-mcp", optional: false });
-  return sentinel;
+function isTrimmedNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && value.length > 0;
 }
 
-function synthesizeBundleMcpAllowlistSentinelName(params: {
-  safeServerName: string;
-  allowlistEntry: string;
-}): string | undefined {
-  const normalized = normalizeToolName(params.allowlistEntry);
-  const serverPrefix = normalizeToolName(`${params.safeServerName}${TOOL_NAME_SEPARATOR}`);
-  if (normalized.startsWith(serverPrefix)) {
-    return normalized;
+function readProviderCatalogValue(params: {
+  value: unknown;
+  key: string;
+  providerId: string;
+  pluginId?: string;
+}): { ok: true; value: unknown } | { ok: false; finding: HealthFinding } {
+  if (!isReadableRecord(params.value)) {
+    return { ok: true, value: undefined };
   }
-  const separatorIndex = normalized.lastIndexOf(TOOL_NAME_SEPARATOR);
-  if (separatorIndex < 0) {
-    return undefined;
-  }
-  const toolPattern = normalized.slice(separatorIndex + TOOL_NAME_SEPARATOR.length);
-  if (!toolPattern) {
-    return undefined;
-  }
-  const concreteToolName = toolPattern.replace(/\*/g, "diagnostic").replace(/\?/g, "x");
-  return `${params.safeServerName}${TOOL_NAME_SEPARATOR}${concreteToolName}`;
-}
-
-function collectBundleMcpDiagnosticSentinels(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  modelRef: { provider: string; model: string };
-  diagnostic: McpToolCatalogDiagnostic;
-}): AnyAgentTool[] {
-  const sentinels = [
-    makeBundleMcpDiagnosticSentinel(
-      `${params.diagnostic.safeServerName}${TOOL_NAME_SEPARATOR}runtime_schema`,
-    ),
-  ];
-  const effectivePolicy = resolveEffectiveToolPolicy({
-    config: params.cfg,
-    agentId: params.agentId,
-    modelProvider: params.modelRef.provider,
-    modelId: params.modelRef.model,
-  });
-  const explicitAllowlist = collectExplicitAllowlist([
-    effectivePolicy.globalPolicy,
-    effectivePolicy.globalProviderPolicy,
-    effectivePolicy.agentPolicy,
-    effectivePolicy.agentProviderPolicy,
-    effectivePolicy.profileAlsoAllow ? { allow: effectivePolicy.profileAlsoAllow } : undefined,
-    effectivePolicy.providerProfileAlsoAllow
-      ? { allow: effectivePolicy.providerProfileAlsoAllow }
-      : undefined,
-  ]);
-  if (explicitAllowlist.length === 0) {
-    return sentinels;
-  }
-
-  for (const entry of explicitAllowlist) {
-    const sentinelName = synthesizeBundleMcpAllowlistSentinelName({
-      safeServerName: params.diagnostic.safeServerName,
-      allowlistEntry: entry,
-    });
-    if (sentinelName) {
-      sentinels.push(makeBundleMcpDiagnosticSentinel(sentinelName));
-    }
-  }
-  return sentinels;
-}
-
-function shouldReportBundleMcpRuntimeDiagnostic(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  modelRef: { provider: string; model: string };
-  diagnostic: McpToolCatalogDiagnostic;
-}): boolean {
-  return (
-    applyFinalEffectiveToolPolicy({
-      bundledTools: collectBundleMcpDiagnosticSentinels(params),
-      config: params.cfg,
-      agentId: params.agentId,
-      modelProvider: params.modelRef.provider,
-      modelId: params.modelRef.model,
-      warn: () => {},
-    }).length > 0
-  );
-}
-
-function filterPolicyActiveBundleMcpDiagnostics(params: {
-  diagnostics: readonly McpToolCatalogDiagnostic[];
-  cfg: OpenClawConfig;
-  agentId: string;
-  modelRef: { provider: string; model: string };
-}): readonly McpToolCatalogDiagnostic[] {
-  return params.diagnostics.filter((diagnostic) =>
-    shouldReportBundleMcpRuntimeDiagnostic({
-      cfg: params.cfg,
-      agentId: params.agentId,
-      modelRef: params.modelRef,
-      diagnostic,
-    }),
-  );
-}
-
-function isAcpRuntimeAgent(cfg: OpenClawConfig, agentId: string): boolean {
-  const entry = listAgentEntries(cfg).find(
-    (candidate) => normalizeAgentId(candidate.id) === agentId,
-  );
-  return entry?.runtime?.type === "acp";
-}
-
-export async function collectRuntimeToolSchemaFindings(
-  cfg: OpenClawConfig,
-): Promise<readonly HealthFinding[]> {
-  const catalog = await loadModelCatalog({ config: cfg });
-  const findings: HealthFinding[] = [];
-  const bundleRuntimeByWorkspace = new Map<string, BundleMcpToolRuntime>();
-  const bundleRuntimeLoadErrorsByWorkspace = new Map<string, HealthFinding>();
-  const reportedBundleRuntimeLoadErrors = new Set<string>();
   try {
-    for (const agentId of listAgentIds(cfg)) {
-      if (isAcpRuntimeAgent(cfg, agentId)) {
-        continue;
-      }
-      const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-      const modelRef = resolveDefaultModelForAgent({
-        cfg,
-        agentId,
-        allowPluginNormalization: true,
-      });
-      const model = buildDoctorRuntimeModel({
-        entry: findModelInCatalog(catalog, modelRef.provider, modelRef.model),
-        provider: modelRef.provider,
-        modelId: modelRef.model,
-      });
-      if (!supportsModelTools(model)) {
-        continue;
-      }
-      const tools = createOpenClawCodingTools({
-        agentId,
-        workspaceDir,
-        config: cfg,
-        modelProvider: modelRef.provider,
-        modelId: modelRef.model,
-        modelApi: model.api,
-        modelCompat: model.compat,
-        modelContextWindowTokens: model.contextWindow,
-        allowGatewaySubagentBinding: true,
-        emitBeforeToolCallDiagnostics: false,
-      });
-      const normalizedTools = normalizeAgentRuntimeTools({
-        tools,
-        provider: modelRef.provider,
-        config: cfg,
-        workspaceDir,
-        env: process.env,
-        modelId: modelRef.model,
-        modelApi: model.api,
-        model,
-      });
-      findings.push(
-        ...collectToolSchemaFindings({
-          agentId,
-          tools: normalizedTools,
-        }),
-      );
-      if (!shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true })) {
-        continue;
-      }
-      if (
-        !bundleRuntimeByWorkspace.has(workspaceDir) &&
-        !bundleRuntimeLoadErrorsByWorkspace.has(workspaceDir)
-      ) {
-        try {
-          bundleRuntimeByWorkspace.set(
-            workspaceDir,
-            await createBundleMcpToolRuntime({
-              workspaceDir,
-              cfg,
-            }),
-          );
-        } catch (error) {
-          bundleRuntimeLoadErrorsByWorkspace.set(
-            workspaceDir,
-            bundleMcpRuntimeLoadFailureFinding(error),
-          );
-        }
-      }
-      const bundleRuntimeLoadError = bundleRuntimeLoadErrorsByWorkspace.get(workspaceDir);
-      if (bundleRuntimeLoadError) {
-        if (!reportedBundleRuntimeLoadErrors.has(workspaceDir)) {
-          findings.push(bundleRuntimeLoadError);
-          reportedBundleRuntimeLoadErrors.add(workspaceDir);
-        }
-        continue;
-      }
-      const bundleRuntime = bundleRuntimeByWorkspace.get(workspaceDir);
-      if (bundleRuntime) {
-        if (bundleRuntime.diagnostics && bundleRuntime.diagnostics.length > 0) {
-          const policyActiveDiagnostics = filterPolicyActiveBundleMcpDiagnostics({
-            diagnostics: bundleRuntime.diagnostics,
-            cfg,
-            agentId,
-            modelRef,
-          });
-          findings.push(...policyActiveDiagnostics.map(bundleMcpRuntimeDiagnosticFinding));
-        }
+    return { ok: true, value: params.value[params.key] };
+  } catch (error) {
+    return {
+      ok: false,
+      finding: providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} entry cannot be read during doctor validation.`,
+        error,
+      ),
+    };
+  }
+}
+
+function collectProviderCatalogModelFindings(params: {
+  providerId: string;
+  pluginId?: string;
+  models: unknown;
+}): HealthFinding[] {
+  const findings: HealthFinding[] = [];
+  let models: unknown[];
+  try {
+    if (!Array.isArray(params.models)) {
+      return [
+        providerCatalogProjectionFinding(
+          params,
+          `Provider catalog ${params.providerId} models value is invalid during doctor validation.`,
+          new Error("models must be an array"),
+        ),
+      ];
+    }
+    models = params.models;
+  } catch (error) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} models value cannot be checked during doctor validation.`,
+        error,
+      ),
+    ];
+  }
+  let modelEntries: unknown[];
+  try {
+    modelEntries = [...models];
+  } catch (error) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} model rows cannot be enumerated during doctor validation.`,
+        error,
+      ),
+    ];
+  }
+  for (const [index, model] of modelEntries.entries()) {
+    try {
+      const modelId = isReadableRecord(model) ? model.id : undefined;
+      if (!isTrimmedNonEmptyString(modelId)) {
         findings.push(
-          ...collectBundleMcpRuntimeToolSchemaFindings({
-            bundleRuntime,
-            cfg,
-            agentId,
-            workspaceDir,
-            modelRef,
-            model,
-          }),
+          providerCatalogProjectionFinding(
+            params,
+            `Provider catalog ${params.providerId} model row ${index} has an invalid model id.`,
+            new Error("model id must be a non-empty trimmed string"),
+          ),
         );
       }
+      const modelName = isReadableRecord(model) ? model.name : undefined;
+      if (modelName !== undefined && typeof modelName !== "string") {
+        findings.push(
+          providerCatalogProjectionFinding(
+            params,
+            `Provider catalog ${params.providerId} model row ${index} has an invalid model name.`,
+            new Error("model name must be a string when present"),
+          ),
+        );
+      }
+    } catch (error) {
+      findings.push(
+        providerCatalogProjectionFinding(
+          params,
+          `Provider catalog ${params.providerId} entry cannot be read during doctor validation.`,
+          error,
+        ),
+      );
     }
-  } finally {
-    await Promise.all([...bundleRuntimeByWorkspace.values()].map((runtime) => runtime.dispose()));
+  }
+  return findings;
+}
+
+function collectProviderCatalogResultFindings(params: {
+  providerId: string;
+  pluginId?: string;
+  result: unknown;
+}): HealthFinding[] {
+  const readValue = (value: unknown, key: string, providerId = params.providerId) =>
+    readProviderCatalogValue({ value, key, providerId, pluginId: params.pluginId });
+  const collectModels = (value: unknown, providerId = params.providerId) => {
+    const models = readValue(value, "models", providerId);
+    return models.ok
+      ? collectProviderCatalogModelFindings({
+          providerId,
+          pluginId: params.pluginId,
+          models: models.value,
+        })
+      : [models.finding];
+  };
+  if (params.result == null) {
+    return [];
+  }
+  if (!isReadableRecord(params.result)) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} result is invalid during doctor validation.`,
+        new Error("result must be an object"),
+      ),
+    ];
+  }
+  let hasProvider: boolean;
+  try {
+    hasProvider = "provider" in params.result;
+  } catch (error) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} result keys cannot be checked during doctor validation.`,
+        error,
+      ),
+    ];
+  }
+  const provider = readValue(params.result, "provider");
+  if (!provider.ok) {
+    return [provider.finding];
+  }
+  if (hasProvider && !isReadableRecord(provider.value)) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} provider value is invalid during doctor validation.`,
+        new Error("provider must be an object"),
+      ),
+    ];
+  }
+  if (isReadableRecord(provider.value)) {
+    return collectModels(provider.value);
+  }
+
+  const providers = readValue(params.result, "providers");
+  if (!providers.ok) {
+    return [providers.finding];
+  }
+  if (!isReadableRecord(providers.value)) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} result is invalid during doctor validation.`,
+        new Error("result must include provider or providers object"),
+      ),
+    ];
+  }
+  let providerIds: string[];
+  try {
+    providerIds = Object.keys(providers.value);
+  } catch (error) {
+    return [
+      providerCatalogProjectionFinding(
+        params,
+        `Provider catalog ${params.providerId} provider entries cannot be enumerated during doctor validation.`,
+        error,
+      ),
+    ];
+  }
+  const findings: HealthFinding[] = [];
+  for (const providerId of providerIds) {
+    if (!isTrimmedNonEmptyString(providerId)) {
+      findings.push(
+        providerCatalogProjectionFinding(
+          params,
+          `Provider catalog ${params.providerId} provider key is invalid during doctor validation.`,
+          new Error("provider key must be a non-empty trimmed string"),
+        ),
+      );
+      continue;
+    }
+    const providerConfig = readValue(providers.value, providerId, providerId);
+    if (!providerConfig.ok) {
+      findings.push(providerConfig.finding);
+      continue;
+    }
+    if (!isReadableRecord(providerConfig.value)) {
+      findings.push(
+        providerCatalogProjectionFinding(
+          { providerId, pluginId: params.pluginId },
+          `Provider catalog ${providerId} provider entry is invalid during doctor validation.`,
+          new Error("provider entry must be an object"),
+        ),
+      );
+      continue;
+    }
+    findings.push(...collectModels(providerConfig.value, providerId));
+  }
+  return findings;
+}
+
+function groupProviderCatalogsForDoctor(providers: readonly ProviderPlugin[]): {
+  findings: HealthFinding[];
+  byOrder: Record<ProviderCatalogOrder, ProviderPlugin[]>;
+} {
+  const findings: HealthFinding[] = [];
+  const byOrder: Record<ProviderCatalogOrder, ProviderPlugin[]> = {
+    simple: [],
+    profile: [],
+    paired: [],
+    late: [],
+  };
+  for (const provider of providers) {
+    let order: ProviderCatalogOrder = "late";
+    try {
+      const declaredOrder = provider.staticCatalog?.order ?? "late";
+      if (PROVIDER_CATALOG_ORDER_SET.has(declaredOrder)) {
+        order = declaredOrder;
+      } else {
+        findings.push(
+          providerCatalogProjectionFinding(
+            { providerId: provider.id, pluginId: provider.pluginId },
+            `Provider catalog ${provider.id} order is invalid during doctor validation.`,
+            new Error("order must be simple, profile, paired, or late"),
+          ),
+        );
+      }
+    } catch (error) {
+      findings.push(
+        providerCatalogProjectionFinding(
+          { providerId: provider.id, pluginId: provider.pluginId },
+          `Provider catalog ${provider.id} order cannot be read during doctor validation.`,
+          error,
+        ),
+      );
+    }
+    byOrder[order].push(provider);
+  }
+  for (const order of PROVIDER_CATALOG_ORDERS) {
+    byOrder[order].sort((a, b) => a.label.localeCompare(b.label));
+  }
+  return { findings, byOrder };
+}
+
+export async function collectProviderCatalogProjectionFindings(
+  cfg: OpenClawConfig,
+  workspaceDir?: string,
+): Promise<readonly HealthFinding[]> {
+  const { runProviderStaticCatalog } = await import("../plugins/provider-discovery.js");
+  const { resolvePluginProvidersCore } = await import("../plugins/providers.runtime.js");
+  const env = process.env;
+  let providers: Awaited<ReturnType<typeof resolvePluginProvidersCore>>;
+  try {
+    providers = resolvePluginProvidersCore({
+      config: cfg,
+      workspaceDir,
+      env,
+      includeUntrustedWorkspacePlugins: false,
+    });
+  } catch (error) {
+    return [
+      {
+        checkId: "core/doctor/provider-catalog-projection",
+        severity: "error",
+        message: "Provider catalog hooks could not be loaded for doctor validation.",
+        requirement: formatErrorMessage(error),
+        fixHint: "Fix plugin provider discovery loading, then rerun doctor.",
+      },
+    ];
+  }
+
+  const findings: HealthFinding[] = [];
+  const grouped = groupProviderCatalogsForDoctor(providers);
+  findings.push(...grouped.findings);
+  for (const order of PROVIDER_CATALOG_ORDERS) {
+    for (const provider of grouped.byOrder[order]) {
+      let staticCatalog: unknown;
+      let staticCatalogRun: unknown;
+      try {
+        staticCatalog = provider.staticCatalog;
+        staticCatalogRun = isReadableRecord(staticCatalog) ? staticCatalog.run : undefined;
+      } catch (error) {
+        findings.push(
+          providerCatalogProjectionFinding(
+            { providerId: provider.id, pluginId: provider.pluginId },
+            `Provider catalog ${provider.id} static catalog hook cannot be read during doctor validation.`,
+            error,
+          ),
+        );
+        continue;
+      }
+      if (staticCatalog === undefined) {
+        continue;
+      }
+      if (typeof staticCatalogRun !== "function") {
+        findings.push(
+          providerCatalogProjectionFinding(
+            { providerId: provider.id, pluginId: provider.pluginId },
+            `Provider catalog ${provider.id} static catalog hook is invalid during doctor validation.`,
+            new Error("static catalog run must be a function"),
+          ),
+        );
+        continue;
+      }
+      let result: Awaited<ReturnType<typeof runProviderStaticCatalog>>;
+      try {
+        result = await runProviderStaticCatalog({ provider });
+      } catch (error) {
+        findings.push(
+          providerCatalogProjectionFinding(
+            { providerId: provider.id, pluginId: provider.pluginId },
+            `Provider catalog ${provider.id} failed during doctor validation.`,
+            error,
+          ),
+        );
+        continue;
+      }
+      findings.push(
+        ...collectProviderCatalogResultFindings({
+          providerId: provider.id,
+          pluginId: provider.pluginId,
+          result,
+        }),
+      );
+    }
   }
   return findings;
 }

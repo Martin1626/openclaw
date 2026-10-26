@@ -1,3 +1,4 @@
+import { resolveMigrationConfigRuntime } from "openclaw/plugin-sdk/migration";
 import type { MigrationProviderContext } from "openclaw/plugin-sdk/plugin-entry";
 import { applyAuthProfileConfig, type OpenClawConfig } from "openclaw/plugin-sdk/provider-auth";
 
@@ -9,7 +10,7 @@ export type HermesAuthProfileConfig = {
   displayName?: string;
 };
 
-export type HermesAuthConfigApplyResult = "configured" | "conflict" | "unavailable";
+type HermesAuthConfigApplyResult = "configured" | "conflict" | "unavailable";
 
 class HermesAuthConfigConflict extends Error {}
 
@@ -51,7 +52,8 @@ export function hasCurrentAuthProfileConfigConflict(
 ): boolean {
   let config = ctx.config;
   try {
-    config = (ctx.runtime?.config?.current?.() as OpenClawConfig | undefined) ?? config;
+    config =
+      (resolveMigrationConfigRuntime(ctx)?.current?.() as OpenClawConfig | undefined) ?? config;
   } catch {
     // Fall back to the planning snapshot; apply still rechecks inside mutate.
   }
@@ -63,7 +65,7 @@ export async function applyAuthProfileConfigWithConflictCheck(params: {
   profile: HermesAuthProfileConfig;
   applyConfigPatch?: (config: OpenClawConfig) => OpenClawConfig;
 }): Promise<HermesAuthConfigApplyResult> {
-  const configApi = params.ctx.runtime?.config;
+  const configApi = resolveMigrationConfigRuntime(params.ctx);
   if (!configApi?.current || !configApi.mutateConfigFile) {
     return "unavailable";
   }

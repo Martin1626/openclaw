@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { tryProcessCwd } from "./safe-cwd.js";
 
 type IsMainModuleOptions = {
   currentFile: string;
@@ -19,20 +20,14 @@ function normalizePathCandidate(candidate: string | undefined, cwd: string): str
 
   const resolved = path.resolve(cwd, candidate);
   try {
+    // Compare real paths so symlinked package bins and resolved entry files still match.
     return fs.realpathSync.native(resolved);
   } catch {
     return resolved;
   }
 }
 
-function resolveDefaultCwd(currentFile: string): string {
-  try {
-    return process.cwd();
-  } catch {
-    return path.dirname(currentFile);
-  }
-}
-
+/** Detects whether a module is executing as the process entrypoint, including wrapper launches. */
 export function isMainModule({
   currentFile,
   argv = process.argv,
@@ -40,7 +35,7 @@ export function isMainModule({
   cwd,
   wrapperEntryPairs = [],
 }: IsMainModuleOptions): boolean {
-  const resolvedCwd = cwd ?? resolveDefaultCwd(currentFile);
+  const resolvedCwd = cwd ?? tryProcessCwd() ?? path.dirname(currentFile);
   const normalizedCurrent = normalizePathCandidate(currentFile, resolvedCwd);
   const normalizedArgv1 = normalizePathCandidate(argv[1], resolvedCwd);
 
@@ -59,13 +54,10 @@ export function isMainModule({
   if (normalizedCurrent && normalizedArgv1 && wrapperEntryPairs.length > 0) {
     const currentBase = path.basename(normalizedCurrent);
     const argvBase = path.basename(normalizedArgv1);
-    const matched = wrapperEntryPairs.some(
+    return wrapperEntryPairs.some(
       ({ wrapperBasename, entryBasename }) =>
         currentBase === entryBasename && argvBase === wrapperBasename,
     );
-    if (matched) {
-      return true;
-    }
   }
 
   return false;

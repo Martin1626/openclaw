@@ -1,33 +1,14 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { readEmbeddingVectors } from "./embedding-vectors.js";
+import {
+  addEmbeddingErrorContext,
+  debugEmbeddingsLog,
+  embeddingResponseLogMeta,
+} from "./embeddings-debug.js";
+import type { SsrFPolicy } from "./openclaw-runtime-network.js";
 import { postJson } from "./post-json.js";
-import type { SsrFPolicy } from "./ssrf-policy.js";
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function malformedEmbeddingResponse(errorPrefix: string): Error {
-  return new Error(`${errorPrefix}: malformed JSON response`);
-}
-
-function readEmbeddingVector(value: unknown, errorPrefix: string): number[] {
-  if (!Array.isArray(value)) {
-    throw malformedEmbeddingResponse(errorPrefix);
-  }
-  for (const entry of value) {
-    if (typeof entry !== "number" || !Number.isFinite(entry)) {
-      throw malformedEmbeddingResponse(errorPrefix);
-    }
-  }
-  return value;
-}
-
-function resolveExpectedEmbeddingCount(body: unknown): number | undefined {
-  const input = asRecord(body)?.input;
-  return Array.isArray(input) ? input.length : undefined;
-}
-
+/** POST an embedding request and return validated vectors in request order. */
 export async function fetchRemoteEmbeddingVectors(params: {
   url: string;
   headers: Record<string, string>;
@@ -37,30 +18,24 @@ export async function fetchRemoteEmbeddingVectors(params: {
   body: unknown;
   errorPrefix: string;
 }): Promise<number[][]> {
+  const body = asOptionalRecord(params.body);
+  const inputCount = Array.isArray(body?.input) ? body.input.length : undefined;
+  const model = typeof body?.model === "string" ? body.model : "unknown";
+  const errorPrefix = `${params.errorPrefix} (model: ${model}, batch size: ${inputCount ?? "unknown"})`;
+  const context = { context: errorPrefix, inputCount };
+  debugEmbeddingsLog("memory embeddings: remote request", context);
   return await postJson({
-    url: params.url,
-    headers: params.headers,
-    ssrfPolicy: params.ssrfPolicy,
-    fetchImpl: params.fetchImpl,
-    signal: params.signal,
-    body: params.body,
-    errorPrefix: params.errorPrefix,
-    parse: (payload) => {
-      const root = asRecord(payload);
-      if (!root || !Array.isArray(root.data)) {
-        throw malformedEmbeddingResponse(params.errorPrefix);
-      }
-      const expectedCount = resolveExpectedEmbeddingCount(params.body);
-      if (expectedCount !== undefined && root.data.length !== expectedCount) {
-        throw malformedEmbeddingResponse(params.errorPrefix);
-      }
-      return root.data.map((entry) => {
-        const record = asRecord(entry);
-        if (!record) {
-          throw malformedEmbeddingResponse(params.errorPrefix);
-        }
-        return readEmbeddingVector(record.embedding, params.errorPrefix);
+    ...params,
+    mapResponseError: (error) => addEmbeddingErrorContext(error, params.errorPrefix, errorPrefix),
+    onResponse: (res) => {
+      debugEmbeddingsLog("memory embeddings: remote response", {
+        ...context,
+        ...embeddingResponseLogMeta(res),
       });
+    },
+    parse: (payload) => {
+      const data = asOptionalRecord(payload)?.data;
+      return readEmbeddingVectors(data, inputCount, errorPrefix);
     },
   });
 }

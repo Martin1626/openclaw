@@ -1,58 +1,118 @@
+import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
 import { isPlainObject } from "../utils.js";
-import { normalizeToolName } from "./tool-policy.js";
+import { normalizeToolPolicyName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
 export const CODE_MODE_EXEC_TOOL_NAME = "exec";
 export const CODE_MODE_WAIT_TOOL_NAME = "wait";
-export const CODE_MODE_EXEC_TOOL_KIND = "code_mode_exec";
+const CODE_MODE_EXEC_TOOL_KIND = "code_mode_exec";
 
-export type CodeModeExecToolKind = typeof CODE_MODE_EXEC_TOOL_KIND;
-export type CodeModeExecToolInputKind = "javascript" | "typescript";
-export type CodeModeExecHookMetadata = {
-  toolKind: CodeModeExecToolKind;
+type CodeModeExecToolInputKind = "javascript";
+type CodeModeExecHookMetadata = {
+  toolKind: typeof CODE_MODE_EXEC_TOOL_KIND;
   toolInputKind?: CodeModeExecToolInputKind;
 };
 
-const codeModeControlTools = new WeakSet<AnyAgentTool>();
+const codeModeControlTools = new WeakSet<object>();
+type CodeModeExecDescriptionTarget = Pick<AnyAgentTool, "description">;
+type CodeModeExecDescriptionState = {
+  description: string;
+  targets: Set<WeakRef<CodeModeExecDescriptionTarget>>;
+};
+const codeModeExecDescriptionTargets = new WeakMap<
+  object,
+  { state: CodeModeExecDescriptionState; reference: WeakRef<CodeModeExecDescriptionTarget> }
+>();
 
 export function markCodeModeControlTool<T extends AnyAgentTool>(tool: T): T {
   codeModeControlTools.add(tool);
   return tool;
 }
 
-export function isCodeModeControlTool(tool: AnyAgentTool): boolean {
+export function copyCodeModeControlToolIdentity(
+  original: object,
+  wrapper: CodeModeExecDescriptionTarget,
+): void {
+  if (codeModeControlTools.has(original)) {
+    codeModeControlTools.add(wrapper);
+    const descriptionState = codeModeExecDescriptionTargets.get(original)?.state;
+    if (descriptionState && descriptionState.targets.size > 0) {
+      // Registry refresh recreates wrappers from retained definitions; every
+      // live copy must reflect the current authorized catalog.
+      wrapper.description = descriptionState.description;
+      // Reuse target identity across observers so duplicate copies still update once.
+      const reference =
+        codeModeExecDescriptionTargets.get(wrapper)?.reference ?? new WeakRef(wrapper);
+      descriptionState.targets.add(reference);
+      codeModeExecDescriptionTargets.set(wrapper, { state: descriptionState, reference });
+    }
+  }
+}
+
+/** Keep catalog updates synchronized across every live exec definition and wrapper. */
+export function createCodeModeExecDescriptionUpdater(tool: AnyAgentTool): {
+  update: (description: string) => void;
+  dispose: () => void;
+} {
+  const initialDescription = tool.description;
+  const toolReference = codeModeExecDescriptionTargets.get(tool)?.reference ?? new WeakRef(tool);
+  const state = { description: initialDescription, targets: new Set([toolReference]) };
+  codeModeExecDescriptionTargets.set(tool, { state, reference: toolReference });
+  return {
+    update(description) {
+      state.description = description;
+      // Obsolete registry wrappers retain their old extension runner. Keep live
+      // copies synchronized without extending either lifetime until catalog disposal.
+      for (const reference of state.targets) {
+        const target = reference.deref();
+        if (target) {
+          target.description = description;
+        } else {
+          state.targets.delete(reference);
+        }
+      }
+    },
+    dispose: () => state.targets.clear(),
+  };
+}
+
+export function isCodeModeControlTool(tool: object): boolean {
   return codeModeControlTools.has(tool);
 }
 
-function isCodeModeExecTool(tool: AnyAgentTool): boolean {
-  return isCodeModeControlTool(tool) && normalizeToolName(tool.name) === CODE_MODE_EXEC_TOOL_NAME;
+/** Return whether a tool is the marked Code Mode `exec` control tool (not a plain shell exec). */
+export function isCodeModeExecTool(tool: AnyAgentTool): boolean {
+  return (
+    isCodeModeControlTool(tool) && normalizeToolPolicyName(tool.name) === CODE_MODE_EXEC_TOOL_NAME
+  );
 }
 
-function resolveCodeModeExecToolInputKind(params: unknown): CodeModeExecToolInputKind | undefined {
+export function isCodeModeExecToolKind(toolKind: unknown): boolean {
+  return toolKind === CODE_MODE_EXEC_TOOL_KIND;
+}
+
+export function resolveCodeModeExecToolInputKind(
+  params: unknown,
+): CodeModeExecToolInputKind | undefined {
   if (!isPlainObject(params)) {
     return undefined;
   }
-  const language = params.language;
-  if (language === undefined || language === "javascript") {
-    return "javascript";
-  }
-  if (language === "typescript") {
-    return "typescript";
-  }
-  return undefined;
+  return params.language === undefined && params.typecheck === undefined ? "javascript" : undefined;
 }
 
 function normalizeCodeModeExecParams(params: unknown): unknown {
   if (!isPlainObject(params)) {
     return params;
   }
-  const code = params.code;
-  const command = params.command;
-  if (typeof code === "string" && typeof command !== "string") {
-    return { ...params, command: params.code };
+  const code = readNonBlankString(params.code);
+  const command = readNonBlankString(params.command);
+  if (code !== undefined && command === undefined) {
+    // Code-mode accepts both `code` and generic exec `command`; keep them paired
+    // so downstream hooks can read either shape.
+    return { ...params, command: code };
   }
-  if (typeof command === "string" && typeof code !== "string") {
-    return { ...params, code: params.command };
+  if (command !== undefined && code === undefined) {
+    return { ...params, code: command };
   }
   return params;
 }
@@ -64,11 +124,10 @@ export function getCodeModeExecBeforeHookMetadata(params: {
   if (!isCodeModeExecTool(params.tool)) {
     return undefined;
   }
-  const toolInputKind = resolveCodeModeExecToolInputKind(params.params);
-  return {
+  return getCodeModeExecBeforeHookMetadataForToolKind({
     toolKind: CODE_MODE_EXEC_TOOL_KIND,
-    ...(toolInputKind && { toolInputKind }),
-  };
+    params: params.params,
+  });
 }
 
 export function getCodeModeExecBeforeHookMetadataForToolKind(params: {
@@ -95,24 +154,21 @@ export function normalizeCodeModeExecBeforeHookParams(params: {
   return normalizeCodeModeExecParams(params.params);
 }
 
-export function normalizeCodeModeExecBeforeHookParamsForToolKind(params: {
-  toolKind: unknown;
-  params: unknown;
-}): unknown {
-  if (params.toolKind !== CODE_MODE_EXEC_TOOL_KIND) {
-    return params.params;
-  }
-  return normalizeCodeModeExecParams(params.params);
-}
+type CodeModeExecReconcileOwner = { tool: AnyAgentTool } | { toolKind: unknown };
 
+/** Reconcile policy- or hook-adjusted aliases after raw-input normalization. */
 export function reconcileCodeModeExecBeforeHookParams(params: {
-  tool: AnyAgentTool;
+  owner: CodeModeExecReconcileOwner;
   originalParams: unknown;
   hookParams: unknown;
   adjustedParams: unknown;
 }): unknown {
+  const isCodeModeExecOwner =
+    "tool" in params.owner
+      ? isCodeModeExecTool(params.owner.tool)
+      : params.owner.toolKind === CODE_MODE_EXEC_TOOL_KIND;
   if (
-    !isCodeModeExecTool(params.tool) ||
+    !isCodeModeExecOwner ||
     !isPlainObject(params.originalParams) ||
     !isPlainObject(params.hookParams) ||
     !isPlainObject(params.adjustedParams)
@@ -127,9 +183,18 @@ export function reconcileCodeModeExecBeforeHookParams(params: {
 
   const adjustedCode = params.adjustedParams.code;
   const adjustedCommand = params.adjustedParams.command;
-  const adjustedCodeChanged = typeof adjustedCode === "string" && adjustedCode !== hookCode;
+  const adjustedCodeChanged =
+    Object.hasOwn(params.adjustedParams, "code") && adjustedCode !== hookCode;
   const adjustedCommandChanged =
-    typeof adjustedCommand === "string" && adjustedCommand !== hookCode;
+    Object.hasOwn(params.adjustedParams, "command") && adjustedCommand !== hookCode;
+  // Invalidation must dominate a simultaneous valid rewrite; otherwise runtime
+  // ignores the invalid alias and executes the other one.
+  if (adjustedCodeChanged && readNonBlankString(adjustedCode) === undefined) {
+    return { ...params.adjustedParams, command: adjustedCode };
+  }
+  if (adjustedCommandChanged && readNonBlankString(adjustedCommand) === undefined) {
+    return { ...params.adjustedParams, code: adjustedCommand };
+  }
   if (adjustedCodeChanged === adjustedCommandChanged) {
     return params.adjustedParams;
   }
@@ -137,8 +202,5 @@ export function reconcileCodeModeExecBeforeHookParams(params: {
   if (adjustedCodeChanged) {
     return { ...params.adjustedParams, command: adjustedCode };
   }
-  if (adjustedCommandChanged) {
-    return { ...params.adjustedParams, code: adjustedCommand };
-  }
-  return params.adjustedParams;
+  return { ...params.adjustedParams, code: adjustedCommand };
 }

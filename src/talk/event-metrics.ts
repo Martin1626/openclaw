@@ -1,5 +1,10 @@
-export { asOptionalRecord as talkEventPayloadRecord } from "../shared/record-coerce.js";
+/**
+ * Talk event payloads are provider-owned JSON blobs, so callers must coerce
+ * records and read only bounded numeric counters that are safe to export.
+ */
+import { asNonNegativeFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 
+/** Read the first non-negative finite number from a provider payload record. */
 export function firstFiniteTalkEventNumber(
   record: Record<string, unknown> | undefined,
   keys: readonly string[],
@@ -8,8 +13,10 @@ export function firstFiniteTalkEventNumber(
     return undefined;
   }
   for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    const value = asNonNegativeFiniteNumber(record[key]);
+    if (value !== undefined) {
+      // Reject negative, NaN, and Infinity values before diagnostics/logging so
+      // provider bugs cannot poison aggregate Talk metrics.
       return value;
     }
   }

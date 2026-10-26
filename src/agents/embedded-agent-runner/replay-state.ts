@@ -3,6 +3,7 @@ export type EmbeddedRunReplayState = {
   hadPotentialSideEffects: boolean;
 };
 
+/** Serializable replay metadata stored with run results. */
 export type EmbeddedRunReplayMetadata = {
   hadPotentialSideEffects: boolean;
   replaySafe: boolean;
@@ -17,6 +18,7 @@ export function createEmbeddedRunReplayState(
   };
 }
 
+/** Merges replay state monotonically so unsafe observations cannot be cleared accidentally. */
 export function mergeEmbeddedRunReplayState(
   current: EmbeddedRunReplayState,
   next?: Partial<EmbeddedRunReplayState>,
@@ -35,15 +37,10 @@ export function observeReplayMetadata(
   current: EmbeddedRunReplayState,
   metadata?: EmbeddedRunReplayMetadata | null,
 ): EmbeddedRunReplayState {
-  if (!metadata) {
-    return mergeEmbeddedRunReplayState(current, {
-      replayInvalid: true,
-      hadPotentialSideEffects: true,
-    });
-  }
+  // An opaque run cannot prove replay safety or the absence of side effects.
   return mergeEmbeddedRunReplayState(current, {
-    replayInvalid: !metadata.replaySafe,
-    hadPotentialSideEffects: metadata.hadPotentialSideEffects,
+    replayInvalid: !metadata?.replaySafe,
+    hadPotentialSideEffects: metadata ? metadata.hadPotentialSideEffects : true,
   });
 }
 

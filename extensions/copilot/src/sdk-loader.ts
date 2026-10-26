@@ -4,18 +4,17 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as Sdk from "@github/copilot-sdk";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+import copilotPluginPackage from "../package.json" with { type: "json" };
 
-export function resolveCopilotSdkFallbackDir(env: NodeJS.ProcessEnv = process.env): string {
+function resolveCopilotSdkFallbackDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(resolveStateDir(env), "npm-runtime", "copilot");
 }
 
-export const COPILOT_SDK_FALLBACK_DIR = resolveCopilotSdkFallbackDir();
-
-export const COPILOT_SDK_SPEC = "@github/copilot-sdk@1.0.0-beta.4";
+const COPILOT_SDK_SPEC = `@github/copilot-sdk@${copilotPluginPackage.dependencies["@github/copilot-sdk"]}`;
 
 let cached: Promise<typeof Sdk> | undefined;
 
-export interface LoadCopilotSdkOptions {
+interface LoadCopilotSdkOptions {
   readonly fallbackDir?: string;
   readonly primaryImport?: () => Promise<typeof Sdk>;
   readonly fallbackImport?: (absolutePath: string) => Promise<typeof Sdk>;
@@ -30,17 +29,13 @@ export async function loadCopilotSdk(options: LoadCopilotSdkOptions = {}): Promi
 
   const promise = doLoad(options);
   if (useCache) {
-    cached = promise.catch((err) => {
+    cached = promise.catch((err: unknown) => {
       cached = undefined;
       throw err;
     });
     return cached;
   }
   return promise;
-}
-
-export function resetCopilotSdkCacheForTests(): void {
-  cached = undefined;
 }
 
 async function doLoad(options: LoadCopilotSdkOptions): Promise<typeof Sdk> {
@@ -86,7 +81,7 @@ function createMissingSdkError(
     "[copilot] @github/copilot-sdk is not installed.",
     "",
     "The external @openclaw/copilot plugin depends on @github/copilot-sdk",
-    "(~260 MB after pulling its platform-specific @github/copilot CLI binary).",
+    "including its platform-specific Copilot runtime package.",
     "Reinstall the plugin once with:",
     "",
     "  openclaw plugins install @openclaw/copilot",
@@ -95,7 +90,7 @@ function createMissingSdkError(
     "",
     `  npm install ${COPILOT_SDK_SPEC}`,
     "",
-    `The legacy fallback location is still probed at\n  ${fallbackPath}`,
+    `The legacy fallback location is still checked at\n  ${fallbackPath}`,
     "",
     "Primary resolution error:",
     `  ${summarizeError(primaryErr)}`,

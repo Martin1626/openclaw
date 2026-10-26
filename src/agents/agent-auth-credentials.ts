@@ -1,9 +1,18 @@
-import { coerceSecretRef } from "../config/types.secrets.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
-import type { AuthProfileCredential, AuthProfileStore } from "./auth-profiles.js";
-import { normalizeProviderId } from "./provider-id.js";
+/** Converts auth-profile credentials into agent runtime credential maps. */
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { parseSecretRef } from "../config/types.secrets.js";
+import type {
+  PreparedAgentCredentialMode,
+  PreparedAgentCredentialModes,
+} from "./agent-auth-credential-modes.js";
+import { isOAuthRefreshFence } from "./auth-profiles/oauth-refresh-marker.js";
+import { resolveAuthProfileOrder } from "./auth-profiles/order.js";
+import type { AuthProfileCredential, AuthProfileStore } from "./auth-profiles/types.js";
+import type { ApiKeyCredential, AuthStorageData } from "./sessions/auth-storage.js";
 
-type AgentApiKeyCredential = { type: "api_key"; key: string };
 type AgentOAuthCredential = {
   type: "oauth";
   access: string;
@@ -11,72 +20,104 @@ type AgentOAuthCredential = {
   expires: number;
 };
 
-export type AgentCredential = AgentApiKeyCredential | AgentOAuthCredential;
+/** Credential value shape consumed by agent runtimes after auth-profile normalization. */
+type AgentCredential = ApiKeyCredential | AgentOAuthCredential;
 export type AgentCredentialMap = Record<string, AgentCredential>;
 
-export type ResolveAgentCredentialMapOptions = {
+type ResolveAgentCredentialMapOptions = {
   includeSecretRefPlaceholders?: boolean;
+  config?: OpenClawConfig;
 };
 
 const AGENT_SECRET_REF_CONFIGURED_MARKER = "openclaw-secret-ref-configured";
 
-function hasConfiguredSecretRef(value: unknown): boolean {
-  return coerceSecretRef(value) !== null;
-}
-
-function secretRefPlaceholder(
-  options: ResolveAgentCredentialMapOptions | undefined,
-): AgentCredential | null {
-  if (options?.includeSecretRefPlaceholders === true) {
-    return { type: "api_key", key: AGENT_SECRET_REF_CONFIGURED_MARKER };
+/** Records only credential modes whose secret material is usable by a prepared runtime owner. */
+export function resolveUsableAgentCredentialModes(
+  credentials: Readonly<AuthStorageData>,
+): PreparedAgentCredentialModes {
+  const modes: Record<string, PreparedAgentCredentialMode> = {};
+  for (const [rawProvider, credential] of Object.entries(credentials)) {
+    const provider = normalizeProviderId(rawProvider);
+    if (!provider) {
+      continue;
+    }
+    if (
+      credential.type === "api_key" &&
+      credential.key &&
+      credential.key !== AGENT_SECRET_REF_CONFIGURED_MARKER
+    ) {
+      const native = credential.nativeAuth;
+      if (!native || normalizeProviderId(native.runtime) === provider) {
+        modes[provider] = native
+          ? Object.freeze({
+              source: "native",
+              mode: native.mode === "api-key" ? "api_key" : native.mode,
+            })
+          : "api_key";
+      }
+    } else if (
+      credential.type === "token" &&
+      credential.token &&
+      (credential.expires === undefined || credential.expires > Date.now())
+    ) {
+      modes[provider] = "token";
+    } else if (
+      credential.type === "oauth" &&
+      !isOAuthRefreshFence(credential) &&
+      credential.access &&
+      credential.refresh &&
+      credential.expires > 0
+    ) {
+      modes[provider] = "oauth";
+    }
   }
-  return null;
+  return Object.freeze(modes);
 }
 
 function convertAuthProfileCredentialToAgent(
   cred: AuthProfileCredential,
   options?: ResolveAgentCredentialMapOptions,
 ): AgentCredential | null {
-  if (cred.type === "api_key") {
-    const key = normalizeOptionalString(cred.key) ?? "";
+  if (cred.type === "api_key" || cred.type === "token") {
+    if (cred.type === "token" && cred.expires !== undefined) {
+      const expires = asDateTimestampMs(cred.expires);
+      if (expires === undefined || Date.now() >= expires) {
+        return null;
+      }
+    }
+    const key = normalizeOptionalString(cred.type === "api_key" ? cred.key : cred.token);
     if (!key) {
-      return hasConfiguredSecretRef(cred.keyRef) ? secretRefPlaceholder(options) : null;
+      // A configured ref proves existence, never authority to resolve its secret here.
+      const ref = cred.type === "api_key" ? cred.keyRef : cred.tokenRef;
+      return parseSecretRef(ref) !== null && options?.includeSecretRefPlaceholders === true
+        ? { type: "api_key", key: AGENT_SECRET_REF_CONFIGURED_MARKER }
+        : null;
     }
     return { type: "api_key", key };
   }
 
-  if (cred.type === "token") {
-    if (
-      typeof cred.expires === "number" &&
-      Number.isFinite(cred.expires) &&
-      Date.now() >= cred.expires
-    ) {
+  if (cred.type === "oauth") {
+    if (isOAuthRefreshFence(cred)) {
       return null;
     }
-    const token = normalizeOptionalString(cred.token) ?? "";
-    if (!token) {
-      return hasConfiguredSecretRef(cred.tokenRef) ? secretRefPlaceholder(options) : null;
-    }
-    return { type: "api_key", key: token };
-  }
-
-  if (cred.type === "oauth") {
     const access = normalizeOptionalString(cred.access) ?? "";
     const refresh = normalizeOptionalString(cred.refresh) ?? "";
-    if (!access || !refresh || !Number.isFinite(cred.expires) || cred.expires <= 0) {
+    const expires = asDateTimestampMs(cred.expires);
+    if (!access || !refresh || expires === undefined || expires <= 0) {
       return null;
     }
     return {
       type: "oauth",
       access,
       refresh,
-      expires: cred.expires,
+      expires,
     };
   }
 
   return null;
 }
 
+/** Build one canonically selected credential per normalized provider. */
 export function resolveAgentCredentialMapFromStore(
   store: AuthProfileStore,
   options?: ResolveAgentCredentialMapOptions,
@@ -84,32 +125,31 @@ export function resolveAgentCredentialMapFromStore(
   const credentials: AgentCredentialMap = {};
   for (const credential of Object.values(store.profiles)) {
     const provider = normalizeProviderId(credential.provider ?? "");
-    if (!provider || credentials[provider]) {
+    if (!provider) {
       continue;
     }
-    const converted = convertAuthProfileCredentialToAgent(credential, options);
-    if (converted) {
-      credentials[provider] = converted;
+    if (credentials[provider]) {
+      continue;
+    }
+    // Discovery must not grow a second auth policy: explicit order, provider
+    // aliases, eligibility, and automatic preference all belong to this resolver.
+    const profileIds = resolveAuthProfileOrder({
+      cfg: options?.config,
+      store,
+      provider,
+      ...(options?.includeSecretRefPlaceholders === true ? { readinessMode: "read-only" } : {}),
+    });
+    for (const profileId of profileIds) {
+      const profile = store.profiles[profileId];
+      if (!profile) {
+        continue;
+      }
+      const converted = convertAuthProfileCredentialToAgent(profile, options);
+      if (converted) {
+        credentials[provider] = converted;
+        break;
+      }
     }
   }
   return credentials;
-}
-
-export function agentCredentialsEqual(a: AgentCredential | undefined, b: AgentCredential): boolean {
-  if (!a || typeof a !== "object") {
-    return false;
-  }
-  if (a.type !== b.type) {
-    return false;
-  }
-
-  if (a.type === "api_key" && b.type === "api_key") {
-    return a.key === b.key;
-  }
-
-  if (a.type === "oauth" && b.type === "oauth") {
-    return a.access === b.access && a.refresh === b.refresh && a.expires === b.expires;
-  }
-
-  return false;
 }

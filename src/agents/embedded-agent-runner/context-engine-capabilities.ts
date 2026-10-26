@@ -1,28 +1,21 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ContextEngineRuntimeContext } from "../../context-engine/types.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { resolveBoundAgentIdForSession } from "../session-agent-binding.js";
 
-export type ResolveContextEngineCapabilitiesParams = {
+export function resolveContextEngineCapabilities(params: {
   config?: OpenClawConfig;
   sessionKey?: string;
-  agentId?: string;
+  explicitAgentId?: string;
   authProfileId?: string;
   contextEnginePluginId?: string;
   purpose: string;
-};
-
-/**
- * Build host-owned capabilities that are bound to one context-engine runtime call.
- */
-export function resolveContextEngineCapabilities(
-  params: ResolveContextEngineCapabilitiesParams,
-): Pick<ContextEngineRuntimeContext, "llm"> {
+}): Pick<ContextEngineRuntimeContext, "llm"> {
   const sessionKey = normalizeOptionalString(params.sessionKey);
   const agentId = resolveBoundAgentIdForSession({
     config: params.config,
     sessionKey,
-    agentId: params.agentId,
+    agentId: params.explicitAgentId,
   });
   const contextEnginePluginId = normalizeOptionalString(params.contextEnginePluginId);
   return {

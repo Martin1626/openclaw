@@ -1,29 +1,32 @@
 import { getRuntimeConfig } from "../../config/config.js";
-import {
-  ensureStandaloneMigrationProviderRegistryLoaded,
-  resolvePluginMigrationProvider,
-  resolvePluginMigrationProviders,
-} from "../../plugins/migration-provider-runtime.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { withPluginMigrationProviders } from "../../plugins/migration-provider-runtime.js";
 import type { MigrationPlan, MigrationProviderPlugin } from "../../plugins/types.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import { buildMigrationContext } from "./context.js";
 import type { MigrateCommonOptions } from "./types.js";
 
-export function resolveMigrationProvider(
+/** Borrow a selected provider for the complete consuming operation. */
+export async function withMigrationProvider<T>(
   providerId: string,
-  config = getRuntimeConfig(),
-): MigrationProviderPlugin {
-  ensureStandaloneMigrationProviderRegistryLoaded({ cfg: config });
-  const provider = resolvePluginMigrationProvider({ providerId, cfg: config });
-  if (!provider) {
-    const available = resolvePluginMigrationProviders({ cfg: config }).map((entry) => entry.id);
-    const suffix =
-      available.length > 0
-        ? ` Available providers: ${available.join(", ")}.`
-        : " No providers found.";
-    throw new Error(`Unknown migration provider "${providerId}".${suffix}`);
-  }
-  return provider;
+  config: OpenClawConfig | undefined,
+  run: (provider: MigrationProviderPlugin) => Promise<T>,
+): Promise<T> {
+  return await withPluginMigrationProviders(
+    { cfg: config ?? getRuntimeConfig(), providerId },
+    async (providers) => {
+      const provider = providers.find((entry) => entry.id === providerId);
+      if (!provider) {
+        const available = providers.map((entry) => entry.id);
+        const suffix =
+          available.length > 0
+            ? ` Available providers: ${available.join(", ")}.`
+            : " No providers found.";
+        throw new Error(`Unknown migration provider "${providerId}".${suffix}`);
+      }
+      return await run(provider);
+    },
+  );
 }
 
 export function buildMigrationProviderOptions(
@@ -43,19 +46,12 @@ export function buildMigrationProviderOptions(
 export async function createMigrationPlan(
   runtime: RuntimeEnv,
   opts: MigrateCommonOptions & { provider: string },
+  provider: MigrationProviderPlugin,
 ): Promise<MigrationPlan> {
-  if (opts.verifyPluginApps && opts.provider !== "codex") {
-    throw new Error("--verify-plugin-apps is only supported for Codex migrations.");
-  }
-  const provider = resolveMigrationProvider(opts.provider, opts.configOverride);
   const ctx = buildMigrationContext({
-    source: opts.source,
-    includeSecrets: opts.includeSecrets,
-    overwrite: opts.overwrite,
-    configOverride: opts.configOverride,
+    ...opts,
     providerOptions: buildMigrationProviderOptions(opts),
     runtime,
-    json: opts.json,
   });
   return await provider.plan(ctx);
 }

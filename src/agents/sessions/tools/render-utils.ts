@@ -1,21 +1,24 @@
 import * as os from "node:os";
-import { getCapabilities, getImageDimensions, imageFallback } from "@earendil-works/pi-tui";
-import type { ImageContent, TextContent } from "../../../llm/types.js";
+import {
+  type Component,
+  getCapabilities,
+  getImageDimensions,
+  imageFallback,
+  Text,
+} from "@earendil-works/pi-tui";
+import { shortenPathWithHome } from "../../../infra/home-display.js";
 import type { Theme } from "../../modes/interactive/theme/theme.js";
-import { stripAnsi } from "../../utils/ansi.js";
-import { sanitizeBinaryOutput } from "../../utils/shell.js";
+import { sanitizeBinaryOutput } from "../../shell-utils.js";
 
+/** Shortens paths under the current home directory for display. */
 export function shortenPath(path: unknown): string {
   if (typeof path !== "string") {
     return "";
   }
-  const home = os.homedir();
-  if (path.startsWith(home)) {
-    return `~${path.slice(home.length)}`;
-  }
-  return path;
+  return shortenPathWithHome(path, { home: os.homedir(), prefix: "~" });
 }
 
+/** Returns a display string for string/nullish values, or null for unsupported values. */
 export function str(value: unknown): string | null {
   if (typeof value === "string") {
     return value;
@@ -26,14 +29,21 @@ export function str(value: unknown): string | null {
   return null;
 }
 
+/** Replaces tabs with stable spaces so terminal layout does not shift by tab stop. */
 export function replaceTabs(text: string): string {
   return text.replace(/\t/g, "   ");
 }
 
-export function normalizeDisplayText(text: string): string {
-  return text.replace(/\r/g, "");
+export function trimTrailingEmptyLines(lines: readonly string[]): string[] {
+  return lines.slice(0, lines.findLastIndex((line) => line !== "") + 1);
 }
 
+export function reuseTextComponent(lastComponent: Component | undefined, content: string): Text {
+  const text = (lastComponent as Text | undefined) ?? new Text("", 0, 0); // SAFETY: Render slots only reuse the component returned by this renderer.
+  text.setText(content);
+  return text;
+}
+/** Extracts text output and image placeholders from a tool result. */
 export function getTextOutput(
   result:
     | { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }
@@ -48,11 +58,12 @@ export function getTextOutput(
   const imageBlocks = result.content.filter((c) => c.type === "image");
 
   let output = textBlocks
-    .map((c) => sanitizeBinaryOutput(stripAnsi(c.text || "")).replace(/\r/g, ""))
+    .map((c) => sanitizeBinaryOutput(c.text || "", { ansiMode: "compat" }).replace(/\r/g, ""))
     .join("\n");
 
   const caps = getCapabilities();
   if (imageBlocks.length > 0 && (!caps.images || !showImages)) {
+    // When inline images are unavailable, preserve visible evidence that media was returned.
     const imageIndicators = imageBlocks
       .map((img) => {
         const mimeType = img.mimeType ?? "image/unknown";
@@ -69,11 +80,7 @@ export function getTextOutput(
   return output;
 }
 
-export type ToolRenderResultLike<TDetails> = {
-  content: (TextContent | ImageContent)[];
-  details: TDetails;
-};
-
+/** Formats the invalid-argument marker with the active theme. */
 export function invalidArgText(theme: Pick<Theme, "fg">): string {
   return theme.fg("error", "[invalid arg]");
 }

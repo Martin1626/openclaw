@@ -1,32 +1,11 @@
-import { streamSimple } from "../../llm/stream.js";
+import { decodeHtmlEntities } from "../../shared/html-entities.js";
 import { visitObjectContentBlocks } from "../../shared/message-content-blocks.js";
 import type { StreamFn } from "../runtime/index.js";
-import type { MutableAssistantMessageEventStream } from "../stream-compat.js";
+import { mapAssistantMessageStream, wrapStreamObjectEvents } from "./run/stream-wrapper.js";
 
-const HTML_ENTITY_RE = /&(?:amp|lt|gt|quot|apos|#39|#x[0-9a-f]+|#\d+);/i;
-
-function decodeHtmlEntities(value: string): string {
-  const decodeNumericEntity = (raw: string, radix: 10 | 16): string => {
-    const codePoint = Number.parseInt(raw, radix);
-    return Number.isFinite(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
-      ? String.fromCodePoint(codePoint)
-      : `&#${radix === 16 ? "x" : ""}${raw};`;
-  };
-
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => decodeNumericEntity(hex, 16))
-    .replace(/&#(\d+);/gi, (_, dec: string) => decodeNumericEntity(dec, 10));
-}
-
-export function decodeHtmlEntitiesInObject(value: unknown): unknown {
+function decodeHtmlEntitiesInObject(value: unknown): unknown {
   if (typeof value === "string") {
-    return HTML_ENTITY_RE.test(value) ? decodeHtmlEntities(value) : value;
+    return decodeHtmlEntities(value);
   }
   if (Array.isArray(value)) {
     return value.map(decodeHtmlEntitiesInObject);
@@ -41,65 +20,41 @@ export function decodeHtmlEntitiesInObject(value: unknown): unknown {
   return value;
 }
 
+const decodedToolCallArguments = new WeakSet<object>();
+
 function decodeToolCallArgumentsHtmlEntitiesInMessage(message: unknown): void {
   visitObjectContentBlocks(message, (block) => {
     const typedBlock = block as { type?: unknown; arguments?: unknown };
-    if (typedBlock.type !== "toolCall" || !typedBlock.arguments) {
+    if (
+      typedBlock.type !== "toolCall" ||
+      typeof typedBlock.arguments !== "object" ||
+      !typedBlock.arguments
+    ) {
       return;
     }
-    if (typeof typedBlock.arguments === "object") {
-      typedBlock.arguments = decodeHtmlEntitiesInObject(typedBlock.arguments);
+    if (decodedToolCallArguments.has(typedBlock.arguments)) {
+      return;
     }
+    const decoded = decodeHtmlEntitiesInObject(typedBlock.arguments) as object;
+    decodedToolCallArguments.add(decoded);
+    typedBlock.arguments = decoded;
   });
 }
 
-function wrapStreamMessageObjects(
-  stream: MutableAssistantMessageEventStream,
-  transformMessage: (message: unknown) => void,
-): MutableAssistantMessageEventStream {
-  const originalResult = stream.result.bind(stream);
-  stream.result = async () => {
-    const message = await originalResult();
-    transformMessage(message);
-    return message;
-  };
-
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return {
-        async next() {
-          const result = await iterator.next();
-          if (!result.done && result.value && typeof result.value === "object") {
-            const event = result.value as { partial?: unknown; message?: unknown };
-            transformMessage(event.partial);
-            transformMessage(event.message);
-          }
-          return result;
-        },
-        async return(value?: unknown) {
-          return iterator.return?.(value) ?? { done: true as const, value: undefined };
-        },
-        async throw(error?: unknown) {
-          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
-        },
+/** Wraps a stream function so tool-call arguments are decoded before consumers inspect them. */
+export function createHtmlEntityToolCallArgumentDecodingWrapper(baseStreamFn: StreamFn): StreamFn {
+  return (model, context, options) =>
+    mapAssistantMessageStream(baseStreamFn(model, context, options), (stream) => {
+      const originalResult = stream.result.bind(stream);
+      stream.result = async () => {
+        const message = await originalResult();
+        decodeToolCallArgumentsHtmlEntitiesInMessage(message);
+        return message;
       };
-    };
-  return stream;
-}
-
-export function createHtmlEntityToolCallArgumentDecodingWrapper(
-  baseStreamFn: StreamFn | undefined,
-): StreamFn {
-  const underlying = baseStreamFn ?? streamSimple;
-  return (model, context, options) => {
-    const maybeStream = underlying(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamMessageObjects(stream, decodeToolCallArgumentsHtmlEntitiesInMessage),
-      );
-    }
-    return wrapStreamMessageObjects(maybeStream, decodeToolCallArgumentsHtmlEntitiesInMessage);
-  };
+      // Tool execution can consume final results or partial/message events.
+      return wrapStreamObjectEvents(stream, (event) => {
+        decodeToolCallArgumentsHtmlEntitiesInMessage(event.partial);
+        decodeToolCallArgumentsHtmlEntitiesInMessage(event.message);
+      });
+    });
 }

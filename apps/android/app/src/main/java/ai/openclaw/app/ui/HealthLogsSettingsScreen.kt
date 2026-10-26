@@ -3,11 +3,17 @@ package ai.openclaw.app.ui
 import ai.openclaw.app.GatewayHealthLogsSummary
 import ai.openclaw.app.GatewayLogEntry
 import ai.openclaw.app.MainViewModel
-import ai.openclaw.app.ui.design.ClawPanel
-import ai.openclaw.app.ui.design.ClawSecondaryButton
+import ai.openclaw.app.VoiceCaptureMode
+import ai.openclaw.app.gatewayConnectionStatusForDisplay
+import ai.openclaw.app.i18n.nativeString
+import ai.openclaw.app.takeUtf16Safe
+import ai.openclaw.app.ui.design.ClawListPanel
 import ai.openclaw.app.ui.design.ClawStatus
 import ai.openclaw.app.ui.design.ClawStatusPill
+import ai.openclaw.app.ui.design.ClawStatusRow
 import ai.openclaw.app.ui.design.ClawTheme
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,176 +21,177 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
+/** Settings health screen for gateway/node status and recent gateway logs. */
 @Composable
 internal fun HealthLogsSettingsScreen(
   viewModel: MainViewModel,
   onBack: () -> Unit,
 ) {
-  val isConnected by viewModel.isConnected.collectAsState()
+  val gatewayConnectionDisplay by viewModel.gatewayConnectionDisplay.collectAsState()
+  val isConnected = gatewayConnectionDisplay.isConnected
   val isNodeConnected by viewModel.isNodeConnected.collectAsState()
   val chatHealthOk by viewModel.chatHealthOk.collectAsState()
-  val statusText by viewModel.statusText.collectAsState()
   val modelCount by viewModel.modelCatalog.collectAsState()
   val pendingRunCount by viewModel.pendingRunCount.collectAsState()
+  val voiceCaptureMode by viewModel.voiceCaptureMode.collectAsState()
+  val talkModeEnabled by viewModel.talkModeEnabled.collectAsState()
+  val talkModeListening by viewModel.talkModeListening.collectAsState()
+  val talkModeSpeaking by viewModel.talkModeSpeaking.collectAsState()
+  val talkAwaitingAgent by viewModel.talkAwaitingAgent.collectAsState()
   val talkStatus by viewModel.talkModeStatusText.collectAsState()
-  val logsSummary by viewModel.healthLogsSummary.collectAsState()
-  val logsRefreshing by viewModel.healthLogsRefreshing.collectAsState()
-  val logsErrorText by viewModel.healthLogsErrorText.collectAsState()
+  val logsState by viewModel.healthLogsState.collectAsState()
+  var selectedLogEntry by remember { mutableStateOf<GatewayLogEntry?>(null) }
 
-  LaunchedEffect(isConnected) {
-    if (isConnected) {
-      viewModel.refreshHealthLogs()
-    }
+  SettingsRefreshOnConnect(isConnected) { viewModel.refreshHealthLogs() }
+
+  selectedLogEntry?.let { entry ->
+    GatewayLogDetailSettingsScreen(entry = entry, onBack = { selectedLogEntry = null })
+    return
   }
 
   SettingsDetailFrame(
-    title = "Health",
-    subtitle = "Gateway status, phone node readiness, and recent log stream.",
-    icon = Icons.Default.Settings,
+    subtitle = nativeString("Gateway status, phone node readiness, and recent log stream."),
+    route = SettingsRoute.Health,
     onBack = onBack,
   ) {
     SettingsMetricPanel(
       rows =
         listOf(
-          SettingsMetric("Gateway", if (isConnected) "Online" else "Offline"),
-          SettingsMetric("Node", if (isNodeConnected) "Online" else "Waiting"),
-          SettingsMetric("Models", modelCount.size.toString()),
-          SettingsMetric("Logs", logsSummary.entries.size.toString()),
+          SettingsMetric(nativeString("Gateway"), if (isConnected) nativeString("Online") else nativeString("Offline")),
+          SettingsMetric(nativeString("Node"), if (isNodeConnected) nativeString("Online") else nativeString("Waiting")),
+          SettingsMetric(nativeString("Models"), modelCount.size.toString()),
+          SettingsMetric(
+            nativeString("Logs"),
+            logsState.summary
+              ?.entries
+              ?.size
+              ?.toString() ?: "—",
+          ),
         ),
     )
-    HealthStatusPanel(
-      gateway = statusText,
-      node = if (isNodeConnected) "Online" else "Waiting",
-      chat = if (chatHealthOk) "Ready" else "Needs connection",
-      models = "${modelCount.size} available",
-      voice = talkStatus,
-      runs = if (pendingRunCount > 0) "$pendingRunCount active" else "Idle",
-      isConnected = isConnected,
-      isNodeConnected = isNodeConnected,
-      chatHealthOk = chatHealthOk,
-      modelsReady = modelCount.isNotEmpty(),
-      voiceReady = talkStatus.lowercase() != "off",
-    )
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      ClawSecondaryButton(
-        text = if (logsRefreshing) "Refreshing" else "Refresh Logs",
-        onClick = viewModel::refreshHealthLogs,
-        enabled = isConnected && !logsRefreshing,
-        modifier = Modifier.weight(1f),
+    val healthRows =
+      listOf(
+        HealthStatus(nativeString("Gateway"), gatewayConnectionStatusForDisplay(gatewayConnectionDisplay.statusText), isConnected),
+        HealthStatus(nativeString("Phone Node"), if (isNodeConnected) nativeString("Online") else nativeString("Waiting"), isNodeConnected),
+        HealthStatus(nativeString("Chat"), if (chatHealthOk) nativeString("Ready") else nativeString("Not ready"), chatHealthOk),
+        HealthStatus(nativeString("Models"), nativeString("\${modelCount.size} available", modelCount.size), modelCount.isNotEmpty()),
+        HealthStatus(
+          nativeString("Voice"),
+          nativeString(talkStatus),
+          voiceRuntimeReady(
+            voiceCaptureMode = voiceCaptureMode,
+            talkModeEnabled = talkModeEnabled,
+            talkModeListening = talkModeListening,
+            talkModeSpeaking = talkModeSpeaking,
+            talkAwaitingAgent = talkAwaitingAgent,
+          ),
+        ),
+        HealthStatus(nativeString("Runs"), if (pendingRunCount > 0) nativeString("\$pendingRunCount active", pendingRunCount) else nativeString("Idle"), true),
       )
+    ClawListPanel(items = healthRows, contentPadding = PaddingValues(0.dp), dividerColor = ClawTheme.colors.border) { row ->
+      ClawStatusRow(title = row.title, value = row.value, healthy = row.healthy)
     }
-    logsErrorText?.let { error ->
-      ClawPanel {
-        Text(text = error, style = ClawTheme.type.body, color = ClawTheme.colors.warning)
-      }
-    }
-    GatewayLogsPanel(isConnected = isConnected, summary = logsSummary)
-  }
-}
-
-@Composable
-private fun HealthStatusPanel(
-  gateway: String,
-  node: String,
-  chat: String,
-  models: String,
-  voice: String,
-  runs: String,
-  isConnected: Boolean,
-  isNodeConnected: Boolean,
-  chatHealthOk: Boolean,
-  modelsReady: Boolean,
-  voiceReady: Boolean,
-) {
-  ClawPanel(contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)) {
-    Column {
-      HealthStatusRow(title = "Gateway", value = gateway, healthy = isConnected)
-      HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-      HealthStatusRow(title = "Phone Node", value = node, healthy = isNodeConnected)
-      HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-      HealthStatusRow(title = "Chat", value = chat, healthy = chatHealthOk)
-      HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-      HealthStatusRow(title = "Models", value = models, healthy = modelsReady)
-      HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-      HealthStatusRow(title = "Voice", value = voice, healthy = voiceReady)
-      HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-      HealthStatusRow(title = "Runs", value = runs, healthy = true)
+    SettingsRefreshControls(isConnected, logsState.refreshing, logsState.errorText, viewModel::refreshHealthLogs, label = nativeString("Refresh Logs"))
+    SettingsSummaryContent(logsState, isConnected, nativeString("Connect the gateway to load recent logs.")) { summary ->
+      GatewayLogsPanel(summary = summary, onLogClick = { selectedLogEntry = it })
     }
   }
 }
 
+internal fun voiceRuntimeReady(
+  voiceCaptureMode: VoiceCaptureMode,
+  talkModeEnabled: Boolean,
+  talkModeListening: Boolean,
+  talkModeSpeaking: Boolean,
+  talkAwaitingAgent: Boolean,
+): Boolean =
+  voiceCaptureMode != VoiceCaptureMode.Off ||
+    talkModeEnabled ||
+    talkModeListening ||
+    talkModeSpeaking ||
+    talkAwaitingAgent
+
 @Composable
-private fun HealthStatusRow(
-  title: String,
-  value: String,
-  healthy: Boolean,
+private fun GatewayLogDetailSettingsScreen(
+  entry: GatewayLogEntry,
+  onBack: () -> Unit,
 ) {
-  Row(
-    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
-    verticalAlignment = Alignment.CenterVertically,
-    horizontalArrangement = Arrangement.spacedBy(9.dp),
+  BackHandler(onBack = onBack)
+  SettingsDetailFrame(
+    title = nativeString("Log Entry"),
+    subtitle = nativeString("Readable gateway log detail."),
+    route = SettingsRoute.Health,
+    onBack = onBack,
   ) {
-    Text(text = title, style = ClawTheme.type.body, color = ClawTheme.colors.text, modifier = Modifier.weight(1f), maxLines = 1)
-    ClawStatusPill(text = value, status = if (healthy) ClawStatus.Success else ClawStatus.Warning)
+    SettingsMetricPanel(
+      rows =
+        listOf(
+          SettingsMetric(nativeString("Time"), compactLogTime(entry.time)),
+          SettingsMetric(nativeString("Level"), entry.level?.uppercase() ?: "LOG"),
+          SettingsMetric(nativeString("Subsystem"), entry.subsystem ?: nativeString("Unknown")),
+        ),
+    )
+    SettingsMessagePanel(title = nativeString("Message"), text = entry.message, color = ClawTheme.colors.text, spacing = 6.dp)
+    SettingsMessagePanel(title = nativeString("Raw"), text = entry.raw.takeUtf16Safe(4_000), textStyle = ClawTheme.type.caption, spacing = 6.dp)
   }
 }
+
+internal data class HealthStatus(
+  val title: String,
+  val value: String,
+  val healthy: Boolean,
+)
 
 @Composable
 private fun GatewayLogsPanel(
-  isConnected: Boolean,
   summary: GatewayHealthLogsSummary,
+  onLogClick: (GatewayLogEntry) -> Unit,
 ) {
   Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-      Text(text = "RECENT LOGS", style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted)
+      Text(text = nativeString("RECENT LOGS"), style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted)
       summary.fileName?.let { fileName ->
         Text(text = fileName, style = ClawTheme.type.caption, color = ClawTheme.colors.textSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
       }
     }
-    when {
-      !isConnected ->
-        ClawPanel {
-          Text(text = "Connect the gateway to load recent logs.", style = ClawTheme.type.body, color = ClawTheme.colors.textMuted)
-        }
-      summary.entries.isEmpty() ->
-        ClawPanel {
-          Text(text = "No recent log entries.", style = ClawTheme.type.body, color = ClawTheme.colors.textMuted)
-        }
-      else ->
-        ClawPanel(contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)) {
-          val entries = summary.entries.takeLast(12)
-          Column {
-            entries.forEachIndexed { index, entry ->
-              GatewayLogRow(entry = entry)
-              if (index != entries.lastIndex) {
-                HorizontalDivider(color = ClawTheme.colors.border, thickness = 1.dp)
-              }
-            }
-          }
-        }
+    if (summary.entries.isEmpty()) {
+      SettingsMessagePanel(text = nativeString("No recent log entries."))
+    } else {
+      ClawListPanel(items = summary.entries.takeLast(12), contentPadding = PaddingValues(0.dp), dividerColor = ClawTheme.colors.border) { entry ->
+        GatewayLogRow(entry = entry, onClick = { onLogClick(entry) })
+      }
     }
     if (summary.truncated) {
-      Text(text = "Showing the latest log chunk.", style = ClawTheme.type.caption, color = ClawTheme.colors.textSubtle)
+      Text(text = nativeString("Showing the latest log chunk."), style = ClawTheme.type.caption, color = ClawTheme.colors.textSubtle)
     }
   }
 }
 
 @Composable
-private fun GatewayLogRow(entry: GatewayLogEntry) {
+private fun GatewayLogRow(
+  entry: GatewayLogEntry,
+  onClick: () -> Unit,
+) {
   Row(
-    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+    modifier =
+      Modifier
+        .fillMaxWidth()
+        .clickable(onClickLabel = nativeString("Open log entry"), onClick = onClick)
+        .padding(horizontal = 10.dp, vertical = 7.dp),
     verticalAlignment = Alignment.Top,
     horizontalArrangement = Arrangement.spacedBy(9.dp),
   ) {
@@ -196,12 +203,19 @@ private fun GatewayLogRow(entry: GatewayLogEntry) {
       }
     }
     ClawStatusPill(text = entry.level?.uppercase() ?: "LOG", status = logLevelStatus(entry.level))
+    Icon(
+      imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+      contentDescription = null,
+      tint = ClawTheme.colors.textSubtle,
+    )
   }
 }
 
 private fun compactLogTime(value: String?): String {
   val raw = value?.trim().orEmpty()
   if (raw.isEmpty()) return "--:--"
+  // Gateway log timestamps may be ISO strings or already-compact fragments;
+  // keep only the HH:mm portion when present.
   val time =
     raw
       .substringAfter('T', raw)

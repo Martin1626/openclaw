@@ -1,6 +1,9 @@
-import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
+import {
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+  type OpenClawPluginApi,
+} from "openclaw/plugin-sdk/channel-entry-contract";
 import { registerDiscordSubagentHooks } from "./subagent-hooks-api.js";
-import { discordVoiceTranscriptsSourceProvider } from "./transcripts-source-api.js";
 
 export default defineBundledChannelEntry({
   id: "discord",
@@ -20,7 +23,17 @@ export default defineBundledChannelEntry({
     exportName: "inspectDiscordReadOnlyAccount",
   },
   registerFull(api) {
+    // Account inspection loads this entry too; runtime registration must stay behind its owner mode.
+    loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(import.meta.url, {
+      specifier: "./activities-api.js",
+      exportName: "registerDiscordActivities",
+    })(api);
     registerDiscordSubagentHooks(api);
-    api.registerTranscriptSourceProvider(discordVoiceTranscriptsSourceProvider);
+  },
+  registerCapabilities(api) {
+    loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(import.meta.url, {
+      specifier: "./transcripts-source-api.js",
+      exportName: "registerDiscordTranscriptSourceProvider",
+    })(api);
   },
 });

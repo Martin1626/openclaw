@@ -1,33 +1,18 @@
 import type { PluginChannelRegistration } from "../../plugins/registry-types.js";
-import { getActivePluginChannelRegistry, getActivePluginRegistry } from "../../plugins/runtime.js";
+import { getActivePluginRegistry } from "../../plugins/runtime.js";
+import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import type { ChannelId } from "./channel-id.types.js";
 
-type ChannelRegistryValueResolver<TValue> = (
-  entry: PluginChannelRegistration,
-) => TValue | undefined;
-
+/**
+ * Creates a lazy loader that resolves one value from the authoritative channel registry.
+ */
 export function createChannelRegistryLoader<TValue>(
-  resolveValue: ChannelRegistryValueResolver<TValue>,
+  resolveValue: (entry: PluginChannelRegistration) => TValue | undefined,
 ): (id: ChannelId) => Promise<TValue | undefined> {
   return async (id: ChannelId): Promise<TValue | undefined> => {
-    const resolveFromRegistry = (
-      registry: ReturnType<typeof getActivePluginRegistry>,
-    ): TValue | undefined => {
-      const pluginEntry = registry?.channels.find((entry) => entry.plugin.id === id);
-      return pluginEntry ? resolveValue(pluginEntry) : undefined;
-    };
-
-    const channelRegistry = getActivePluginChannelRegistry();
-    const channelValue = resolveFromRegistry(channelRegistry);
-    if (channelValue !== undefined) {
-      return channelValue;
-    }
-
-    const activeRegistry = getActivePluginRegistry();
-    if (activeRegistry && activeRegistry !== channelRegistry) {
-      return resolveFromRegistry(activeRegistry);
-    }
-
-    return undefined;
+    const registry =
+      getPluginRuntimeGatewayRequestScope()?.pluginRegistry ?? getActivePluginRegistry();
+    const pluginEntry = registry?.channels.find((entry) => entry.plugin.id === id);
+    return pluginEntry ? resolveValue(pluginEntry) : undefined;
   };
 }

@@ -1,8 +1,10 @@
-import type { RawData, WebSocket } from "ws";
 import type { JsonObject, JsonValue } from "../protocol.js";
-import type { HttpHeader, JsonRpcRequest } from "./types.js";
+import type { CodexSandboxExecMessageTransport, HttpHeader, JsonRpcRequest } from "./types.js";
 
+/** JSON-RPC error code used when a sandbox filesystem resource does not exist. */
 export const JSON_RPC_NOT_FOUND = -32004;
+
+export const JSON_RPC_METHOD_NOT_FOUND = -32601;
 
 export class JsonRpcProtocolError extends Error {
   constructor(
@@ -13,13 +15,7 @@ export class JsonRpcProtocolError extends Error {
   }
 }
 
-export function parseRequest(data: RawData): JsonRpcRequest {
-  const buffer = Array.isArray(data)
-    ? Buffer.concat(data)
-    : Buffer.isBuffer(data)
-      ? data
-      : Buffer.from(data);
-  const text = buffer.toString("utf8");
+export function parseRequest(text: string): JsonRpcRequest {
   const parsed = JSON.parse(text) as unknown;
   return requireObject(parsed, "JSON-RPC request") as JsonRpcRequest;
 }
@@ -34,13 +30,6 @@ export function requireObject(value: unknown, label: string): JsonObject {
 export function requireString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value) {
     throw new Error(`${label} must be a non-empty string.`);
-  }
-  return value;
-}
-
-export function requireBase64String(value: unknown, label: string): string {
-  if (typeof value !== "string") {
-    throw new Error(`${label} must be a string.`);
   }
   return value;
 }
@@ -76,18 +65,18 @@ export function readHttpHeaders(value: unknown): HttpHeader[] {
 }
 
 export function sendResult(
-  socket: WebSocket,
+  send: CodexSandboxExecMessageTransport["send"],
   id: string | number,
-  result: JsonValue | undefined,
+  result: JsonValue,
 ): void {
-  socket.send(JSON.stringify({ jsonrpc: "2.0", id, result: result ?? {} }));
+  send({ jsonrpc: "2.0", id, result });
 }
 
 export function sendError(
-  socket: WebSocket,
+  send: CodexSandboxExecMessageTransport["send"],
   id: string | number | undefined,
   code: number,
   message: string,
 ): void {
-  socket.send(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }));
+  send({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
 }

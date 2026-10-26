@@ -4,7 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { normalizeOptionalString } from "../src/shared/string-coerce.ts";
+import { expectDefined } from "../packages/normalization-core/src/expect.js";
+import { normalizeOptionalString } from "../packages/normalization-core/src/string-coerce.js";
+import { requireOptionArgument } from "./lib/arg-utils.mts";
+import { readBoundedResponseText } from "./lib/bounded-response.mjs";
 import {
   maskIdentifier,
   parseStrictIntegerOption,
@@ -14,6 +17,7 @@ import {
 
 type Args = {
   agentId: string;
+  help: boolean;
   reveal: boolean;
   sessionKey?: string;
 };
@@ -23,41 +27,74 @@ type FetchOptions = {
   timeoutMs?: number;
 };
 
+type AuthProfiles = {
+  profiles?: Record<string, { provider?: string; type?: string; token?: string; key?: string }>;
+};
+
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 const FETCH_RESPONSE_MAX_BYTES = 256 * 1024;
 
 const mask = (value: string) => {
-  return maskIdentifier(
-    value,
-    value.trim().length >= 12 ? 6 : 4,
-    value.trim().length >= 12 ? 6 : 4,
-  );
+  const visibleChars = value.trim().length >= 12 ? 6 : 4;
+  return maskIdentifier(value, visibleChars, visibleChars);
 };
 
-const parseArgs = (): Args => {
-  const args = process.argv.slice(2);
+const parseArgs = (args = process.argv.slice(2)): Args => {
   let agentId = "main";
+  let help = false;
   let reveal = false;
   let sessionKey: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--agent" && args[i + 1]) {
-      agentId = args[++i].trim() || "main";
+    const arg = expectDefined(args[i], `Claude usage argument at index ${i}`);
+    const valueFlag = ["--agent", "--session-key"].find(
+      (flag) => arg === flag || arg.startsWith(`${flag}=`),
+    );
+    if (valueFlag) {
+      const value = parseNonBlankArgValue(
+        arg === valueFlag
+          ? requireOptionArgument(args, i++, valueFlag)
+          : arg.slice(valueFlag.length + 1),
+        valueFlag,
+      );
+      if (valueFlag === "--agent") {
+        agentId = value;
+      } else {
+        sessionKey = value;
+      }
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      help = true;
       continue;
     }
     if (arg === "--reveal") {
       reveal = true;
       continue;
     }
-    if (arg === "--session-key" && args[i + 1]) {
-      sessionKey = normalizeOptionalString(args[++i]);
-      continue;
-    }
+    throw new Error(`Unknown argument: ${arg}`);
   }
 
-  return { agentId, reveal, sessionKey };
+  return { agentId, help, reveal, sessionKey };
 };
+
+function parseNonBlankArgValue(value: string, label: string): string {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    throw new Error(`${label} requires a value`);
+  }
+  return normalized;
+}
+
+function printUsage(): void {
+  console.log(`Usage: node --import tsx scripts/debug-claude-usage.ts [options]
+
+Options:
+  --agent <id>          OpenClaw agent id to inspect (default: main)
+  --session-key <key>   Claude web session key override
+  --reveal              Print token/session values instead of masked identifiers
+  --help, -h            Show this help message`);
+}
 
 const loadAuthProfiles = (agentId: string) => {
   const stateRoot = process.env.OPENCLAW_STATE_DIR?.trim() || path.join(os.homedir(), ".openclaw");
@@ -65,9 +102,7 @@ const loadAuthProfiles = (agentId: string) => {
   if (!fs.existsSync(authPath)) {
     throw new Error(`Missing: ${authPath}`);
   }
-  const store = JSON.parse(fs.readFileSync(authPath, "utf8")) as {
-    profiles?: Record<string, { provider?: string; type?: string; token?: string; key?: string }>;
-  };
+  const store = JSON.parse(fs.readFileSync(authPath, "utf8")) as AuthProfiles;
   return { authPath, store };
 };
 
@@ -76,22 +111,12 @@ const CLAUDE_COOKIE_HOST_SQL =
 const CLAUDE_FIREFOX_COOKIE_HOST_SQL =
   "(host = 'claude.ai' OR host = '.claude.ai' OR host LIKE '%.claude.ai')";
 
-const pickAnthropicTokens = (store: {
-  profiles?: Record<string, { provider?: string; type?: string; token?: string; key?: string }>;
-}): Array<{ profileId: string; token: string }> => {
-  const profiles = store.profiles ?? {};
-  const found: Array<{ profileId: string; token: string }> = [];
-  for (const [id, cred] of Object.entries(profiles)) {
-    if (cred?.provider !== "anthropic") {
-      continue;
-    }
-    const token = cred.type === "token" ? cred.token?.trim() : undefined;
-    if (token) {
-      found.push({ profileId: id, token });
-    }
-  }
-  return found;
-};
+const pickAnthropicTokens = (store: AuthProfiles): Array<{ profileId: string; token: string }> =>
+  Object.entries(store.profiles ?? {}).flatMap(([profileId, cred]) => {
+    const token =
+      cred?.provider === "anthropic" && cred.type === "token" ? cred.token?.trim() : undefined;
+    return token ? [{ profileId, token }] : [];
+  });
 
 const resolveFetchTimeoutMs = (raw = process.env.OPENCLAW_DEBUG_CLAUDE_USAGE_FETCH_TIMEOUT_MS) => {
   return parseStrictIntegerOption({
@@ -125,93 +150,6 @@ const withFetchTimeout = async <T>(
   }
 };
 
-const responseBodyTooLargeError = (label: string, maxBytes: number): Error =>
-  new Error(`${label} response body exceeded ${maxBytes} bytes`);
-
-const readResponseChunk = async (
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  label: string,
-  signal: AbortSignal,
-  markCanceled: () => void,
-): Promise<ReadableStreamReadResult<Uint8Array>> => {
-  if (signal.aborted) {
-    markCanceled();
-    await reader.cancel().catch(() => undefined);
-    throw signal.reason instanceof Error ? signal.reason : new Error(`${label} request aborted`);
-  }
-
-  let removeAbortListener: (() => void) | undefined;
-  const abortPromise = new Promise<ReadableStreamReadResult<Uint8Array>>((_resolve, reject) => {
-    const onAbort = () => {
-      markCanceled();
-      void reader.cancel().catch(() => undefined);
-      reject(
-        signal.reason instanceof Error ? signal.reason : new Error(`${label} request aborted`),
-      );
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-  });
-
-  try {
-    return await Promise.race([reader.read(), abortPromise]);
-  } finally {
-    removeAbortListener?.();
-  }
-};
-
-const readBoundedResponseText = async (
-  response: Response,
-  label: string,
-  signal: AbortSignal,
-  maxBytes = FETCH_RESPONSE_MAX_BYTES,
-): Promise<string> => {
-  const contentLength = Number(response.headers.get("content-length") ?? "");
-  if (Number.isSafeInteger(contentLength) && contentLength > maxBytes) {
-    await response.body?.cancel().catch(() => undefined);
-    throw responseBodyTooLargeError(label, maxBytes);
-  }
-
-  if (!response.body) {
-    return "";
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  let totalBytes = 0;
-  let canceled = false;
-
-  try {
-    for (;;) {
-      const { done, value } = await readResponseChunk(reader, label, signal, () => {
-        canceled = true;
-      });
-      if (done) {
-        const tail = decoder.decode();
-        if (tail) {
-          chunks.push(tail);
-        }
-        break;
-      }
-
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        canceled = true;
-        await reader.cancel().catch(() => undefined);
-        throw responseBodyTooLargeError(label, maxBytes);
-      }
-      chunks.push(decoder.decode(value, { stream: true }));
-    }
-  } finally {
-    if (!canceled) {
-      reader.releaseLock();
-    }
-  }
-
-  return chunks.join("");
-};
-
 const fetchText = async (
   label: string,
   url: string,
@@ -222,7 +160,7 @@ const fetchText = async (
   const timeoutMs = options.timeoutMs ?? resolveFetchTimeoutMs();
   return await withFetchTimeout(label, timeoutMs, async (signal) => {
     const res = await fetchImpl(url, { ...init, signal });
-    const text = await readBoundedResponseText(res, label, signal);
+    const text = await readBoundedResponseText(res, label, FETCH_RESPONSE_MAX_BYTES, { signal });
     return { res, text };
   });
 };
@@ -247,7 +185,6 @@ const fetchAnthropicOAuthUsage = async (token: string, options: FetchOptions = {
 
 const readClaudeCliKeychain = (): {
   accessToken: string;
-  expiresAt?: number;
   scopes?: string[];
 } | null => {
   if (process.platform !== "darwin") {
@@ -268,11 +205,10 @@ const readClaudeCliKeychain = (): {
     if (typeof accessToken !== "string" || !accessToken.trim()) {
       return null;
     }
-    const expiresAt = typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined;
     const scopes = Array.isArray(oauth.scopes)
       ? oauth.scopes.filter((v): v is string => typeof v === "string")
       : undefined;
-    return { accessToken, expiresAt, scopes };
+    return { accessToken, scopes };
   } catch {
     return null;
   }
@@ -397,8 +333,6 @@ const queryFirefoxCookieDb = (cookieDb: string): string | null => {
   }
 };
 
-const browserRootLabel = (root: string): string => path.basename(root) || "browser";
-
 const findClaudeSessionKey = (): { sessionKey: string; source: string } | null => {
   if (process.platform !== "darwin") {
     return null;
@@ -446,7 +380,10 @@ const findClaudeSessionKey = (): { sessionKey: string; source: string } | null =
       }
       const value = queryChromeCookieDb(db);
       if (value) {
-        return { sessionKey: value, source: `chromium:${browserRootLabel(root)}/${profile}` };
+        return {
+          sessionKey: value,
+          source: `chromium:${path.basename(root) || "browser"}/${profile}`,
+        };
       }
     }
   }
@@ -487,8 +424,13 @@ const fetchClaudeWebUsage = async (sessionKey: string, options: FetchOptions = {
     : { ok: false as const, step: "usage", status: usageRes.status, body: usageText };
 };
 
-const main = async () => {
-  const opts = parseArgs();
+const main = async (argv = process.argv.slice(2)) => {
+  const opts = parseArgs(argv);
+  if (opts.help) {
+    printUsage();
+    return;
+  }
+
   const { authPath, store } = loadAuthProfiles(opts.agentId);
   console.log(`Auth file: ${redactHomePath(authPath)}`);
 
@@ -525,7 +467,7 @@ const main = async () => {
   const envSessionKey =
     process.env.CLAUDE_AI_SESSION_KEY?.trim() || process.env.CLAUDE_WEB_SESSION_KEY?.trim();
   const discoveredSession = opts.sessionKey || envSessionKey ? null : findClaudeSessionKey();
-  const sessionKey = opts.sessionKey?.trim() || envSessionKey || discoveredSession?.sessionKey;
+  const sessionKey = opts.sessionKey || envSessionKey || discoveredSession?.sessionKey;
   const source = opts.sessionKey
     ? "--session-key"
     : envSessionKey
@@ -554,17 +496,13 @@ const main = async () => {
 
 export const testing = {
   CLAUDE_COOKIE_HOST_SQL,
-  CLAUDE_FIREFOX_COOKIE_HOST_SQL,
-  FETCH_RESPONSE_MAX_BYTES,
-  browserRootLabel,
   fetchAnthropicOAuthUsage,
-  mask,
-  readBoundedResponseText,
+  parseArgs,
   resolveFetchTimeoutMs,
 };
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  await main().catch((error) => {
+if (import.meta.url === pathToFileURL(path.resolve(process.argv[1] ?? "")).href) {
+  await main().catch((error: unknown) => {
     console.error(
       previewForDevToolLog(error instanceof Error ? error.message : String(error), 800),
     );

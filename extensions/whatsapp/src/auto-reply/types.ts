@@ -1,4 +1,7 @@
-import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import type {
+  ChannelAccountSnapshot,
+  ChannelRuntimeSurface,
+} from "openclaw/plugin-sdk/channel-contract";
 import type { WebInboundMessage } from "../inbound/types.js";
 import type { ReconnectPolicy } from "../reconnect.js";
 import type { WhatsAppSocketTimingOptions } from "../socket-timing.js";
@@ -12,11 +15,13 @@ export type WebChannelHealthState =
   | "logged-out"
   | "stopped";
 
+/** @deprecated Use `WebInboundMessage`. */
 export type WebInboundMsg = WebInboundMessage;
 
 export type WebChannelStatus = {
   running: boolean;
   connected: boolean;
+  authAgeMs?: number | null;
   reconnectAttempts: number;
   lastConnectedAt?: number | null;
   lastDisconnect?: {
@@ -29,8 +34,12 @@ export type WebChannelStatus = {
   lastMessageAt?: number | null;
   lastEventAt?: number | null;
   lastTransportActivityAt?: number | null;
+  busy?: boolean;
+  lastRunActivityAt?: number | null;
   lastError?: string | null;
   healthState?: WebChannelHealthState;
+  lifecycle?: ChannelAccountSnapshot["lifecycle"];
+  terminalDisconnect?: boolean;
 };
 
 export type WebMonitorTuning = {

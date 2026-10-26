@@ -1,15 +1,15 @@
-import {
-  emitTrustedDiagnosticEvent,
-  type DiagnosticEventInput,
-} from "../infra/diagnostic-events.js";
-import { firstFiniteTalkEventNumber, talkEventPayloadRecord } from "./event-metrics.js";
+/**
+ * The diagnostic stream needs timing and size counters for reliability work,
+ * but must not export raw provider payloads, transcripts, or audio content.
+ */
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { emitTrustedDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { firstFiniteTalkEventNumber } from "./event-metrics.js";
 import type { TalkEvent } from "./talk-events.js";
 
-type TalkDiagnosticEventInput = Extract<DiagnosticEventInput, { type: "talk.event" }>;
-
-export function createTalkDiagnosticEvent(event: TalkEvent): TalkDiagnosticEventInput {
-  const payload = talkEventPayloadRecord(event.payload);
-  return {
+export function recordTalkDiagnosticEvent(event: TalkEvent): void {
+  const payload = asOptionalRecord(event.payload);
+  emitTrustedDiagnosticEvent({
     type: "talk.event",
     sessionId: event.sessionId,
     turnId: event.turnId,
@@ -20,11 +20,9 @@ export function createTalkDiagnosticEvent(event: TalkEvent): TalkDiagnosticEvent
     brain: event.brain,
     provider: event.provider,
     final: event.final,
+    // Read only known numeric aliases from provider payloads; raw payload text
+    // and audio bytes stay out of diagnostics.
     durationMs: firstFiniteTalkEventNumber(payload, ["durationMs", "latencyMs", "elapsedMs"]),
     byteLength: firstFiniteTalkEventNumber(payload, ["byteLength", "audioBytes"]),
-  };
-}
-
-export function recordTalkDiagnosticEvent(event: TalkEvent): void {
-  emitTrustedDiagnosticEvent(createTalkDiagnosticEvent(event));
+  });
 }

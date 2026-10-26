@@ -1,17 +1,11 @@
-import { runQaCoverageReportCommand } from "../extensions/qa-lab/src/cli.runtime.ts";
-import { booleanFlag, parseFlagArgs, stringFlag, stringListFlag } from "./lib/arg-utils.mjs";
+import { booleanFlag, parseFlagArgs, stringFlag, stringListFlag } from "./lib/arg-utils.mts";
 
-type Options = {
-  json?: boolean;
-  match?: string[];
-  output?: string;
-  repoRoot?: string;
-  summary?: string;
-  tools?: boolean;
-};
+type Options = Parameters<
+  typeof import("../extensions/qa-lab/src/cli.runtime.ts").runQaCoverageReportCommand
+>[0];
 
 function parseArgs(args: string[]): Options {
-  return parseFlagArgs(
+  return parseFlagArgs<Options>(
     args,
     {},
     [
@@ -41,15 +35,14 @@ Options:
         process.exit(0);
       },
     },
-  ) as Options;
+  );
 }
 
-const opts = parseArgs(process.argv.slice(2));
-await runQaCoverageReportCommand({
-  ...(opts.json ? { json: true } : {}),
-  ...(opts.match ? { match: opts.match } : {}),
-  ...(opts.output ? { output: opts.output } : {}),
-  ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
-  ...(opts.summary ? { summary: opts.summary } : {}),
-  ...(opts.tools ? { tools: true } : {}),
-});
+try {
+  const opts = parseArgs(process.argv.slice(2));
+  const { runQaCoverageReportCommand } = await import("../extensions/qa-lab/src/cli.runtime.ts");
+  await runQaCoverageReportCommand(opts);
+} catch (error) {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

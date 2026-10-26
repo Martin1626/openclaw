@@ -1,124 +1,392 @@
+import { isOpenAIGpt56Model } from "@openclaw/ai/internal/openai";
+import { projectRuntimeToolInputSchema } from "@openclaw/ai/internal/tool-schema";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { StreamFn } from "../../../agents/runtime/index.js";
-import { normalizeOptionalString } from "../../../shared/string-coerce.js";
 import { streamSimple } from "../../stream.js";
-type AnthropicToolSchemaMode = "openai-functions";
-type AnthropicToolChoiceMode = "openai-string-modes";
-
+import { streamWithPayloadPatch } from "./stream-payload-utils.js";
 type AnthropicToolPayloadCompatibilityOptions = {
-  toolSchemaMode?: AnthropicToolSchemaMode;
-  toolChoiceMode?: AnthropicToolChoiceMode;
+  toolSchemaMode?: "openai-functions";
+  toolChoiceMode?: "openai-string-modes";
 };
 
-function hasOpenAiAnthropicToolPayloadCompatFlag(model: { compat?: unknown }): boolean {
-  if (!model.compat || typeof model.compat !== "object" || Array.isArray(model.compat)) {
-    return false;
+type PayloadFieldRead = { ok: true; value: unknown } | { ok: false };
+
+type OpenAiToolProjection = {
+  readonly kind?: "custom" | "function";
+  readonly name?: string;
+  readonly projectedKind?: "custom" | "function";
+  readonly tool: Record<string, unknown>;
+};
+
+type OpenAiFunctionToolsProjection = {
+  readonly customFunctionNames: ReadonlySet<string>;
+  readonly customNames: ReadonlySet<string>;
+  readonly functionNames: ReadonlySet<string>;
+  readonly tools: readonly Record<string, unknown>[];
+};
+
+function readPayloadField(record: Record<string, unknown>, field: string): PayloadFieldRead {
+  try {
+    return { ok: true, value: Reflect.get(record, field) };
+  } catch {
+    return { ok: false };
   }
-
-  return (
-    (model.compat as { requiresOpenAiAnthropicToolPayload?: unknown })
-      .requiresOpenAiAnthropicToolPayload === true
-  );
 }
 
-function requiresAnthropicToolPayloadCompatibilityForModel(
-  model: {
-    api?: unknown;
-    compat?: unknown;
-  },
-  options?: AnthropicToolPayloadCompatibilityOptions,
-): boolean {
-  if (model.api !== "anthropic-messages") {
-    return false;
+function projectJsonObjectSchema(
+  schema: unknown,
+  path: string,
+): Record<string, unknown> | undefined {
+  const { schema: normalizedSchema, violations } = projectRuntimeToolInputSchema(schema, path);
+  if (
+    !isRecord(normalizedSchema) ||
+    violations.some(
+      (violation) => !violation.endsWith(".$dynamicRef") && !violation.endsWith(".$dynamicAnchor"),
+    )
+  ) {
+    return undefined;
   }
-  return (
-    Boolean(options?.toolSchemaMode || options?.toolChoiceMode) ||
-    hasOpenAiAnthropicToolPayloadCompatFlag(model)
-  );
+  const { properties, required } = normalizedSchema;
+  if (
+    (properties !== undefined && properties !== null && !isRecord(properties)) ||
+    (required !== undefined &&
+      required !== null &&
+      (!Array.isArray(required) || required.some((entry) => typeof entry !== "string")))
+  ) {
+    return undefined;
+  }
+  if (properties === null) {
+    delete normalizedSchema.properties;
+  }
+  if (required === null) {
+    delete normalizedSchema.required;
+  }
+  return normalizedSchema;
 }
 
-function usesOpenAiFunctionAnthropicToolSchemaForModel(
-  model: {
-    compat?: unknown;
-  },
-  options?: AnthropicToolPayloadCompatibilityOptions,
-): boolean {
-  return (
-    options?.toolSchemaMode === "openai-functions" || hasOpenAiAnthropicToolPayloadCompatFlag(model)
-  );
+function snapshotJsonRecord(value: unknown): Record<string, unknown> | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    if (!serialized) {
+      return undefined;
+    }
+    const snapshot = JSON.parse(serialized) as unknown;
+    return isRecord(snapshot) ? snapshot : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function usesOpenAiStringModeAnthropicToolChoiceForModel(
-  model: {
-    compat?: unknown;
-  },
-  options?: AnthropicToolPayloadCompatibilityOptions,
-): boolean {
-  return (
-    options?.toolChoiceMode === "openai-string-modes" ||
-    hasOpenAiAnthropicToolPayloadCompatFlag(model)
-  );
+function snapshotToolMetadata(tool: Record<string, unknown>): Record<string, unknown> | undefined {
+  let fields: string[];
+  try {
+    fields = Object.keys(tool);
+  } catch {
+    return undefined;
+  }
+  const metadata: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (field === "function" || field === "type") {
+      continue;
+    }
+    const read = readPayloadField(tool, field);
+    if (!read.ok) {
+      continue;
+    }
+    try {
+      const serialized = JSON.stringify(read.value);
+      if (serialized !== undefined) {
+        metadata[field] = JSON.parse(serialized) as unknown;
+      }
+    } catch {
+      // Provider extensions are optional; keep the usable function definition.
+    }
+  }
+  return metadata;
 }
 
 function normalizeOpenAiFunctionAnthropicToolDefinition(
   tool: unknown,
-): Record<string, unknown> | undefined {
-  if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+): OpenAiToolProjection | undefined {
+  if (!isRecord(tool)) {
     return undefined;
   }
 
-  const toolObj = tool as Record<string, unknown>;
-  if (toolObj.function && typeof toolObj.function === "object") {
-    return toolObj;
+  const functionField = readPayloadField(tool, "function");
+  if (!functionField.ok) {
+    return undefined;
+  }
+  if (isRecord(functionField.value)) {
+    const nameField = readPayloadField(functionField.value, "name");
+    if (!nameField.ok) {
+      return undefined;
+    }
+    const name = normalizeOptionalString(nameField.value);
+    if (!name) {
+      return undefined;
+    }
+    const parametersField = readPayloadField(functionField.value, "parameters");
+    if (!parametersField.ok) {
+      return undefined;
+    }
+    const parameters =
+      parametersField.value === undefined
+        ? undefined
+        : projectJsonObjectSchema(parametersField.value, `${name}.parameters`);
+    if (parametersField.value !== undefined && !parameters) {
+      return undefined;
+    }
+    const functionSpec: Record<string, unknown> = {
+      name,
+      ...(parameters ? { parameters } : {}),
+    };
+    const descriptionField = readPayloadField(functionField.value, "description");
+    if (
+      descriptionField.ok &&
+      typeof descriptionField.value === "string" &&
+      descriptionField.value.trim()
+    ) {
+      functionSpec.description = descriptionField.value;
+    }
+    const strictField = readPayloadField(functionField.value, "strict");
+    if (strictField.ok && (typeof strictField.value === "boolean" || strictField.value === null)) {
+      functionSpec.strict = strictField.value;
+    }
+    const metadata = snapshotToolMetadata(tool);
+    if (!metadata) {
+      return undefined;
+    }
+    return {
+      kind: "function",
+      name,
+      projectedKind: "function",
+      tool: {
+        ...metadata,
+        type: "function",
+        function: functionSpec,
+      },
+    };
   }
 
-  const rawName = normalizeOptionalString(toolObj.name) ?? "";
+  const nameField = readPayloadField(tool, "name");
+  if (!nameField.ok) {
+    return undefined;
+  }
+  const rawName = normalizeOptionalString(nameField.value);
   if (!rawName) {
-    return toolObj;
+    const snapshot = snapshotJsonRecord(tool);
+    if (!snapshot) {
+      return undefined;
+    }
+    if (snapshot.type === "custom" && isRecord(snapshot.custom)) {
+      const name = normalizeOptionalString(snapshot.custom.name);
+      if (!name) {
+        return undefined;
+      }
+      const inputSchema = snapshot.custom.input_schema;
+      if (inputSchema === undefined) {
+        return { kind: "custom", name, projectedKind: "custom", tool: snapshot };
+      }
+      const parameters = projectJsonObjectSchema(inputSchema, `${name}.input_schema`);
+      if (!parameters) {
+        return undefined;
+      }
+      const functionSpec: Record<string, unknown> = { name, parameters };
+      if (typeof snapshot.custom.description === "string" && snapshot.custom.description.trim()) {
+        functionSpec.description = snapshot.custom.description;
+      }
+      return {
+        kind: "custom",
+        name,
+        projectedKind: "function",
+        tool: { type: "function", function: functionSpec },
+      };
+    }
+    return { tool: snapshot };
   }
 
+  const inputSchemaField = readPayloadField(tool, "input_schema");
+  if (!inputSchemaField.ok) {
+    return undefined;
+  }
+  let parameters: unknown = { type: "object", properties: {} };
+  if (isRecord(inputSchemaField.value)) {
+    parameters = projectJsonObjectSchema(inputSchemaField.value, `${rawName}.input_schema`);
+    if (!parameters) {
+      return undefined;
+    }
+  } else {
+    const parametersField = readPayloadField(tool, "parameters");
+    if (!parametersField.ok) {
+      return undefined;
+    }
+    if (isRecord(parametersField.value)) {
+      parameters = projectJsonObjectSchema(parametersField.value, `${rawName}.parameters`);
+      if (!parameters) {
+        return undefined;
+      }
+    } else if (inputSchemaField.value !== undefined || parametersField.value !== undefined) {
+      return undefined;
+    }
+  }
   const functionSpec: Record<string, unknown> = {
     name: rawName,
-    parameters:
-      toolObj.input_schema && typeof toolObj.input_schema === "object"
-        ? toolObj.input_schema
-        : toolObj.parameters && typeof toolObj.parameters === "object"
-          ? toolObj.parameters
-          : { type: "object", properties: {} },
+    parameters,
   };
 
-  if (typeof toolObj.description === "string" && toolObj.description.trim()) {
-    functionSpec.description = toolObj.description;
+  const descriptionField = readPayloadField(tool, "description");
+  if (
+    descriptionField.ok &&
+    typeof descriptionField.value === "string" &&
+    descriptionField.value.trim()
+  ) {
+    functionSpec.description = descriptionField.value;
   }
-  if (typeof toolObj.strict === "boolean") {
-    functionSpec.strict = toolObj.strict;
+  const strictField = readPayloadField(tool, "strict");
+  if (strictField.ok && typeof strictField.value === "boolean") {
+    functionSpec.strict = strictField.value;
   }
 
   return {
-    type: "function",
-    function: functionSpec,
+    kind: "function",
+    name: rawName,
+    projectedKind: "function",
+    tool: {
+      type: "function",
+      function: functionSpec,
+    },
   };
 }
 
-function normalizeOpenAiStringModeAnthropicToolChoice(toolChoice: unknown): unknown {
-  if (!toolChoice || typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
+function projectOpenAiFunctionAnthropicTools(
+  tools: readonly unknown[],
+): OpenAiFunctionToolsProjection {
+  const projectedTools: Record<string, unknown>[] = [];
+  const customFunctionNames = new Set<string>();
+  const customNames = new Set<string>();
+  const functionNames = new Set<string>();
+  for (const tool of tools) {
+    const projection = normalizeOpenAiFunctionAnthropicToolDefinition(tool);
+    if (!projection) {
+      continue;
+    }
+    projectedTools.push(projection.tool);
+    if (projection.kind === "custom" && projection.name) {
+      customNames.add(projection.name);
+      if (projection.projectedKind === "function") {
+        customFunctionNames.add(projection.name);
+      }
+    } else if (projection.kind === "function" && projection.name) {
+      functionNames.add(projection.name);
+    }
+  }
+  return {
+    customFunctionNames,
+    customNames,
+    functionNames,
+    tools: projectedTools,
+  };
+}
+
+function isProjectedToolAvailable(
+  projection: OpenAiFunctionToolsProjection | undefined,
+  kind: "custom" | "function",
+  name: string,
+): boolean {
+  return (
+    !projection || (kind === "custom" ? projection.customNames : projection.functionNames).has(name)
+  );
+}
+
+function projectToolChoiceKind(
+  projection: OpenAiFunctionToolsProjection,
+  kind: "custom" | "function",
+  name: string,
+): "custom" | "function" {
+  return kind === "custom" && projection.customFunctionNames.has(name) ? "function" : kind;
+}
+
+function normalizeAllowedToolChoice(
+  choice: Record<string, unknown>,
+  toolProjection: OpenAiFunctionToolsProjection | undefined,
+): unknown {
+  if (!toolProjection || !isRecord(choice.allowed_tools)) {
+    return choice;
+  }
+  const mode = choice.allowed_tools.mode;
+  if ((mode !== "auto" && mode !== "required") || !Array.isArray(choice.allowed_tools.tools)) {
+    return choice;
+  }
+  const tools = choice.allowed_tools.tools.flatMap<Record<string, unknown>>((tool) => {
+    const snapshot = snapshotJsonRecord(tool);
+    if (!snapshot) {
+      return [];
+    }
+    const kind =
+      snapshot.type === "custom" || snapshot.type === "function" ? snapshot.type : undefined;
+    const definition = kind && isRecord(snapshot[kind]) ? snapshot[kind] : undefined;
+    const name = definition && normalizeOptionalString(definition.name);
+    if (!kind || !name || !isProjectedToolAvailable(toolProjection, kind, name)) {
+      return [];
+    }
+    const projectedKind = projectToolChoiceKind(toolProjection, kind, name);
+    return [{ type: projectedKind, [projectedKind]: { name } }];
+  });
+  if (tools.length === 0) {
+    if (mode === "auto") {
+      return "none";
+    }
+    throw new Error(
+      "OpenAI-compatible Anthropic tool_choice requires a tool, but no allowed tools survived payload conversion",
+    );
+  }
+  return {
+    type: "allowed_tools",
+    allowed_tools: { mode, tools },
+  };
+}
+
+function normalizeOpenAiStringModeAnthropicToolChoice(
+  toolChoice: unknown,
+  toolProjection?: OpenAiFunctionToolsProjection,
+): unknown {
+  const mode = isRecord(toolChoice)
+    ? toolChoice.type === "any"
+      ? "required"
+      : toolChoice.type
+    : toolChoice;
+  if (mode === "auto" || mode === "none" || mode === "required") {
+    if (mode === "auto" && toolProjection?.tools.length === 0) {
+      return undefined;
+    }
+    if (mode === "required" && toolProjection?.tools.length === 0) {
+      throw new Error(
+        "OpenAI-compatible Anthropic tool_choice requires a tool, but no tools survived payload conversion",
+      );
+    }
+    return mode;
+  }
+  if (!isRecord(toolChoice)) {
     return toolChoice;
   }
 
-  const choice = toolChoice as Record<string, unknown>;
-  if (choice.type === "auto") {
-    return "auto";
+  const choice = toolChoice;
+  const kind = choice.type === "custom" ? "custom" : "function";
+  const definition =
+    choice.type === "tool" ? choice : choice.type === kind ? choice[kind] : undefined;
+  const name = isRecord(definition) ? normalizeOptionalString(definition.name) : undefined;
+  if (name) {
+    if (!isProjectedToolAvailable(toolProjection, kind, name)) {
+      throw new Error(
+        `OpenAI-compatible Anthropic tool_choice requested unavailable tool "${name}" after payload conversion`,
+      );
+    }
+    const projectedKind = toolProjection ? projectToolChoiceKind(toolProjection, kind, name) : kind;
+    return { type: projectedKind, [projectedKind]: { name } };
   }
-  if (choice.type === "none") {
-    return "none";
-  }
-  if (choice.type === "required" || choice.type === "any") {
-    return "required";
-  }
-  if (choice.type === "tool" && typeof choice.name === "string" && choice.name.trim()) {
-    return {
-      type: "function",
-      function: { name: choice.name.trim() },
-    };
+  if (choice.type === "allowed_tools") {
+    return normalizeAllowedToolChoice(choice, toolProjection);
   }
 
   return toolChoice;
@@ -130,35 +398,44 @@ export function createAnthropicToolPayloadCompatibilityWrapper(
   options?: AnthropicToolPayloadCompatibilityOptions,
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
-  return (model, context, streamOptions) => {
-    const originalOnPayload = streamOptions?.onPayload;
-    return underlying(model, context, {
-      ...streamOptions,
-      onPayload: (payload) => {
+  return (model, context, streamOptions) =>
+    streamWithPayloadPatch(underlying, model, context, streamOptions, (payloadObj) => {
+      if (model.api === "anthropic-messages") {
+        const compatibilityFlag =
+          isRecord(model.compat) && model.compat.requiresOpenAiAnthropicToolPayload === true;
+        let toolProjection: OpenAiFunctionToolsProjection | undefined;
         if (
-          payload &&
-          typeof payload === "object" &&
-          requiresAnthropicToolPayloadCompatibilityForModel(model, options)
+          Array.isArray(payloadObj.tools) &&
+          (options?.toolSchemaMode === "openai-functions" || compatibilityFlag)
         ) {
-          const payloadObj = payload as Record<string, unknown>;
-          if (
-            Array.isArray(payloadObj.tools) &&
-            usesOpenAiFunctionAnthropicToolSchemaForModel(model, options)
-          ) {
-            payloadObj.tools = payloadObj.tools
-              .map((tool) => normalizeOpenAiFunctionAnthropicToolDefinition(tool))
-              .filter((tool): tool is Record<string, unknown> => !!tool);
-          }
-          if (usesOpenAiStringModeAnthropicToolChoiceForModel(model, options)) {
-            payloadObj.tool_choice = normalizeOpenAiStringModeAnthropicToolChoice(
-              payloadObj.tool_choice,
-            );
+          toolProjection = projectOpenAiFunctionAnthropicTools(payloadObj.tools);
+          if (toolProjection.tools.length > 0) {
+            payloadObj.tools = toolProjection.tools;
+          } else {
+            delete payloadObj.tools;
           }
         }
-        return originalOnPayload?.(payload, model);
-      },
+        if (options?.toolChoiceMode === "openai-string-modes" || compatibilityFlag) {
+          const toolChoice = normalizeOpenAiStringModeAnthropicToolChoice(
+            payloadObj.tool_choice,
+            toolProjection,
+          );
+          if (toolChoice === undefined) {
+            delete payloadObj.tool_choice;
+          } else {
+            payloadObj.tool_choice = toolChoice;
+          }
+        }
+        if (
+          isOpenAIGpt56Model(model) &&
+          toolProjection?.tools.some((tool) => tool.type === "function")
+        ) {
+          // GPT-5.6 Chat Completions rejects function tools while reasoning
+          // is enabled and defaults reasoning on when the field is omitted.
+          payloadObj.reasoning_effort = "none";
+        }
+      }
     });
-  };
 }
 
 /** @deprecated Anthropic-family provider stream helper; do not use from third-party plugins. */

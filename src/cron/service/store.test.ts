@@ -1,12 +1,32 @@
+// Cron service store tests cover persisted service state loading and writes.
 import fs from "node:fs/promises";
-import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../../state/openclaw-state-db.js";
+import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { setupCronServiceSuite } from "../service.test-harness.js";
-import { resolveCronQuarantinePath, saveCronStore } from "../store.js";
+import * as cronStoreModule from "../store.js";
+import { loadCronStore, saveCronStore } from "../store.js";
+import { cronStoreKey } from "../store/key.js";
+import {
+  CronRunReceiptConflictError,
+  finishCronRunReceiptAsync,
+  prepareCronRunReceiptClaim,
+} from "../store/run-receipt-store.js";
+import { claimCronRunReceiptInDatabaseForTest } from "../store/run-receipt-store.test-support.js";
 import type { CronJob } from "../types.js";
-import { findJobOrThrow } from "./jobs.js";
+import { findJobOrThrow } from "./jobs-scheduling.js";
+import { prepareCronRunReceiptOwnerMutation } from "./run-receipts.js";
 import { createCronServiceState } from "./state.js";
-import { ensureLoaded, persist } from "./store.js";
+import {
+  ensureLoaded,
+  snapshotStoreForRollback,
+  captureCronJobMutationSource,
+  persistCronJobMutation,
+} from "./store.js";
 
 const { logger, makeStorePath } = setupCronServiceSuite({
   prefix: "cron-service-store-seam",
@@ -19,23 +39,19 @@ async function writeSingleJobStore(storePath: string, job: Record<string, unknow
 }
 
 async function writeJobStore(storePath: string, jobs: unknown[]) {
-  await fs.mkdir(path.dirname(storePath), { recursive: true });
-  await fs.writeFile(
-    storePath,
-    JSON.stringify(
-      {
-        version: 1,
-        jobs,
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
+  await saveCronStore(storePath, {
+    version: 1,
+    jobs: jobs as CronJob[],
+  });
 }
 
-function createStoreTestState(storePath: string) {
+async function expectPathMissing(targetPath: string): Promise<void> {
+  await expect(fs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+function createStoreTestState(storePath: string, onEvent = vi.fn()) {
   return createCronServiceState({
+    scheduler: createTestGatewayScheduler(),
     storePath,
     cronEnabled: true,
     log: logger,
@@ -43,6 +59,7 @@ function createStoreTestState(storePath: string) {
     enqueueSystemEvent: vi.fn(),
     requestHeartbeat: vi.fn(),
     runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+    onEvent,
   });
 }
 
@@ -61,21 +78,39 @@ function createReloadCronJob(params?: Partial<CronJob>): CronJob {
     ...params,
   };
 }
-
-function expectWarnedJob(params: { storePath: string; jobId: string; message: string }) {
-  const warnCalls = logger.warn.mock.calls as unknown as Array<
-    [{ storePath?: string; jobId?: string }, string]
-  >;
-  const warning = warnCalls.find(
-    ([metadata, message]) => metadata.jobId === params.jobId && message.includes(params.message),
-  );
-  expect(warning?.[0].storePath).toBe(params.storePath);
-  expect(warning?.[0].jobId).toBe(params.jobId);
-  expect(warning?.[1]).toContain(params.message);
-}
-
 describe("cron service store seam coverage", () => {
-  it("loads stored jobs, recomputes next runs, and does not rewrite the store on load", async () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a loaded snapshot stale when a writer advances its revision during loading", async () => {
+    const { storePath } = await makeStorePath();
+    const state = createStoreTestState(storePath);
+    const first = createReloadCronJob({ id: "before-write" });
+    const second = createReloadCronJob({ id: "after-write" });
+    const loaded = (job: CronJob) => ({
+      store: { version: 1 as const, jobs: [job] },
+      configJobs: [{ ...job }],
+      configJobIndexes: [0],
+      configJobRuntimeEntries: [{ state: job.state }],
+      invalidConfigRows: [],
+    });
+    const read = vi
+      .spyOn(cronStoreModule, "loadCronJobsStoreWithConfigJobs")
+      .mockImplementationOnce(async () => {
+        cronStoreModule.noteCronJobsStoreCommit(storePath);
+        return loaded(first);
+      })
+      .mockResolvedValue(loaded(second));
+
+    await ensureLoaded(state);
+    expect(state.store?.jobs[0]?.id).toBe("before-write");
+    await ensureLoaded(state);
+    expect(state.store?.jobs[0]?.id).toBe("after-write");
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("loads stored jobs without schedule repair or rewriting the store", async () => {
     const { storePath } = await makeStorePath();
 
     await writeSingleJobStore(storePath, {
@@ -108,12 +143,10 @@ describe("cron service store seam coverage", () => {
     expect(job.delivery?.mode).toBe("announce");
     expect(job.delivery?.channel).toBe("telegram");
     expect(job.delivery?.to).toBe("123");
-    expect(job?.state.nextRunAtMs).toBe(STORE_TEST_NOW);
+    expect(job.state.nextRunAtMs).toBeUndefined();
 
-    const persisted = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    const persistedJob = persisted.jobs[0];
+    const persistedJob = (await loadCronStore(storePath)).jobs[0];
+    expect(persistedJob?.state.nextRunAtMs).toBeUndefined();
     const persistedPayload = persistedJob?.payload as
       | { kind?: string; message?: string }
       | undefined;
@@ -125,481 +158,380 @@ describe("cron service store seam coverage", () => {
     expect(persistedDelivery?.mode).toBe("announce");
     expect(persistedDelivery?.channel).toBe("telegram");
     expect(persistedDelivery?.to).toBe("123");
-
-    const firstMtime = state.storeFileMtimeMs;
-    expect(typeof firstMtime).toBe("number");
-
-    await persist(state);
-    expect(typeof state.storeFileMtimeMs).toBe("number");
-    expect((state.storeFileMtimeMs ?? 0) >= (firstMtime ?? 0)).toBe(true);
+    await expectPathMissing(storePath);
   });
 
-  it("quarantines unsupported payload-kind rows and sanitizes active jobs.json", async () => {
+  it("quarantines malformed SQLite rows atomically without creating JSON state", async () => {
     const { storePath } = await makeStorePath();
-
-    await writeJobStore(storePath, [
-      {
-        id: "valid-job",
-        name: "valid job",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 60_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick" },
-        state: {},
-      },
-      {
-        id: "legacy-command",
-        name: "legacy command",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "cron", expr: "0 8 * * *", tz: "UTC" },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "command", command: "echo daily" },
-        state: { lastRunAtMs: STORE_TEST_NOW - 3_600_000 },
-      },
-      {
-        id: "legacy-agentmessage",
-        name: "legacy agentmessage",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
-        sessionTarget: "isolated",
-        wakeMode: "now",
-        payload: { kind: "agentmessage", message: "summarize" },
-        metadata: { preserve: { nested: true } },
-      },
-    ]);
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-
-    expect(state.store?.jobs.map((job) => job.id)).toEqual(["valid-job"]);
-    expect(() => findJobOrThrow(state, "legacy-command")).toThrow(/unknown cron job id/);
-    expect(() => findJobOrThrow(state, "legacy-agentmessage")).toThrow(/unknown cron job id/);
-
-    const valid = findJobOrThrow(state, "valid-job");
-    valid.name = "valid job renamed";
-    await persist(state);
-
-    const config = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(config.jobs.map((job) => job.id)).toEqual(["valid-job"]);
-    expect(config.jobs[0]?.name).toBe("valid job renamed");
-
-    const quarantine = JSON.parse(
-      await fs.readFile(resolveCronQuarantinePath(storePath), "utf8"),
-    ) as { jobs: Array<{ reason?: string; job?: Record<string, unknown> }> };
-    expect(quarantine.jobs.map((entry) => entry.job?.id)).toEqual([
-      "legacy-command",
-      "legacy-agentmessage",
-    ]);
-    expect(quarantine.jobs[0]?.reason).toBe("invalid-payload");
-    expect(quarantine.jobs[0]?.job).toMatchObject({
-      id: "legacy-command",
-      payload: { kind: "command", command: "echo daily" },
-      state: { lastRunAtMs: STORE_TEST_NOW - 3_600_000 },
+    const malformed = createReloadCronJob({ id: "malformed-sqlite-row" });
+    const legacyValid = createReloadCronJob({ id: "legacy-valid" });
+    const legacyValidTrigger = createReloadCronJob({ id: "legacy-valid-trigger" });
+    const legacyInvalidTrigger = createReloadCronJob({ id: "legacy-invalid-trigger" });
+    const legacyMissingPayload = createReloadCronJob({ id: "legacy-missing-payload" });
+    const surviving = createReloadCronJob({
+      id: "surviving-sqlite-row",
+      state: { nextRunAtMs: STORE_TEST_NOW + 60_000 },
     });
-    expect(quarantine.jobs[1]?.job).toMatchObject({
-      id: "legacy-agentmessage",
-      payload: { kind: "agentmessage", message: "summarize" },
-      metadata: { preserve: { nested: true } },
+    await saveCronStore(storePath, {
+      version: 1,
+      jobs: [
+        malformed,
+        legacyValid,
+        legacyValidTrigger,
+        legacyInvalidTrigger,
+        legacyMissingPayload,
+        surviving,
+      ],
     });
-    expect(quarantine.jobs[1]?.job).not.toHaveProperty("state");
-    expect(quarantine.jobs[1]?.job).not.toHaveProperty("updatedAtMs");
-
-    const stateFile = JSON.parse(
-      await fs.readFile(storePath.replace(/\.json$/, "-state.json"), "utf8"),
-    ) as { jobs: Record<string, unknown> };
-    expect(Object.keys(stateFile.jobs)).toEqual(["valid-job"]);
-
-    const invalidPayloadWarns = logger.warn.mock.calls.filter((call) => {
-      const msg = typeof call[1] === "string" ? call[1] : "";
-      return msg.includes("quarantined invalid persisted job");
-    });
-    expect(invalidPayloadWarns.map((call) => (call[0] as { jobId?: string }).jobId)).toEqual([
-      "legacy-command",
-      "legacy-agentmessage",
-    ]);
-  });
-
-  it("quarantines malformed persisted rows and sanitizes active jobs.json", async () => {
-    const { storePath } = await makeStorePath();
-
-    await writeJobStore(storePath, [
-      {
-        id: "valid-job",
-        name: "valid job",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 60_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick" },
-        state: {},
-      },
-      {
-        id: "missing-schedule-job",
-        name: "missing schedule job",
-        enabled: true,
-        payload: { kind: "systemEvent", text: "tick" },
-        state: { lastRunAtMs: STORE_TEST_NOW - 3_600_000 },
-      },
-      {
-        id: "missing-schedule-job",
-        name: "missing schedule job",
-        enabled: true,
-        payload: { kind: "systemEvent", text: "tick" },
-        state: { lastRunAtMs: STORE_TEST_NOW - 3_600_000 },
-      },
-      {
-        id: "missing-system-text-job",
-        name: "missing system text job",
-        enabled: true,
-        schedule: { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
-        payload: { kind: "systemEvent" },
-        metadata: { preserve: { nested: true } },
-      },
-      "bad-scalar-row",
-    ]);
-    await fs.writeFile(
-      storePath.replace(/\.json$/, "-state.json"),
-      JSON.stringify(
-        {
-          version: 1,
-          jobs: {
-            "missing-system-text-job": {
-              updatedAtMs: STORE_TEST_NOW - 30_000,
-              state: { lastStatus: "error", lastRunAtMs: STORE_TEST_NOW - 120_000 },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
+    const db = openOpenClawStateDatabase().db;
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule.kind', ?) WHERE job_id = ?",
+    ).run("unsupported", malformed.id);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule', ?) WHERE job_id IN (?, ?, ?, ?)",
+    ).run(
+      "*/5 * * * *",
+      legacyValid.id,
+      legacyValidTrigger.id,
+      legacyInvalidTrigger.id,
+      legacyMissingPayload.id,
     );
-
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.trigger', json(?)) WHERE job_id = ?",
+    ).run(JSON.stringify({ script: "true" }), legacyValidTrigger.id);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.trigger', json(?)) WHERE job_id = ?",
+    ).run(JSON.stringify({}), legacyInvalidTrigger.id);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_remove(job_json, '$.payload') WHERE job_id = ?",
+    ).run(legacyMissingPayload.id);
     const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
 
-    expect(state.store?.jobs.map((job) => job.id)).toEqual(["valid-job"]);
-    expect(() => findJobOrThrow(state, "missing-schedule-job")).toThrow(/unknown cron job id/);
-    expect(() => findJobOrThrow(state, "missing-system-text-job")).toThrow(/unknown cron job id/);
+    await ensureLoaded(state);
 
-    const valid = findJobOrThrow(state, "valid-job");
-    valid.name = "valid job renamed";
-    await persist(state);
-
-    const config = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(config.jobs.map((job) => job.id)).toEqual(["valid-job"]);
-    expect(config.jobs[0]?.name).toBe("valid job renamed");
-
-    const quarantine = JSON.parse(
-      await fs.readFile(resolveCronQuarantinePath(storePath), "utf8"),
-    ) as {
-      jobs: Array<{
-        reason?: string;
-        job?: Record<string, unknown>;
-        raw?: unknown;
-        sourceIndex?: number;
-        state?: Record<string, unknown>;
-        updatedAtMs?: number;
-      }>;
-    };
-    expect(quarantine.jobs.map((entry) => entry.job?.id ?? entry.raw)).toEqual([
-      "missing-schedule-job",
-      "missing-schedule-job",
-      "missing-system-text-job",
-      "bad-scalar-row",
-    ]);
-    expect(quarantine.jobs.map((entry) => entry.reason)).toEqual([
-      "missing-schedule",
-      "missing-schedule",
-      "invalid-payload",
-      "non-object-row",
-    ]);
-    expect(quarantine.jobs.map((entry) => entry.sourceIndex)).toEqual([1, 2, 3, 4]);
-    expect(quarantine.jobs[0]?.job).toMatchObject({
-      id: "missing-schedule-job",
-      state: { lastRunAtMs: STORE_TEST_NOW - 3_600_000 },
-    });
-    expect(quarantine.jobs[2]?.job).toMatchObject({
-      id: "missing-system-text-job",
-      metadata: { preserve: { nested: true } },
-    });
-    expect(quarantine.jobs[2]?.state).toEqual({
-      lastStatus: "error",
-      lastRunAtMs: STORE_TEST_NOW - 120_000,
-    });
-    expect(quarantine.jobs[2]?.updatedAtMs).toBe(STORE_TEST_NOW - 30_000);
-    expect(quarantine.jobs[2]?.job).not.toHaveProperty("state");
-    expect(quarantine.jobs[2]?.job).not.toHaveProperty("updatedAtMs");
-
-    const stateFile = JSON.parse(
-      await fs.readFile(storePath.replace(/\.json$/, "-state.json"), "utf8"),
-    ) as { jobs: Record<string, unknown> };
-    expect(Object.keys(stateFile.jobs)).toEqual(["valid-job"]);
-
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ storePath, jobId: "missing-schedule-job", jobIndex: 1 }),
-      expect.stringContaining("quarantined invalid persisted job"),
+    const expectedActiveJobIds = [legacyValid.id, legacyValidTrigger.id, surviving.id];
+    expect(state.store?.jobs.map((job) => job.id)).toEqual(expectedActiveJobIds);
+    expect((await loadCronStore(storePath)).jobs.map((job) => job.id)).toEqual(
+      expectedActiveJobIds,
     );
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ storePath, jobId: "missing-system-text-job", jobIndex: 3 }),
-      expect.stringContaining("quarantined invalid persisted job"),
-    );
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([
+      expect.objectContaining({
+        sourceIndex: 0,
+        reason: "invalid-schedule",
+        job: expect.objectContaining({ id: malformed.id }),
+      }),
+      expect.objectContaining({
+        sourceIndex: 3,
+        reason: "invalid-trigger",
+        job: expect.objectContaining({ id: legacyInvalidTrigger.id }),
+      }),
+      expect.objectContaining({
+        sourceIndex: 4,
+        reason: "missing-payload",
+        job: expect.objectContaining({ id: legacyMissingPayload.id }),
+      }),
+    ]);
+    await expectPathMissing(storePath.replace(/\.json$/, "-quarantine.json"));
   });
 
-  it("quarantines legacy jobId rows with split runtime state before pruning state file", async () => {
+  it("quarantines malformed job and state JSON with exact recovery bytes", async () => {
     const { storePath } = await makeStorePath();
-
-    await writeJobStore(storePath, [
-      {
-        id: "valid-job",
-        name: "valid job",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 60_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick" },
-        state: {},
-      },
-      {
-        jobId: "legacy-invalid-job",
-        name: "legacy invalid job",
-        enabled: true,
-        schedule: { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
-        payload: { kind: "systemEvent" },
-      },
-    ]);
-    await fs.writeFile(
-      storePath.replace(/\.json$/, "-state.json"),
-      JSON.stringify(
-        {
-          version: 1,
-          jobs: {
-            "legacy-invalid-job": {
-              updatedAtMs: STORE_TEST_NOW - 45_000,
-              scheduleIdentity: "legacy-schedule-identity",
-              state: { lastStatus: "error", lastRunAtMs: STORE_TEST_NOW - 90_000 },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-
-    const quarantine = JSON.parse(
-      await fs.readFile(resolveCronQuarantinePath(storePath), "utf8"),
-    ) as {
-      jobs: Array<{
-        job?: Record<string, unknown>;
-        scheduleIdentity?: string;
-        state?: Record<string, unknown>;
-        updatedAtMs?: number;
-      }>;
-    };
-    expect(quarantine.jobs).toHaveLength(1);
-    expect(quarantine.jobs[0]?.job).toMatchObject({ jobId: "legacy-invalid-job" });
-    expect(quarantine.jobs[0]?.state).toEqual({
-      lastStatus: "error",
-      lastRunAtMs: STORE_TEST_NOW - 90_000,
+    const malformedJob = createReloadCronJob({ id: "malformed-job-json" });
+    const malformedState = createReloadCronJob({ id: "malformed-state-json" });
+    const surviving = createReloadCronJob({ id: "surviving-json-row" });
+    await saveCronStore(storePath, {
+      version: 1,
+      jobs: [malformedJob, malformedState, surviving],
     });
-    expect(quarantine.jobs[0]?.updatedAtMs).toBe(STORE_TEST_NOW - 45_000);
-    expect(quarantine.jobs[0]?.scheduleIdentity).toBe("legacy-schedule-identity");
+    const db = openOpenClawStateDatabase().db;
+    const stateRow = db
+      .prepare("SELECT job_json FROM cron_jobs WHERE job_id = ?")
+      .get(malformedState.id) as { job_json: string };
+    db.prepare("UPDATE cron_jobs SET job_json = ? WHERE job_id = ?").run("{", malformedJob.id);
+    db.prepare("UPDATE cron_jobs SET state_json = ? WHERE job_id = ?").run("[]", malformedState.id);
+    const state = createStoreTestState(storePath);
 
-    const stateFile = JSON.parse(
-      await fs.readFile(storePath.replace(/\.json$/, "-state.json"), "utf8"),
-    ) as { jobs: Record<string, unknown> };
-    expect(Object.keys(stateFile.jobs)).toEqual(["valid-job"]);
+    await ensureLoaded(state);
+
+    expect(state.store?.jobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect((await loadCronStore(storePath)).jobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([
+      expect.objectContaining({
+        sourceIndex: 0,
+        reason: "invalid-payload",
+        raw: { jobId: malformedJob.id, jobJson: "{", stateJson: "{}" },
+      }),
+      expect.objectContaining({
+        sourceIndex: 1,
+        reason: "invalid-state",
+        job: expect.objectContaining({ id: malformedState.id }),
+        raw: { jobId: malformedState.id, jobJson: stateRow.job_json, stateJson: "[]" },
+      }),
+    ]);
   });
 
-  it("blocks later persists until malformed rows are copied to quarantine", async () => {
+  it("quarantines persisted every schedules that cannot produce valid Date timestamps", async () => {
     const { storePath } = await makeStorePath();
-    const quarantinePath = resolveCronQuarantinePath(storePath);
-
-    await writeJobStore(storePath, [
-      {
-        id: "valid-job",
-        name: "valid job",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 60_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick" },
-        state: {},
-      },
-      {
-        id: "missing-schedule-job",
-        name: "missing schedule job",
-        enabled: true,
-        payload: { kind: "systemEvent", text: "tick" },
-      },
-    ]);
-    await fs.writeFile(quarantinePath, "{ not json", "utf8");
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-
-    const valid = findJobOrThrow(state, "valid-job");
-    valid.name = "valid job renamed";
-    await persist(state, { stateOnly: true });
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-    findJobOrThrow(state, "valid-job").name = "valid job renamed";
-    await persist(state);
-
-    const quarantineFailureWarns = logger.warn.mock.calls.filter((call) => {
-      const msg = typeof call[1] === "string" ? call[1] : "";
-      return msg.includes("failed to quarantine malformed persisted jobs");
+    const invalidInterval = createReloadCronJob({
+      id: "invalid-date-interval",
+      schedule: { kind: "every", everyMs: 1_000 },
     });
-    expect(quarantineFailureWarns).toHaveLength(1);
-
-    let config = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(config.jobs.map((job) => job.id)).toEqual(["valid-job", "missing-schedule-job"]);
-    expect(config.jobs[0]?.name).toBe("valid job");
-
-    await fs.writeFile(quarantinePath, JSON.stringify({ version: 1, jobs: [] }), "utf8");
-    await persist(state);
-
-    config = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(config.jobs.map((job) => job.id)).toEqual(["valid-job"]);
-    expect(config.jobs[0]?.name).toBe("valid job renamed");
-
-    const quarantine = JSON.parse(await fs.readFile(quarantinePath, "utf8")) as {
-      jobs: Array<{ job?: Record<string, unknown> }>;
-    };
-    expect(quarantine.jobs.map((entry) => entry.job?.id)).toEqual(["missing-schedule-job"]);
-  });
-
-  it("keeps canonical jobs when quarantined unsupported rows collide by id", async () => {
-    const { storePath } = await makeStorePath();
-
-    await writeJobStore(storePath, [
-      {
-        id: "trimmed-collision",
-        name: "supported trimmed collision",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 60_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick" },
-        state: {},
-      },
-      {
-        id: "  trimmed-collision  ",
-        name: "stale unsupported padded id",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "cron", expr: "0 8 * * *", tz: "UTC" },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "command", command: "echo stale" },
-      },
-      {
-        id: "legacy-jobid-collision",
-        name: "supported legacy jobId collision",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        updatedAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "every", everyMs: 120_000 },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "systemEvent", text: "tick legacy" },
-        state: {},
-      },
-      {
-        jobId: "  legacy-jobid-collision  ",
-        name: "stale unsupported legacy jobId",
-        enabled: true,
-        createdAtMs: STORE_TEST_NOW - 60_000,
-        schedule: { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
-        sessionTarget: "main",
-        wakeMode: "now",
-        payload: { kind: "agentmessage", message: "summarize stale" },
-      },
-    ]);
-
+    const invalidAnchor = createReloadCronJob({
+      id: "invalid-date-anchor",
+      schedule: { kind: "every", everyMs: 1_000, anchorMs: 0 },
+    });
+    const unsatisfiableInterval = createReloadCronJob({
+      id: "unsatisfiable-date-interval",
+      schedule: { kind: "every", everyMs: MAX_DATE_TIMESTAMP_MS },
+    });
+    const disabledUnsatisfiableInterval = createReloadCronJob({
+      id: "disabled-unsatisfiable-date-interval",
+      enabled: false,
+      schedule: { kind: "every", everyMs: MAX_DATE_TIMESTAMP_MS },
+    });
+    const invalidStagger = createReloadCronJob({ id: "invalid-date-stagger" });
+    const repairableState = createReloadCronJob({
+      id: "repairable-runtime-state",
+      state: { lastRunAtMs: MAX_DATE_TIMESTAMP_MS },
+    });
+    const surviving = createReloadCronJob({ id: "valid-schedule" });
+    await saveCronStore(storePath, {
+      version: 1,
+      jobs: [
+        invalidInterval,
+        invalidAnchor,
+        unsatisfiableInterval,
+        disabledUnsatisfiableInterval,
+        invalidStagger,
+        repairableState,
+        surviving,
+      ],
+    });
+    const db = openOpenClawStateDatabase().db;
+    // Number bindings become SQLite FLOATs; JSON formatting can round max + 1
+    // back into the valid Date domain. Inject exact numeric JSON instead.
+    const invalidTimestampJson = JSON.stringify(MAX_DATE_TIMESTAMP_MS + 1);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule.everyMs', json(?)) WHERE job_id = ?",
+    ).run(invalidTimestampJson, invalidInterval.id);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule.anchorMs', json(?)) WHERE job_id = ?",
+    ).run(invalidTimestampJson, invalidAnchor.id);
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule.staggerMs', json(?)) WHERE job_id = ?",
+    ).run(invalidTimestampJson, invalidStagger.id);
     const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
+
+    await ensureLoaded(state);
 
     expect(state.store?.jobs.map((job) => job.id)).toEqual([
-      "trimmed-collision",
-      "legacy-jobid-collision",
+      disabledUnsatisfiableInterval.id,
+      repairableState.id,
+      surviving.id,
     ]);
-
-    await persist(state);
-
-    const config = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(config.jobs.map((job) => job.id)).toEqual([
-      "trimmed-collision",
-      "legacy-jobid-collision",
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([
+      expect.objectContaining({
+        sourceIndex: 0,
+        reason: "invalid-schedule",
+        job: expect.objectContaining({
+          id: invalidInterval.id,
+          schedule: expect.objectContaining({ everyMs: MAX_DATE_TIMESTAMP_MS + 1 }),
+        }),
+      }),
+      expect.objectContaining({
+        sourceIndex: 1,
+        reason: "invalid-schedule",
+        job: expect.objectContaining({
+          id: invalidAnchor.id,
+          schedule: expect.objectContaining({ anchorMs: MAX_DATE_TIMESTAMP_MS + 1 }),
+        }),
+      }),
+      expect.objectContaining({
+        sourceIndex: 2,
+        reason: "unsatisfiable-schedule",
+        job: expect.objectContaining({ id: unsatisfiableInterval.id }),
+      }),
+      expect.objectContaining({
+        sourceIndex: 4,
+        reason: "invalid-schedule",
+        job: expect.objectContaining({
+          id: invalidStagger.id,
+          schedule: expect.objectContaining({ staggerMs: MAX_DATE_TIMESTAMP_MS + 1 }),
+        }),
+      }),
     ]);
-    expect(config.jobs.map((job) => job.name)).toEqual([
-      "supported trimmed collision",
-      "supported legacy jobId collision",
-    ]);
-    expect(config.jobs.some((job) => job.jobId === "  legacy-jobid-collision  ")).toBe(false);
-    expect(config.jobs.some((job) => job.name === "stale unsupported padded id")).toBe(false);
-    expect(config.jobs.some((job) => job.name === "stale unsupported legacy jobId")).toBe(false);
   });
 
-  it("normalizes jobId-only jobs in memory so scheduler lookups resolve by stable id", async () => {
+  it("quarantines persisted runtime timestamps outside the Date domain", async () => {
     const { storePath } = await makeStorePath();
+    const invalidState = createReloadCronJob({ id: "invalid-runtime-state" });
+    const surviving = createReloadCronJob({ id: "valid-runtime-state" });
+    await saveCronStore(storePath, { version: 1, jobs: [invalidState, surviving] });
+    openOpenClawStateDatabase()
+      .db.prepare(
+        "UPDATE cron_jobs SET state_json = json_set(state_json, '$.lastRunAtMs', json(?)) WHERE job_id = ?",
+      )
+      .run(JSON.stringify(MAX_DATE_TIMESTAMP_MS + 1), invalidState.id);
+    const state = createStoreTestState(storePath);
 
-    await writeSingleJobStore(storePath, {
-      jobId: "repro-stable-id",
+    await ensureLoaded(state);
+
+    expect(state.store?.jobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([
+      expect.objectContaining({
+        reason: "invalid-state",
+        job: expect.objectContaining({ id: invalidState.id }),
+        state: expect.objectContaining({ lastRunAtMs: MAX_DATE_TIMESTAMP_MS + 1 }),
+      }),
+    ]);
+  });
+
+  it("retains malformed rows and their quarantine until a load repair commits", async () => {
+    const { storePath } = await makeStorePath();
+    const malformed = createReloadCronJob({ id: "quarantine-retry-job" });
+    const surviving = createReloadCronJob({
+      id: "quarantine-survivor",
+      state: { nextRunAtMs: STORE_TEST_NOW + 60_000 },
+    });
+    await saveCronStore(storePath, { version: 1, jobs: [malformed, surviving] });
+    const db = openOpenClawStateDatabase().db;
+    db.prepare(
+      "UPDATE cron_jobs SET job_json = json_set(job_json, '$.schedule.kind', ?) WHERE job_id = ?",
+    ).run("unsupported", malformed.id);
+    const readRows = () =>
+      db
+        .prepare(
+          "SELECT job_id, job_json, state_json FROM cron_jobs WHERE store_key = ? ORDER BY job_id",
+        )
+        .all(cronStoreKey(storePath));
+    const before = readRows();
+    const onEvent = vi.fn();
+    const state = createStoreTestState(storePath, onEvent);
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("quarantine unavailable"),
+    );
+
+    await ensureLoaded(state);
+
+    expect(readRows()).toEqual(before);
+    expect(state.store?.jobs.map((job) => job.id)).toEqual([surviving.id]);
+    expect(state.pendingQuarantineConfigJobs).toHaveLength(1);
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([]);
+    expect(onEvent).not.toHaveBeenCalled();
+
+    await ensureLoaded(state, { forceReload: true });
+
+    expect(readRows().map((row) => row.job_id)).toEqual([surviving.id]);
+    expect(state.pendingQuarantineConfigJobs).toEqual([]);
+    expect(await cronStoreModule.loadCronQuarantinedJobs(storePath)).toEqual([
+      expect.objectContaining({
+        reason: "invalid-schedule",
+        job: expect.objectContaining({ id: malformed.id }),
+      }),
+    ]);
+    expect(state.durableNextRunAtMsByJobId.get(surviving.id)).toBe(surviving.state.nextRunAtMs);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("does not let quarantine recovery bypass an active receipt fence", async () => {
+    const { storePath } = await makeStorePath();
+    const job = createReloadCronJob({ id: "quarantined-receipt-conflict", agentId: "alpha" });
+    await saveCronStore(storePath, { version: 1, jobs: [job] });
+    const state = createStoreTestState(storePath);
+    await ensureLoaded(state);
+    const prepared = prepareCronRunReceiptClaim({
+      observed: undefined,
+      storePath,
+      job,
+      agentId: "alpha",
+      startedAtMs: STORE_TEST_NOW,
+    });
+    const receipt = runOpenClawStateWriteTransaction(({ db }) =>
+      claimCronRunReceiptInDatabaseForTest({
+        database: db,
+        prepared,
+        resolveAgentId: (current) => current.agentId!,
+      }),
+    );
+    const snapshot = snapshotStoreForRollback(state);
+    const ownerMutation = await prepareCronRunReceiptOwnerMutation({
+      state,
+      previousJob: job,
+      nextJob: { ...job, agentId: "beta" },
+    });
+    findJobOrThrow(state, job.id).agentId = "beta";
+    state.pendingQuarantineConfigJobs = [
+      { sourceIndex: 0, reason: "invalid-schedule", job: { id: "quarantined-job" } },
+    ];
+
+    try {
+      await expect(
+        persistCronJobMutation({
+          state,
+          source: captureCronJobMutationSource(state),
+          previous: snapshot.store!,
+          next: state.store!,
+          method: "cron.update",
+          assertCurrent: ownerMutation?.assertCurrent,
+          receiptMutation: {
+            jobId: job.id,
+            owner: ownerMutation?.prepared,
+            triggerStateChanged: false,
+            scheduleChanged: false,
+          },
+        }),
+      ).rejects.toBeInstanceOf(CronRunReceiptConflictError);
+      expect((await loadCronStore(storePath)).jobs[0]?.agentId).toBe("alpha");
+      expect(state.pendingQuarantineConfigJobs).toHaveLength(1);
+    } finally {
+      await finishCronRunReceiptAsync({
+        handle: receipt,
+        status: "superseded",
+        finishedAtMs: STORE_TEST_NOW + 1,
+      });
+    }
+  });
+
+  it("uses the trimmed canonical id for job rows and companion authority", async () => {
+    const { storePath } = await makeStorePath();
+    const rawJob = {
+      id: "  repro-stable-id  ",
+      jobId: "ignored-obsolete-alias",
       name: "handed",
       enabled: true,
       createdAtMs: STORE_TEST_NOW - 60_000,
       updatedAtMs: STORE_TEST_NOW - 60_000,
       schedule: { kind: "every", everyMs: 60_000 },
-      sessionTarget: "main",
+      sessionTarget: "isolated",
       wakeMode: "now",
-      payload: { kind: "systemEvent", text: "tick" },
+      payload: { kind: "agentTurn", message: "tick", toolsAllow: [" read "] },
+      runtimeAuthority: {
+        version: 1,
+        runtimeId: "codex",
+        namespace: "codex.apps",
+        payload: { apps: [{ id: "calendar" }] },
+      },
       state: {},
-    });
+    };
+
+    await writeSingleJobStore(storePath, rawJob);
+    await writeSingleJobStore(storePath, rawJob);
 
     const state = createStoreTestState(storePath);
 
     await ensureLoaded(state);
 
-    expectWarnedJob({ storePath, jobId: "repro-stable-id", message: "legacy jobId" });
-
     const job = findJobOrThrow(state, "repro-stable-id");
     expect(job.id).toBe("repro-stable-id");
     expect((job as { jobId?: unknown }).jobId).toBeUndefined();
-
-    const raw = JSON.parse(await fs.readFile(storePath, "utf8")) as {
-      jobs: Array<Record<string, unknown>>;
-    };
-    expect(raw.jobs[0]?.jobId).toBe("repro-stable-id");
-    expect(raw.jobs[0]?.id).toBeUndefined();
+    expect(job.payload).toMatchObject({ kind: "agentTurn", toolsAllow: ["read"] });
+    expect(job.runtimeAuthority).toEqual({
+      version: 1,
+      runtimeId: "codex",
+      namespace: "codex.apps",
+      payload: { apps: [{ id: "calendar" }] },
+    });
+    await expectPathMissing(`${storePath}.migrated`);
   });
 
   it("preserves disabled jobs when persisted booleans roundtrip through string values", async () => {
@@ -618,16 +550,13 @@ describe("cron service store seam coverage", () => {
       state: {},
     });
 
-    const before = await fs.readFile(storePath, "utf8");
     const state = createStoreTestState(storePath);
 
     await ensureLoaded(state);
 
     const job = findJobOrThrow(state, "disabled-string-job");
     expect(job.enabled).toBe(false);
-
-    const after = await fs.readFile(storePath, "utf8");
-    expect(after).toBe(before);
+    await expectPathMissing(`${storePath}.migrated`);
   });
 
   it("loads persisted jobs with opaque custom session ids containing separators", async () => {
@@ -649,7 +578,7 @@ describe("cron service store seam coverage", () => {
 
     const state = createStoreTestState(storePath);
 
-    await ensureLoaded(state, { skipRecompute: true });
+    await ensureLoaded(state);
 
     const job = findJobOrThrow(state, "opaque-session-target-job");
     expect(job.sessionTarget).toBe(sessionTarget);
@@ -663,241 +592,5 @@ describe("cron service store seam coverage", () => {
           message.includes("invalid persisted sessionTarget"),
       ),
     ).toBe(false);
-  });
-
-  it("clears stale nextRunAtMs after force reload when cron schedule expression changes", async () => {
-    const { storePath } = await makeStorePath();
-    const staleNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await saveCronStore(storePath, {
-      version: 1,
-      jobs: [
-        createReloadCronJob({
-          state: { nextRunAtMs: staleNextRunAtMs },
-        }),
-      ],
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-    expect(findJobOrThrow(state, "reload-cron-expr-job").state.nextRunAtMs).toBe(staleNextRunAtMs);
-
-    await writeSingleJobStore(storePath, {
-      id: "reload-cron-expr-job",
-      name: "reload cron expr job",
-      enabled: true,
-      createdAtMs: STORE_TEST_NOW - 60_000,
-      updatedAtMs: STORE_TEST_NOW - 30_000,
-      schedule: { kind: "cron", expr: "30 6 * * 0,6", tz: "UTC" },
-      sessionTarget: "main",
-      wakeMode: "now",
-      payload: { kind: "systemEvent", text: "tick" },
-      state: {},
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    const reloadedJob = findJobOrThrow(state, "reload-cron-expr-job");
-    expect(reloadedJob.schedule).toEqual({ kind: "cron", expr: "30 6 * * 0,6", tz: "UTC" });
-    expect(reloadedJob.state.nextRunAtMs).toBeUndefined();
-  });
-
-  it("preserves nextRunAtMs after force reload when cron schedule key order changes only", async () => {
-    const { storePath } = await makeStorePath();
-    const dueNextRunAtMs = STORE_TEST_NOW - 1_000;
-
-    await saveCronStore(storePath, {
-      version: 1,
-      jobs: [
-        createReloadCronJob({
-          state: { nextRunAtMs: dueNextRunAtMs },
-        }),
-      ],
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-
-    await writeSingleJobStore(storePath, {
-      id: "reload-cron-expr-job",
-      name: "reload cron expr job",
-      enabled: true,
-      createdAtMs: STORE_TEST_NOW - 60_000,
-      updatedAtMs: STORE_TEST_NOW - 30_000,
-      schedule: { expr: "0 6 * * *", kind: "cron", tz: "UTC" },
-      sessionTarget: "main",
-      wakeMode: "now",
-      payload: { kind: "systemEvent", text: "tick" },
-      state: {},
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    expect(findJobOrThrow(state, "reload-cron-expr-job").state.nextRunAtMs).toBe(dueNextRunAtMs);
-  });
-
-  it("keeps a force-reloaded legacy string schedule for runtime repair handling", async () => {
-    const { storePath } = await makeStorePath();
-    const staleNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        updatedAtMs: STORE_TEST_NOW,
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-      schedule: "0 17 * * *",
-    });
-
-    await expect(ensureLoaded(state, { forceReload: true, skipRecompute: true })).resolves.toBe(
-      undefined,
-    );
-
-    const job = findJobOrThrow(state, "reload-cron-expr-job");
-    expect(job.schedule).toBe("0 17 * * *");
-    expect(job.state.nextRunAtMs).toBeUndefined();
-  });
-
-  it("warns once per malformed persisted row across repeated forceReload cycles", async () => {
-    const { storePath } = await makeStorePath();
-
-    await writeSingleJobStore(storePath, {
-      id: "missing-cron-expr-job",
-      name: "missing cron expr job",
-      enabled: true,
-      schedule: { kind: "cron" },
-      payload: { kind: "systemEvent", text: "tick" },
-      state: {},
-    });
-
-    const warnSpy = vi.spyOn(logger, "warn");
-    const state = createStoreTestState(storePath);
-
-    await ensureLoaded(state, { skipRecompute: true });
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    const malformedWarns = warnSpy.mock.calls.filter((call) => {
-      const msg = typeof call[1] === "string" ? call[1] : "";
-      return msg.includes("quarantined invalid persisted job");
-    });
-    expect(malformedWarns).toHaveLength(1);
-    warnSpy.mockRestore();
-  });
-
-  it("preserves nextRunAtMs after force reload when scheduling inputs are unchanged", async () => {
-    const { storePath } = await makeStorePath();
-    const originalNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({ state: { nextRunAtMs: originalNextRunAtMs } }),
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        updatedAtMs: STORE_TEST_NOW,
-        state: { nextRunAtMs: originalNextRunAtMs + 60_000 },
-      }),
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    expect(findJobOrThrow(state, "reload-cron-expr-job").state.nextRunAtMs).toBe(
-      originalNextRunAtMs + 60_000,
-    );
-  });
-
-  it("clears stale nextRunAtMs after force reload when enabled state changes", async () => {
-    const { storePath } = await makeStorePath();
-    const staleNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        enabled: true,
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        enabled: false,
-        updatedAtMs: STORE_TEST_NOW,
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    expect(findJobOrThrow(state, "reload-cron-expr-job").state.nextRunAtMs).toBeUndefined();
-  });
-
-  it("clears stale nextRunAtMs after force reload when every schedule anchor changes", async () => {
-    const { storePath } = await makeStorePath();
-    const jobId = "reload-every-anchor-job";
-    const staleNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        id: jobId,
-        schedule: { kind: "every", everyMs: 60_000, anchorMs: STORE_TEST_NOW - 60_000 },
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        id: jobId,
-        updatedAtMs: STORE_TEST_NOW,
-        schedule: { kind: "every", everyMs: 60_000, anchorMs: STORE_TEST_NOW },
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    expect(findJobOrThrow(state, jobId).state.nextRunAtMs).toBeUndefined();
-  });
-
-  it("clears stale nextRunAtMs after force reload when at schedule target changes", async () => {
-    const { storePath } = await makeStorePath();
-    const jobId = "reload-at-target-job";
-    const staleNextRunAtMs = STORE_TEST_NOW + 3_600_000;
-
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        id: jobId,
-        schedule: { kind: "at", at: "2026-03-23T13:00:00.000Z" },
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    const state = createStoreTestState(storePath);
-    await ensureLoaded(state, { skipRecompute: true });
-    await writeSingleJobStore(storePath, {
-      ...createReloadCronJob({
-        id: jobId,
-        updatedAtMs: STORE_TEST_NOW,
-        schedule: { kind: "at", at: "2026-03-23T14:00:00.000Z" },
-        state: { nextRunAtMs: staleNextRunAtMs },
-      }),
-    });
-
-    await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-
-    expect(findJobOrThrow(state, jobId).state.nextRunAtMs).toBeUndefined();
   });
 });

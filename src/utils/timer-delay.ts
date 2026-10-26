@@ -1,8 +1,7 @@
 import { resolveSafeTimeoutDelayMs } from "../../packages/gateway-client/src/timeouts.js";
 
 export {
-  MAX_SAFE_TIMEOUT_DELAY_MS,
-  resolveFiniteTimeoutDelayMs,
+  addSafeTimeoutDelayGraceMs,
   resolveSafeTimeoutDelayMs,
 } from "../../packages/gateway-client/src/timeouts.js";
 

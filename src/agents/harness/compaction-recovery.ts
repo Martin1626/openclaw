@@ -1,6 +1,6 @@
 import type { EmbeddedAgentCompactResult } from "../embedded-agent-runner/types.js";
 
-export function isRecoverableNativeHarnessBindingReason(reason: unknown): boolean {
+function isRecoverableNativeHarnessBindingReason(reason: unknown): boolean {
   if (typeof reason !== "string") {
     return false;
   }
@@ -13,6 +13,7 @@ export function isRecoverableNativeHarnessBindingReason(reason: unknown): boolea
   );
 }
 
+/** Native binding failures permit context-engine fallback after clearing the stale binding. */
 export function isRecoverableNativeHarnessBindingFailure(
   result: EmbeddedAgentCompactResult | undefined,
 ): boolean {

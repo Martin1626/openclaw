@@ -1,63 +1,53 @@
+/** Embedded-agent helper barrel for bootstrap, provider error, media, and turn sanitizers. */
+
 export {
   buildBootstrapContextFiles,
-  DEFAULT_BOOTSTRAP_MAX_CHARS,
-  DEFAULT_BOOTSTRAP_PROMPT_TRUNCATION_WARNING_MODE,
-  DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
-  ensureSessionHeader,
   resolveBootstrapMaxChars,
-  resolveBootstrapPromptTruncationWarningMode,
   resolveBootstrapTotalMaxChars,
-  stripThoughtSignatures,
 } from "./embedded-agent-helpers/bootstrap.js";
 export {
-  BILLING_ERROR_USER_MESSAGE,
-  classifyProviderRuntimeFailureKind,
-  formatBillingErrorMessage,
-  formatRateLimitOrOverloadedErrorCopy,
-  classifyFailoverReason,
-  classifyFailoverReasonFromHttpStatus,
-  formatRawAssistantErrorForUi,
-  formatAssistantErrorText,
-  getApiErrorPayloadFingerprint,
+  classifyAssistantFailoverReason,
   isAuthAssistantError,
-  isAuthErrorMessage,
-  isAuthPermanentErrorMessage,
-  isModelNotFoundErrorMessage,
   isBillingAssistantError,
-  extractObservedOverflowTokenCount,
-  parseApiErrorInfo,
-  isBillingErrorMessage,
-  isCloudflareOrHtmlErrorPage,
-  isCloudCodeAssistFormatError,
-  isCompactionFailureError,
-  isContextOverflowError,
-  isLikelyContextOverflowError,
   isFailoverAssistantError,
-  isFailoverErrorMessage,
-  isImageDimensionErrorMessage,
-  isImageSizeError,
-  isOverloadedErrorMessage,
-  isRawApiErrorPayload,
   isRateLimitAssistantError,
-  isRateLimitErrorMessage,
-  isTransientHttpError,
-  isTimeoutErrorMessage,
+} from "./embedded-agent-helpers/assistant-message-failures.js";
+export {
+  extractObservedOverflowTokenCount,
+  isCompactionFailureError,
+} from "./embedded-agent-helpers/context-overflow-observation.js";
+export {
+  formatAssistantErrorText,
+  formatUserFacingAssistantErrorText,
+  GENERIC_ASSISTANT_ERROR_TEXT,
+} from "./embedded-agent-helpers/error-text.js";
+export {
   parseImageDimensionError,
   parseImageSizeError,
-} from "./embedded-agent-helpers/errors.js";
-export type { ProviderRuntimeFailureKind } from "./embedded-agent-helpers/errors.js";
-export { sanitizeUserFacingText } from "./embedded-agent-helpers/sanitize-user-facing-text.js";
-export { isGoogleModelApi, sanitizeGoogleTurnOrdering } from "./embedded-agent-helpers/google.js";
+} from "./embedded-agent-helpers/image-errors.js";
+export { classifyProviderRuntimeFailureKind } from "./embedded-agent-helpers/provider-runtime-failure.js";
+export type { ProviderRuntimeFailureKind } from "./embedded-agent-helpers/provider-runtime-failure.js";
+export { formatBillingErrorMessage, getApiErrorPayloadFingerprint } from "./failover/user-copy.js";
+export {
+  formatRawAssistantErrorForUi,
+  parseApiErrorInfo,
+} from "../shared/assistant-error-format.js";
+export {
+  classifyFailoverReason,
+  isCloudCodeAssistFormatError,
+  isContextOverflowError,
+  isLikelyContextOverflowError,
+  isProviderRequestSizeCeilingError,
+  isTimeoutErrorMessage,
+} from "./failover/classify.js";
+export { sanitizeGoogleTurnOrdering } from "./embedded-agent-helpers/google.js";
 
 export {
   downgradeOpenAIFunctionCallReasoningPairs,
-  downgradeOpenAIReasoningBlocks,
+  dropStaleOpenAIReasoning,
   normalizeOpenAIResponsesToolCallIds,
 } from "./embedded-agent-helpers/openai.js";
-export {
-  isEmptyAssistantMessageContent,
-  sanitizeSessionMessagesImages,
-} from "./embedded-agent-helpers/images.js";
+export { sanitizeSessionMessagesImages } from "./embedded-agent-helpers/images.js";
 export {
   isMessagingToolDuplicate,
   isMessagingToolDuplicateNormalized,
@@ -66,12 +56,4 @@ export {
 
 export { pickFallbackThinkingLevel } from "./embedded-agent-helpers/thinking.js";
 
-export {
-  mergeConsecutiveUserTurns,
-  validateAnthropicTurns,
-  validateGeminiTurns,
-} from "./embedded-agent-helpers/turns.js";
-export type { EmbeddedContextFile, FailoverReason } from "./embedded-agent-helpers/types.js";
-
-export type { ToolCallIdMode } from "./tool-call-id.js";
-export { isValidCloudCodeAssistToolId, sanitizeToolCallId } from "./tool-call-id.js";
+export { validateAnthropicTurns, validateGeminiTurns } from "./embedded-agent-helpers/turns.js";

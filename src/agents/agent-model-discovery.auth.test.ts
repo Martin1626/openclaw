@@ -1,29 +1,24 @@
+/** Tests model discovery auth storage, SecretRef placeholders, and env-backed credentials. */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it, vi } from "vitest";
-import { resolveAgentCredentialMapFromStore } from "./agent-auth-credentials.js";
 import {
-  addEnvBackedAgentCredentials,
-  scrubLegacyStaticAuthJsonEntriesForDiscovery,
-} from "./agent-auth-discovery-core.js";
-import { discoverAuthStorage } from "./agent-model-discovery.js";
+  resolveAgentCredentialMapFromStore,
+  resolveUsableAgentCredentialModes,
+} from "./agent-auth-credentials.js";
+import { addEnvBackedAgentCredentials } from "./agent-auth-discovery-core.js";
+import { discoverAuthStorageFacts } from "./agent-model-discovery.js";
 import type { AuthProfileStore } from "./auth-profiles.js";
+import {
+  createApiKeyCredential,
+  createAuthProfileStoreFixture,
+} from "./auth-profiles/credential-fixtures.test-support.js";
+import { writePersistedAuthProfileStoreRaw } from "./auth-profiles/sqlite.js";
 
 vi.mock("./model-auth-env-vars.js", () => ({
   listProviderEnvAuthLookupKeys: () => ["mistral", "workspace-cloud"],
-  resolveProviderEnvApiKeyCandidates: () => ({
-    mistral: ["MISTRAL_API_KEY"],
-  }),
-  resolveProviderEnvAuthEvidence: () => ({
-    "workspace-cloud": [
-      {
-        type: "local-file-with-env",
-        credentialMarker: "workspace-cloud-local-credentials",
-        source: "workspace cloud credentials",
-      },
-    ],
-  }),
   resolveProviderEnvAuthLookupMaps: () => ({
     aliasMap: {},
     envCandidateMap: {
@@ -73,48 +68,29 @@ async function withAgentDir(run: (agentDir: string) => Promise<void>): Promise<v
   }
 }
 
-async function writeLegacyAuthJson(
-  agentDir: string,
-  authEntries: Record<string, unknown>,
-): Promise<void> {
-  await fs.writeFile(path.join(agentDir, "auth.json"), JSON.stringify(authEntries, null, 2));
+function writeAuthProfilesSqlite(agentDir: string, store: AuthProfileStore): void {
+  writePersistedAuthProfileStoreRaw(store, agentDir);
 }
 
-async function writeAuthProfilesJson(agentDir: string, store: AuthProfileStore): Promise<void> {
-  await fs.writeFile(path.join(agentDir, "auth-profiles.json"), JSON.stringify(store, null, 2));
-}
-
-async function readLegacyAuthJson(agentDir: string): Promise<Record<string, unknown>> {
-  return JSON.parse(await fs.readFile(path.join(agentDir, "auth.json"), "utf8")) as Record<
-    string,
-    unknown
-  >;
-}
-
-describe("discoverAuthStorage", () => {
+describe("discoverAuthStorageFacts auth storage", () => {
   it("converts runtime auth profiles into agent discovery credentials", () => {
-    const credentials = resolveAgentCredentialMapFromStore({
-      version: 1,
-      profiles: {
-        "openrouter:default": {
-          type: "api_key",
-          provider: "openrouter",
-          key: "sk-or-v1-runtime",
-        },
+    const credentials = resolveAgentCredentialMapFromStore(
+      createAuthProfileStoreFixture({
+        "openrouter:default": createApiKeyCredential("openrouter", "sk-or-v1-runtime"),
         "anthropic:default": {
           type: "token",
           provider: "anthropic",
           token: "sk-ant-runtime",
         },
-        "openai-codex:default": {
+        "openai:default": {
           type: "oauth",
-          provider: "openai-codex",
+          provider: "openai",
           access: "oauth-access",
           refresh: "oauth-refresh",
           expires: Date.now() + 60_000,
         },
-      },
-    });
+      }),
+    );
 
     expect(credentials.openrouter).toEqual({
       type: "api_key",
@@ -124,87 +100,159 @@ describe("discoverAuthStorage", () => {
       type: "api_key",
       key: "sk-ant-runtime",
     });
-    const codexCredential = credentials["openai-codex"] as
+    const codexCredential = credentials["openai"] as
       | { type?: string; access?: string; refresh?: string }
       | undefined;
     expect(codexCredential?.type).toBe("oauth");
     expect(codexCredential?.access).toBe("oauth-access");
     expect(codexCredential?.refresh).toBe("oauth-refresh");
+    expect(resolveUsableAgentCredentialModes(credentials)).toEqual({
+      anthropic: "api_key",
+      openai: "oauth",
+      openrouter: "api_key",
+    });
+    expect(
+      resolveUsableAgentCredentialModes({
+        bearer: { type: "token", token: "runtime-token", expires: Date.now() + 60_000 },
+        expired: { type: "token", token: "expired-token", expires: Date.now() - 1 },
+      }),
+    ).toEqual({ bearer: "token" });
   });
 
-  it("keeps keyRef and tokenRef profiles visible only for read-only agent discovery", () => {
+  it("drops runtime auth profiles with out-of-range expiry values", () => {
     const credentials = resolveAgentCredentialMapFromStore({
       version: 1,
       profiles: {
-        "openrouter:default": {
-          type: "api_key",
-          provider: "openrouter",
-          keyRef: { source: "exec", provider: "keychain", id: "OPENROUTER_API_KEY" },
-        },
-        "anthropic:default": {
+        "anthropic:bad-token-expiry": {
           type: "token",
           provider: "anthropic",
-          tokenRef: { source: "env", provider: "default", id: "ANTHROPIC_AUTH_TOKEN" },
+          token: "sk-ant-runtime",
+          expires: MAX_DATE_TIMESTAMP_MS + 1,
         },
-        "expired:default": {
-          type: "token",
-          provider: "expired",
-          tokenRef: { source: "env", provider: "default", id: "EXPIRED_AUTH_TOKEN" },
-          expires: Date.now() - 1_000,
+        "openai:bad-oauth-expiry": {
+          type: "oauth",
+          provider: "openai",
+          access: "oauth-access",
+          refresh: "oauth-refresh",
+          expires: MAX_DATE_TIMESTAMP_MS + 1,
         },
       },
     });
-    const discoveryCredentials = resolveAgentCredentialMapFromStore(
-      {
-        version: 1,
-        profiles: {
-          "openrouter:default": {
-            type: "api_key",
-            provider: "openrouter",
-            keyRef: { source: "exec", provider: "keychain", id: "OPENROUTER_API_KEY" },
-          },
-          "anthropic:default": {
-            type: "token",
-            provider: "anthropic",
-            tokenRef: { source: "env", provider: "default", id: "ANTHROPIC_AUTH_TOKEN" },
-          },
-          "expired:default": {
-            type: "token",
-            provider: "expired",
-            tokenRef: { source: "env", provider: "default", id: "EXPIRED_AUTH_TOKEN" },
-            expires: Date.now() - 1_000,
-          },
+
+    expect(credentials.anthropic).toBeUndefined();
+    expect(credentials.openai).toBeUndefined();
+  });
+
+  it("uses canonical mode and expiry ordering instead of profile insertion order", () => {
+    const resolved = resolveAgentCredentialMapFromStore(
+      createAuthProfileStoreFixture({
+        "openai:key": createApiKeyCredential("openai", "test-key"),
+        "openai:expired": {
+          type: "oauth",
+          provider: "openai",
+          access: "dummy",
+          refresh: "placeholder",
+          expires: Date.now() - 3600_000,
         },
-      },
-      { includeSecretRefPlaceholders: true },
+        "openai:valid": {
+          type: "oauth",
+          provider: "openai",
+          access: "fake",
+          refresh: "sample",
+          expires: Date.now() + 3600_000,
+        },
+      }),
     );
+
+    expect(resolved.openai).toEqual({
+      type: "oauth",
+      access: "fake",
+      refresh: "sample",
+      expires: expect.any(Number),
+    });
+  });
+
+  it("passes configured auth order through discovery selection", async () => {
+    await withAgentDir(async (agentDir) => {
+      writeAuthProfilesSqlite(
+        agentDir,
+        createAuthProfileStoreFixture({
+          "openai:oauth": {
+            type: "oauth",
+            provider: "openai",
+            access: "fake",
+            refresh: "sample",
+            expires: Date.now() + 3600_000,
+          },
+          "openai:key": createApiKeyCredential("openai", "test-key"),
+        }),
+      );
+      const { authStorage } = discoverAuthStorageFacts(agentDir, {
+        skipExternalAuthProfiles: true,
+        env: {},
+        config: {
+          auth: { order: { openai: ["openai:key", "openai:oauth"] } },
+        },
+      });
+
+      expect(authStorage.get("openai")).toEqual({
+        type: "api_key",
+        key: "test-key",
+      });
+    });
+  });
+
+  it("keeps keyRef and tokenRef profiles visible only for read-only agent discovery", () => {
+    const store = createAuthProfileStoreFixture<AuthProfileStore["profiles"]>({
+      "openrouter:default": {
+        type: "api_key",
+        provider: "openrouter",
+        keyRef: { source: "exec", provider: "keychain", id: "OPENROUTER_API_KEY" },
+      },
+      "anthropic:default": {
+        type: "token",
+        provider: "anthropic",
+        tokenRef: { source: "env", provider: "default", id: "ANTHROPIC_AUTH_TOKEN" },
+      },
+      "expired:default": {
+        type: "token",
+        provider: "expired",
+        tokenRef: { source: "env", provider: "default", id: "EXPIRED_AUTH_TOKEN" },
+        expires: Date.now() - 1_000,
+      },
+    });
+    const credentials = resolveAgentCredentialMapFromStore(store);
+    const discoveryCredentials = resolveAgentCredentialMapFromStore(store, {
+      includeSecretRefPlaceholders: true,
+    });
 
     expect(credentials.openrouter).toBeUndefined();
     expect(credentials.anthropic).toBeUndefined();
     expect(discoveryCredentials.openrouter?.type).toBe("api_key");
     expect(discoveryCredentials.anthropic?.type).toBe("api_key");
     expect(discoveryCredentials.expired).toBeUndefined();
+    expect(resolveUsableAgentCredentialModes(discoveryCredentials)).toEqual({});
   });
 
   it("marks keyRef-only auth profiles configured for read-only model discovery", async () => {
     await withAgentDir(async (agentDir) => {
-      await writeAuthProfilesJson(agentDir, {
-        version: 1,
-        profiles: {
+      writeAuthProfilesSqlite(
+        agentDir,
+        createAuthProfileStoreFixture({
           "fixture-ref-provider:default": {
             type: "api_key",
             provider: "fixture-ref-provider",
             keyRef: { source: "exec", provider: "keychain", id: "FIXTURE_API_KEY" },
           },
-        },
-      });
+        }),
+      );
 
-      const readOnlyStorage = discoverAuthStorage(agentDir, {
+      const { authStorage: readOnlyStorage } = discoverAuthStorageFacts(agentDir, {
         readOnly: true,
         skipExternalAuthProfiles: true,
         env: {},
       });
-      const runtimeStorage = discoverAuthStorage(agentDir, {
+      const { authStorage: runtimeStorage } = discoverAuthStorageFacts(agentDir, {
         skipExternalAuthProfiles: true,
         env: {},
       });
@@ -214,84 +262,45 @@ describe("discoverAuthStorage", () => {
     });
   });
 
-  it("scrubs static api_key entries from legacy auth.json and keeps oauth entries", async () => {
-    await withAgentDir(async (agentDir) => {
-      await writeLegacyAuthJson(agentDir, {
-        openrouter: { type: "api_key", key: "legacy-static-key" },
-        "openai-codex": {
-          type: "oauth",
-          access: "oauth-access",
-          refresh: "oauth-refresh",
-          expires: Date.now() + 60_000,
-        },
-      });
+  it("uses the lifecycle owner's explicit inherited auth directory", async () => {
+    await withAgentDir(async (inheritedAuthDir) => {
+      await withAgentDir(async (agentDir) => {
+        writeAuthProfilesSqlite(
+          inheritedAuthDir,
+          createAuthProfileStoreFixture({
+            "inherited-provider:default": createApiKeyCredential(
+              "inherited-provider",
+              "inherited-key",
+            ),
+            "shared-provider:inherited": createApiKeyCredential(
+              "shared-provider",
+              "inherited-shared-key",
+            ),
+          }),
+        );
+        writeAuthProfilesSqlite(
+          agentDir,
+          createAuthProfileStoreFixture({
+            "shared-provider:local": createApiKeyCredential("shared-provider", "local-shared-key"),
+          }),
+        );
 
-      scrubLegacyStaticAuthJsonEntriesForDiscovery(path.join(agentDir, "auth.json"));
-
-      const parsed = await readLegacyAuthJson(agentDir);
-      expect(parsed.openrouter).toBeUndefined();
-      const codexEntry = parsed["openai-codex"] as { type?: string; access?: string } | undefined;
-      expect(codexEntry?.type).toBe("oauth");
-      expect(codexEntry?.access).toBe("oauth-access");
-    });
-  });
-
-  it("preserves legacy auth.json when auth store is forced read-only", async () => {
-    await withAgentDir(async (agentDir) => {
-      const previous = process.env.OPENCLAW_AUTH_STORE_READONLY;
-      process.env.OPENCLAW_AUTH_STORE_READONLY = "1";
-      try {
-        await writeLegacyAuthJson(agentDir, {
-          openrouter: { type: "api_key", key: "legacy-static-key" },
+        const { authStorage: storage } = discoverAuthStorageFacts(agentDir, {
+          inheritedAuthDir,
+          skipExternalAuthProfiles: true,
+          env: {},
         });
 
-        scrubLegacyStaticAuthJsonEntriesForDiscovery(path.join(agentDir, "auth.json"));
-
-        const parsed = await readLegacyAuthJson(agentDir);
-        const openrouterEntry = parsed.openrouter as { type?: string; key?: string } | undefined;
-        expect(openrouterEntry?.type).toBe("api_key");
-        expect(openrouterEntry?.key).toBe("legacy-static-key");
-      } finally {
-        if (previous === undefined) {
-          delete process.env.OPENCLAW_AUTH_STORE_READONLY;
-        } else {
-          process.env.OPENCLAW_AUTH_STORE_READONLY = previous;
-        }
-      }
-    });
-  });
-
-  it("includes env-backed provider auth when no auth profile exists", () => {
-    const previousMistral = process.env.MISTRAL_API_KEY;
-    const previousBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
-    const previousDisableBundledPlugins = process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
-    process.env.MISTRAL_API_KEY = "mistral-env-test-key";
-    delete process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
-    delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
-    try {
-      const credentials = addEnvBackedAgentCredentials({}, { env: process.env });
-
-      expect(credentials.mistral).toEqual({
-        type: "api_key",
-        key: "mistral-env-test-key",
+        expect(storage.get("inherited-provider")).toEqual({
+          type: "api_key",
+          key: "inherited-key",
+        });
+        expect(storage.get("shared-provider")).toEqual({
+          type: "api_key",
+          key: "local-shared-key",
+        });
       });
-    } finally {
-      if (previousMistral === undefined) {
-        delete process.env.MISTRAL_API_KEY;
-      } else {
-        process.env.MISTRAL_API_KEY = previousMistral;
-      }
-      if (previousBundledPluginsDir === undefined) {
-        delete process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
-      } else {
-        process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = previousBundledPluginsDir;
-      }
-      if (previousDisableBundledPlugins === undefined) {
-        delete process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS;
-      } else {
-        process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS = previousDisableBundledPlugins;
-      }
-    }
+    });
   });
 
   it("includes workspace-scoped auth evidence in agent discovery credentials", () => {

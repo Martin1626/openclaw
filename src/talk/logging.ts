@@ -1,15 +1,10 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { getChildLogger } from "../logging/logger.js";
-import { firstFiniteTalkEventNumber, talkEventPayloadRecord } from "./event-metrics.js";
+import { firstFiniteTalkEventNumber } from "./event-metrics.js";
 import type { TalkEvent, TalkEventType } from "./talk-events.js";
 
-type TalkLogLevel = "info" | "warn";
-
-type TalkLogRecord = {
-  level: TalkLogLevel;
-  message: string;
-  attributes: Record<string, string | number | boolean>;
-};
-
+// Delta events can arrive at audio/text chunk cadence; omitting them keeps logs useful
+// without hiding lifecycle, error, usage, and latency events.
 const OMITTED_TALK_LOG_EVENT_TYPES = new Set<TalkEventType>([
   "input.audio.delta",
   "output.audio.delta",
@@ -20,12 +15,15 @@ const OMITTED_TALK_LOG_EVENT_TYPES = new Set<TalkEventType>([
 
 const TALK_LOGGER_BINDINGS = Object.freeze({ subsystem: "talk" });
 
-export function createTalkLogRecord(event: TalkEvent): TalkLogRecord | undefined {
+/**
+ * Emits Talk logs best-effort so logging failures never break realtime audio handling.
+ */
+export function recordTalkLogEvent(event: TalkEvent): void {
   if (OMITTED_TALK_LOG_EVENT_TYPES.has(event.type)) {
-    return undefined;
+    return;
   }
 
-  const payload = talkEventPayloadRecord(event.payload);
+  const payload = asOptionalRecord(event.payload);
   const attributes: Record<string, string | number | boolean> = {
     sessionId: event.sessionId,
     talkEventType: event.type,
@@ -50,26 +48,15 @@ export function createTalkLogRecord(event: TalkEvent): TalkLogRecord | undefined
     attributes.talkByteLength = byteLength;
   }
 
-  return {
-    level: event.type === "session.error" || event.type === "tool.error" ? "warn" : "info",
-    message: `talk event ${event.type}`,
-    attributes,
-  };
-}
-
-export function recordTalkLogEvent(event: TalkEvent): void {
-  const record = createTalkLogRecord(event);
-  if (!record) {
-    return;
-  }
-
+  const level = event.type === "session.error" || event.type === "tool.error" ? "warn" : "info";
+  const message = `talk event ${event.type}`;
   try {
     const logger = getChildLogger(TALK_LOGGER_BINDINGS);
-    if (record.level === "warn") {
-      logger.warn(record.attributes, record.message);
+    if (level === "warn") {
+      logger.warn(attributes, message);
       return;
     }
-    logger.info(record.attributes, record.message);
+    logger.info(attributes, message);
   } catch {
     // logging must never block the realtime Talk path
   }

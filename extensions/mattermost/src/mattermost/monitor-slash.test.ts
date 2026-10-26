@@ -1,7 +1,8 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Mattermost tests cover monitor slash plugin behavior.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { registerMattermostMonitorSlashCommands } from "./monitor-slash.js";
 
 const listSkillCommandsForAgents = vi.hoisted(() => vi.fn());
-const parseTcpPort = vi.hoisted(() => vi.fn());
 const fetchMattermostUserTeams = vi.hoisted(() => vi.fn());
 const normalizeMattermostBaseUrl = vi.hoisted(() => vi.fn((value: string | undefined) => value));
 const isSlashCommandsEnabled = vi.hoisted(() => vi.fn());
@@ -12,7 +13,6 @@ const activateSlashCommands = vi.hoisted(() => vi.fn());
 
 vi.mock("./runtime-api.js", () => ({
   listSkillCommandsForAgents,
-  parseTcpPort,
 }));
 
 vi.mock("./client.js", async () => {
@@ -51,15 +51,8 @@ function requireFirstMockCall<TArgs extends unknown[]>(
 }
 
 describe("mattermost monitor slash", () => {
-  let registerMattermostMonitorSlashCommands: typeof import("./monitor-slash.js").registerMattermostMonitorSlashCommands;
-
-  beforeAll(async () => {
-    ({ registerMattermostMonitorSlashCommands } = await import("./monitor-slash.js"));
-  });
-
   beforeEach(() => {
     listSkillCommandsForAgents.mockReset();
-    parseTcpPort.mockReset();
     fetchMattermostUserTeams.mockReset();
     normalizeMattermostBaseUrl.mockClear();
     isSlashCommandsEnabled.mockReset();
@@ -94,7 +87,6 @@ describe("mattermost monitor slash", () => {
     vi.stubEnv("OPENCLAW_GATEWAY_PORT", "18888");
     resolveSlashCommandConfig.mockReturnValue({ enabled: true, nativeSkills: true });
     isSlashCommandsEnabled.mockReturnValue(true);
-    parseTcpPort.mockReturnValue(18888);
     fetchMattermostUserTeams.mockResolvedValue([{ id: "team-1" }, { id: "team-2" }]);
     resolveCallbackUrl.mockReturnValue("https://openclaw.test/slash");
     listSkillCommandsForAgents.mockReturnValue([
@@ -170,7 +162,6 @@ describe("mattermost monitor slash", () => {
     vi.stubEnv("OPENCLAW_GATEWAY_PORT", "65536");
     resolveSlashCommandConfig.mockReturnValue({ enabled: true, nativeSkills: false });
     isSlashCommandsEnabled.mockReturnValue(true);
-    parseTcpPort.mockReturnValue(null);
     fetchMattermostUserTeams.mockResolvedValue([{ id: "team-1" }]);
     resolveCallbackUrl.mockReturnValue("https://openclaw.test/slash");
     registerSlashCommands.mockResolvedValue([{ token: "token-1", trigger: "ping" }]);
@@ -184,7 +175,6 @@ describe("mattermost monitor slash", () => {
       botUserId: "bot-user",
     });
 
-    expect(parseTcpPort).toHaveBeenCalledWith("65536");
     expect(resolveCallbackUrl).toHaveBeenCalledWith(
       expect.objectContaining({ gatewayPort: 18789 }),
     );
@@ -193,7 +183,6 @@ describe("mattermost monitor slash", () => {
   it("warns on loopback callback urls and reports partial team failures", async () => {
     resolveSlashCommandConfig.mockReturnValue({ enabled: true, nativeSkills: false });
     isSlashCommandsEnabled.mockReturnValue(true);
-    parseTcpPort.mockReturnValue(null);
     fetchMattermostUserTeams.mockResolvedValue([{ id: "team-1" }, { id: "team-2" }]);
     resolveCallbackUrl.mockReturnValue("http://127.0.0.1:18789/slash");
     registerSlashCommands
